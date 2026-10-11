@@ -543,6 +543,114 @@ void register_ps2_runtime_io_tests()
             t.IsTrue(std::filesystem::exists(hostPath), "sceMcOpen/sceMcWrite should create the host file under mcRoot");
         });
 
+        tc.Run("sceMcWriteFast and sceMcReadFast roundtrip through sync with their own command ids", [](TestCase &t)
+        {
+            // Register setup as a game's call sites pass it (SRWZ 0x192328:
+            // a0 = fd from sceMcOpen's sync result, a1 = 0x57bbc0, a2 = 0xf5a0;
+            // the reads go through a `j sceMcReadFast` thunk with a0..a2 untouched).
+            TestContext test;
+
+            const uint32_t dirAddr = GUEST_STRING_AREA_START + 0x400;
+            const uint32_t fileAddr = GUEST_STRING_AREA_START + 0x500;
+            constexpr uint32_t writeBufAddr = 0x0057BBC0u;
+            constexpr uint32_t readBufAddr = 0x00600000u;
+            constexpr uint32_t saveSize = 0xF5A0u;
+
+            for (uint32_t i = 0; i < saveSize; ++i)
+            {
+                test.rdram[writeBufAddr + i] = static_cast<uint8_t>((i * 7u + (i >> 8)) & 0xFFu);
+            }
+            writeGuestString(test.rdram.data(), dirAddr, "/SAVEDATA");
+            writeGuestString(test.rdram.data(), fileAddr, "/SAVEDATA/save.bin");
+
+            // libmc state is process-wide and earlier cases unformat the card: start clean.
+            clearContext(test.ctx);
+            ps2_stubs::sceMcInit(test.rdram.data(), &test.ctx, nullptr);
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, dirAddr);
+            ps2_stubs::sceMcMkdir(test.rdram.data(), &test.ctx, nullptr);
+            int32_t cmd = 0;
+            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcMkdir should finish successfully");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, fileAddr);
+            setRegU32(test.ctx, 7, PS2_FIO_O_WRONLY | PS2_FIO_O_CREAT);
+            ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
+            int32_t fd = syncMc(test.rdram, &cmd);
+            t.IsTrue(fd > 0, "sceMcOpen should produce a descriptor for the write");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            setRegU32(test.ctx, 5, writeBufAddr);
+            setRegU32(test.ctx, 6, saveSize);
+            ps2_stubs::sceMcWriteFast(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(getRegS32(&test.ctx, 2), 0, "sceMcWriteFast should return 0 (request accepted)");
+            t.Equals(syncMc(test.rdram, &cmd), static_cast<int32_t>(saveSize),
+                     "sceMcWriteFast should report the byte count through sceMcSync");
+            t.Equals(cmd, 0x1B, "sceMcSync should report WRITEFAST (0x1B) as the last command");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            ps2_stubs::sceMcClose(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcClose should finish successfully");
+
+            const std::filesystem::path hostPath = test.paths.mcRoot / "SAVEDATA" / "save.bin";
+            t.Equals(static_cast<uint64_t>(std::filesystem::file_size(hostPath)), static_cast<uint64_t>(saveSize),
+                     "sceMcWriteFast should store every byte in the host file");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, fileAddr);
+            setRegU32(test.ctx, 7, PS2_FIO_O_RDONLY);
+            ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
+            fd = syncMc(test.rdram, &cmd);
+            t.IsTrue(fd > 0, "sceMcOpen should produce a descriptor for the read");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            setRegU32(test.ctx, 5, readBufAddr);
+            setRegU32(test.ctx, 6, saveSize);
+            ps2_stubs::sceMcReadFast(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(getRegS32(&test.ctx, 2), 0, "sceMcReadFast should return 0 (request accepted)");
+            t.Equals(syncMc(test.rdram, &cmd), static_cast<int32_t>(saveSize),
+                     "sceMcReadFast should report the byte count through sceMcSync");
+            t.Equals(cmd, 0x16, "sceMcSync should report READFAST (0x16) as the last command");
+            t.IsTrue(std::memcmp(test.rdram.data() + readBufAddr, test.rdram.data() + writeBufAddr, saveSize) == 0,
+                     "sceMcReadFast should fill the guest buffer with the saved bytes");
+
+            // Past the end: a short read reports 0 bytes, still as READFAST.
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            setRegU32(test.ctx, 5, readBufAddr);
+            setRegU32(test.ctx, 6, 0x40u);
+            ps2_stubs::sceMcReadFast(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcReadFast at end of file should report 0 bytes");
+            t.Equals(cmd, 0x16, "sceMcSync should report READFAST for the short read");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            ps2_stubs::sceMcClose(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcClose should finish successfully");
+
+            // A closed descriptor: sceMcResNoEntry (-4) through sync, under each command id.
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            setRegU32(test.ctx, 5, readBufAddr);
+            setRegU32(test.ctx, 6, 0x40u);
+            ps2_stubs::sceMcReadFast(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), -4, "sceMcReadFast on a closed descriptor should report -4");
+            t.Equals(cmd, 0x16, "the failed read should still report READFAST");
+            ps2_stubs::sceMcWriteFast(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), -4, "sceMcWriteFast on a closed descriptor should report -4");
+            t.Equals(cmd, 0x1B, "the failed write should still report WRITEFAST");
+        });
+
         tc.Run("sceMcGetDir includes dot entries and file metadata", [](TestCase &t)
         {
             TestContext test;
@@ -703,8 +811,8 @@ void register_ps2_runtime_io_tests()
             t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdSearchFile should resolve the extracted movie file");
             t.Equals(readGuestU32(test.rdram.data(), fileAddr + 4), 3u,
                      "sceCdSearchFile should report the host file size");
-            t.IsTrue(readGuestU32(test.rdram.data(), fileAddr + 0) >= 0x00100000u,
-                     "sceCdSearchFile should assign a pseudo LSN for the resolved host file");
+            t.IsTrue(readGuestU32(test.rdram.data(), fileAddr + 0) >= 0x00500000u,
+                     "sceCdSearchFile should assign a pseudo LSN above any real DVD sector");
         });
 
         tc.Run("sceCdRead reads from explicit cdImage path", [](TestCase &t)

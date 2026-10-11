@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -74,11 +75,30 @@ using EeWaitPayload = std::variant<std::monostate,
                                    EeVSyncWait,
                                    EeExternalWait>;
 
+// A wait completion is a host closure (it re-runs a stub when the thread wakes). A
+// snapshot cannot store a closure, so every closure comes with this tag: the closure's
+// kind and the values it captured. Snapshot load rebuilds the closure from the tag
+// (ps2_snapshot.cpp). A closure without a tag (kind None) blocks saving.
+enum class EeResumeKind : uint32_t
+{
+    None = 0,
+    SetPc = 1,          // args[0] = resume pc (PS2Runtime::eeWaitVSyncTicks)
+    MpegGetPicture = 2, // re-run sceMpegGetPicture on the woken context
+    CdStRead = 3,       // continue sceCdStRead: args = requested, buffer, error address, read
+};
+
+struct EeResumeTag
+{
+    EeResumeKind kind = EeResumeKind::None;
+    std::array<uint64_t, 4> args{};
+};
+
 struct EeWaitState
 {
     EeWaitReason reason = EeWaitReason::None;
     EeWaitPayload payload{};
     std::function<void(R5900Context &)> completion;
+    EeResumeTag resumeTag{};
 };
 
 enum class GuestInvocationKind : uint8_t
@@ -93,6 +113,28 @@ enum class GuestInvocationKind : uint8_t
     SifCommand,
 };
 
+// What an invocation's onComplete closure does, so a snapshot can store a thread's
+// invocation stack and rebuild the closure (docs/SNAPSHOT-DESIGN.md). An invocation
+// with an onComplete but no tag cannot be saved: a snapshot request waits for it.
+enum class GuestInvocationCompleteKind : uint8_t
+{
+    None,
+    GuestFree,        // runtime.guestFree(arg)
+    CopyReturnValue,  // parent.r[2] = completed.r[2]
+    ExitCurrent,      // scheduler.exitCurrent(arg != 0)
+    IpuInitComplete,  // ps2_stubs::snapshot::makeIpuInitComplete
+    RpcClientComplete, // ps2_stubs::snapshot::makeRpcClientComplete: arg = SIF RPC client address |
+                       // call sequence << 32, arg2 = completion semaphore | signal count << 32
+    MpegNodataComplete, // ps2_stubs::snapshot::makeMpegNodataComplete(arg = callback data)
+};
+
+struct GuestInvocationCompleteTag
+{
+    GuestInvocationCompleteKind kind = GuestInvocationCompleteKind::None;
+    uint64_t arg = 0;
+    uint64_t arg2 = 0;
+};
+
 struct GuestInvocation
 {
     GuestInvocationKind kind = GuestInvocationKind::Interrupt;
@@ -100,6 +142,7 @@ struct GuestInvocation
     uint64_t tag = 0;
     R5900Context context{};
     std::function<void(const R5900Context &, R5900Context &)> onComplete;
+    GuestInvocationCompleteTag completeTag{}; // describes onComplete (see above)
 };
 
 struct GuestThread
@@ -122,6 +165,7 @@ struct GuestThread
     uint32_t tlsBase = 0;
     EeWaitState wait{};
     std::function<void(R5900Context &)> resumeCompletion;
+    EeResumeTag resumeTag{}; // describes resumeCompletion (see EeResumeTag)
     std::vector<GuestInvocation> invocations;
 
     [[nodiscard]] R5900Context &activeContext()
@@ -236,6 +280,7 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    DeferredInvocation, // id = key in m_deferredInvocations: queue it when due
 };
 
 struct EeEvent
@@ -258,6 +303,8 @@ struct EeThreadCreateParams
 
 class EeScheduler
 {
+    friend struct PS2SnapshotAccess;
+
 public:
     static constexpr int kMainThreadId = 1;
     static constexpr int kFirstThreadId = 2;
@@ -267,6 +314,8 @@ public:
     static constexpr uint32_t kGeneratedCheckpointCycles = 32u;
     static constexpr uint32_t kGuestDispatchCycles = 8u;
     static constexpr uint64_t kDefaultTimeSliceCycles = 65536ull;
+    // PS2X_BATCH_TIMING=1: the EE timers and the IOP catch up at least this often (~3.5 us).
+    static constexpr uint64_t kDefaultBatchTimingCycles = 1024ull;
 
     explicit EeScheduler(PS2Runtime &runtime);
     ~EeScheduler();
@@ -279,8 +328,67 @@ public:
     void requestStop();
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+    // True from the moment checkpointDue() answers true until the scheduler dispatches guest
+    // code again: generated code is then returning, frame by frame, to the scheduler, and
+    // ctx->pc is the point to resume at. PS2Runtime::dispatchGuestBranch reads it so that a
+    // callee unwinding with ctx->pc at its own entry (a nested call to the same function, a
+    // loop back to its first instruction) is not taken for a callee that returned.
+    [[nodiscard]] bool unwindingToDispatcher() const noexcept { return m_unwindingToDispatcher; }
     void accountCycles(uint32_t cycles) noexcept;
+    // Tops m_eeCycle up to wall-clock time when the guest has fallen behind it
+    // (sampled every few checkpoints; PS2X_REALTIME_CLOCK=0 disables it).
+    void catchUpToHostClock() noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
+
+    // PS2X_SCHED_STATS=1 (or =0x<lo>-0x<hi> to also count dispatches landing in that pc
+    // range): where the scheduler's dispatches land, by the name table (ps2_guest_names.h):
+    // a function's start, the middle of a function (a resume through its pc switch), or a
+    // resume fragment (entry_*). Free when off: one predictable branch per dispatch.
+    struct DispatchStats
+    {
+        uint64_t total = 0;
+        uint64_t intoStart = 0;
+        uint64_t intoOwner = 0;
+        uint64_t intoFragment = 0;
+        uint64_t intoOverlay = 0; // a code overlay's function (ps2_overlays.h), start or not
+        uint64_t watched = 0;
+    };
+    [[nodiscard]] bool dispatchStatsEnabled() const noexcept { return m_dispatchStatsEnabled; }
+    [[nodiscard]] DispatchStats dispatchStats() const noexcept;
+
+    // Batched timing (PS2X_BATCH_TIMING, default off). Off: every charge advances the EE
+    // timers and runs the IOP for the charged cycles (one IOP scheduler iteration per guest
+    // call). On: charges only move m_eeCycle; the timers and the IOP catch up in one step
+    // at the next flush, which comes at the earliest of: the next EE timer compare/overflow
+    // (exact cycle, from PS2Memory::cyclesUntilNextEeTimerInterrupt), the IOP's next event
+    // (a runnable thread, a delay, a DMA completion, a callback, an IOP timer), a timer
+    // register write (PS2Memory::eeTimerGeneration), maxBatchCycles, a checkpoint
+    // (processPendingEvents), the idle wait, and any EE-visible IOP operation
+    // (PS2Runtime::syncIopTime: RPC, SIF transfer, IOP memory access). Guest reads of
+    // timer registers catch up lazily inside PS2Memory. Interrupts therefore fire at the
+    // same guest cycle as unbatched; only the EE/IOP interleaving is coarser (<= maxBatch).
+    void setBatchTiming(uint64_t maxBatchCycles) noexcept;
+    // Tests: deterministic guest time (no wall-clock top-ups), like PS2X_REALTIME_CLOCK=0.
+    void setRealtimeClock(bool enabled) noexcept { m_realtimeClock = enabled; }
+    [[nodiscard]] bool batchTimingEnabled() const noexcept { return m_batchTiming; }
+    void flushDeferredTime() noexcept;
+    // The same, requested by an EE-visible IOP operation (counted separately).
+    void flushDeferredTimeForIopAccess() noexcept
+    {
+        ++m_batchStats.externalSyncs;
+        flushDeferredTime();
+    }
+    [[nodiscard]] bool isExecutorThread() const noexcept { return m_executorThread == std::this_thread::get_id(); }
+    [[nodiscard]] uint64_t eeCycle() const noexcept { return m_eeCycle; }
+    struct BatchTimingStats
+    {
+        uint64_t charges = 0;      // accountCycles calls
+        uint64_t flushes = 0;      // flushDeferredTime calls that applied anything
+        uint64_t iopRuns = 0;      // runEeCycles calls made by flushes
+        uint64_t timerSyncs = 0;   // flushes that found deferred timer cycles
+        uint64_t externalSyncs = 0; // flushes requested by PS2Runtime::syncIopTime
+    };
+    [[nodiscard]] const BatchTimingStats &batchTimingStats() const noexcept { return m_batchStats; }
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
     // EE executor and therefore need no host synchronization.
@@ -316,9 +424,17 @@ public:
     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
     int cancelAlarm(int id);
     void queueInvocation(GuestInvocation invocation);
+    // Queues the invocation once `delayCycles` of guest time have passed (a completion the
+    // hardware delivers later, e.g. an IOP RPC end function): until then nothing runs it,
+    // so code that runs on after the call sees the world unchanged, as on the hardware.
+    void queueInvocationAfter(GuestInvocation invocation, uint64_t delayCycles);
+    [[nodiscard]] bool hasDeferredInvocations() const noexcept { return !m_deferredInvocations.empty(); }
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
+    // Removes the queued (not yet started) invocations of this kind and tag, oldest first, so
+    // a caller can run them itself (e.g. ahead of a nested call that must see their effect).
+    [[nodiscard]] std::vector<GuestInvocation> takePendingInvocations(GuestInvocationKind kind, uint64_t tag);
     [[nodiscard]] uint32_t invocationStackTop();
 
     int addIrqHandler(bool dmac,
@@ -334,12 +450,23 @@ public:
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+    // VBlanks at which the display buffer (DISPFB1/2) differed from the previous VBlank's: the
+    // game's own frame rate (a new picture per flip), for the [run:tick] line.
+    [[nodiscard]] uint64_t displayFlips() const noexcept { return m_displayFlips.load(std::memory_order_relaxed); }
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
-    [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {}, EeResumeTag resumeTag = {});
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
-    [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {}, EeResumeTag resumeTag = {});
+
+    // Snapshots (ps2_snapshot.cpp). requestSnapshot() may be called from any thread: the
+    // executor saves at the next dispatcher loop head where the state is serialisable.
+    // setSnapshotTick(): request one automatically when the VBlank tick reaches `tick`.
+    void requestSnapshot() noexcept;
+    void setSnapshotTick(uint64_t tick) noexcept;
+    // Snapshot load runs on another thread before run(); the executor then adopts it.
+    void adoptExecutorThread() noexcept;
 
     [[nodiscard]] GuestThread *thread(int id);
     [[nodiscard]] const GuestThread *thread(int id) const;
@@ -361,6 +488,8 @@ public:
     void publishSnapshot();
 
 private:
+    [[nodiscard]] bool checkpointDueNow(uint32_t cycles) noexcept;
+
     struct ScheduledEvent
     {
         uint64_t deadlineCycle = 0;
@@ -405,6 +534,8 @@ private:
     std::unordered_map<int, EeSemaphore> m_semaphores;
     std::unordered_map<int, EeEventFlag> m_eventFlags;
     std::unordered_map<int, EeAlarm> m_alarms;
+    std::unordered_map<uint32_t, GuestInvocation> m_deferredInvocations; // queueInvocationAfter
+    uint32_t m_nextDeferredInvocationId = 1;
     std::unordered_map<int, EeIrqHandler> m_intcHandlers;
     std::unordered_map<int, EeIrqHandler> m_dmacHandlers;
     int m_nextThreadId = kFirstThreadId;
@@ -422,17 +553,52 @@ private:
     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
     int m_currentThreadId = 0;
     bool m_rescheduleRequested = false;
+    bool m_unwindingToDispatcher = false; // see unwindingToDispatcher(); executor thread only
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
+    bool m_realtimeClock = true;
+    uint32_t m_realtimeSampleCounter = 0u;
+    std::chrono::steady_clock::time_point m_hostEpoch{};
+    uint64_t m_hostEpochCycle = 0u;
+    // Unlimited fast-forward busy-scale governor (see governBusyScaleAtVBlank): the busy scale in
+    // effect (0 = not set yet: the configured one), VBlanks in a row with no idle skip, and
+    // whether the guest went idle since the last VBlank.
+    double m_ffBusyScale = 0.0;
+    uint32_t m_ffBusyVBlanks = 0u;
+    bool m_ffIdleSinceVBlank = false;
+    uint32_t m_ffScaleChangeLogs = 0u;
+    void governBusyScaleAtVBlank() noexcept;
     std::thread::id m_executorThread{};
+    // Batched timing state (see setBatchTiming): the cycle at which the next flush is due,
+    // the EE cycle up to which the IOP has run, the timer generation the deadline was
+    // computed for, and a re-entrancy guard (the IOP can call back into guest code, which
+    // charges cycles).
+    bool m_batchTiming = false;
+    bool m_flushingDeferred = false;
+    uint64_t m_batchMaxCycles = 0u;
+    uint64_t m_batchFlushCycle = 0u;
+    uint64_t m_iopSyncedCycle = 0u;
+    uint32_t m_batchTimerGeneration = 0u;
+    BatchTimingStats m_batchStats{};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_guestExecuting{false};
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;
+
+    void recordDispatch(uint32_t pc) noexcept;
+    bool m_dispatchStatsEnabled = false;
+    uint32_t m_dispatchWatchLo = 0u;
+    uint32_t m_dispatchWatchHi = 0u;
+    std::atomic<uint64_t> m_dispatchTotal{0};
+    std::atomic<uint64_t> m_dispatchIntoStart{0};
+    std::atomic<uint64_t> m_dispatchIntoOwner{0};
+    std::atomic<uint64_t> m_dispatchIntoFragment{0};
+    std::atomic<uint64_t> m_dispatchIntoOverlay{0};
+    std::atomic<uint64_t> m_dispatchWatched{0};
 
     mutable std::mutex m_eventMutex;
     std::condition_variable m_eventCv;
@@ -444,6 +610,8 @@ private:
     uint64_t m_vsyncTick = 0;
     uint32_t m_vsyncFlagAddress = 0;
     uint32_t m_vsyncTickAddress = 0;
+    std::atomic<uint64_t> m_displayFlips{0u};
+    uint64_t m_lastDispfb = 0u;
     uint32_t m_gsVSyncCallback = 0;
     uint32_t m_gsVSyncCallbackGp = 0;
     uint32_t m_gsVSyncCallbackSp = 0;
@@ -453,4 +621,7 @@ private:
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
     uint64_t m_snapshotSequence = 0;
+
+    std::atomic<bool> m_saveRequested{false};
+    std::atomic<uint64_t> m_saveAtTick{std::numeric_limits<uint64_t>::max()};
 };

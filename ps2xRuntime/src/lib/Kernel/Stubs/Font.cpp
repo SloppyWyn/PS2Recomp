@@ -511,14 +511,17 @@ namespace ps2_stubs
         const uint32_t paramY = getRegU32(ctx, 6);
         const uint32_t fmtAddr = getRegU32(ctx, 7);
 
-        const uint8_t *callerVa = getConstMemPtr(rdram, oldSp + 16u);
-        uint8_t *frameVa = getMemPtr(rdram, frame + 0x8f8u);
-        if (callerVa && frameVa)
-            std::memcpy(frameVa, callerVa, 64u);
+        // va_list over the varargs (EE EABI, see Ps2VaListCursor): the first four come in t0-t3,
+        // the rest in 8-byte slots from the caller's sp+0. Spill t0-t3 as 8-byte slots right
+        // below oldSp (inside this handler's own frame), so the list runs on into the caller's
+        // stack arguments without touching the caller's frame.
+        const uint32_t vaList = oldSp - 0x20u;
+        for (uint32_t i = 0; i < 4u; ++i)
+            FAST_WRITE64(vaList + i * 8u, GPR_U64(ctx, 8 + static_cast<int>(i)));
 
         SET_GPR_U32(ctx, 4, frame + 0x20u);
         SET_GPR_U32(ctx, 5, fmtAddr);
-        SET_GPR_U32(ctx, 6, frame + 0x8f8u);
+        SET_GPR_U32(ctx, 6, vaList);
         vsprintf(rdram, ctx, runtime);
 
         const uint32_t gp = getRegU32(ctx, 28);
@@ -663,5 +666,22 @@ namespace ps2_stubs
         std::memcpy(&scly_bits, &ctx->f[13], sizeof(float));
         writeU32AtGp(rdram, gp, -0x7b54, sclx_bits);
         writeU32AtGp(rdram, gp, -0x7b50, scly_bits);
+    }
+}
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    // No state of its own: only this file's copy of the Helpers/Support.h globals.
+    void saveFont(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+    }
+
+    void loadFont(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
     }
 }

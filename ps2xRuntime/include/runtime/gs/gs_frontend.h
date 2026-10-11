@@ -2,10 +2,13 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
@@ -98,9 +101,11 @@ struct GSDebugHistoryEntry
 
 class GS
 {
+    friend struct PS2SnapshotAccess;
+
 public:
     GS();
-    ~GS() = default;
+    ~GS();
 
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
@@ -147,6 +152,64 @@ public:
 
     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+
+    // Asynchronous GS (default; PS2X_GS_ASYNC=0 = synchronous). On the console the GS draws while the EE runs on; here
+    // the drawing (the CPU rasteriser) is host work, and done inline it lands in the guest's
+    // frame time: a frame of EE work plus its GS work must fit in one VBlank. With the GS
+    // asynchronous, every command that changes GS state (GIF packets from all three paths,
+    // image uploads, register writes, clears, VRAM writes) is copied into a queue and run in
+    // order on a GS thread; everything that reads GS state (presentation, local->host
+    // transfers, VRAM reads, debug views, snapshots) first waits for the queue to drain
+    // (sync()). The guest sees what it saw before: transfers complete at once. The EE may run
+    // at most one VBlank ahead of the GS (throttleAtVBlank, called at each VBlank start).
+    // GS state the guest reads back in an order that matters (a CSR SIGNAL/FINISH clear,
+    // SIGLBLID) drains the queue through PS2Memory's GS sync callback.
+    bool asyncEnabled() const noexcept { return m_async; }
+    void sync() const;
+    void throttleAtVBlank();
+
+private:
+    enum class AsyncKind : uint8_t
+    {
+        GifPacket,
+        NativePackedGifPacket,
+        UploadImage,
+        WriteRegister,
+        ClearContext,
+        ClearActive,
+        WriteVram,
+    };
+    struct AsyncCommand
+    {
+        AsyncKind kind = AsyncKind::GifPacket;
+        uint8_t reg = 0;
+        uint32_t u[5]{};
+        uint64_t q[4]{};
+        std::vector<uint8_t> data;
+    };
+    bool runInline() const noexcept;
+    void enqueue(AsyncCommand &&command);
+    void execute(const AsyncCommand &command);
+    void asyncThreadMain();
+    void processGIFPacketImpl(const uint8_t *data, uint32_t sizeBytes);
+    bool processNativePackedGIFPacketImpl(const uint8_t *data, uint32_t sizeBytes);
+    bool clearFramebufferContextImpl(uint32_t contextIndex, uint32_t rgba);
+    bool clearActiveFramebufferImpl(uint32_t rgba);
+    void writeVramImpl(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+
+    bool m_async = false;
+    std::thread m_asyncThread;
+    std::thread::id m_asyncThreadId{};
+    mutable std::mutex m_asyncMutex;
+    mutable std::condition_variable m_asyncWork;  // GS thread: a command or stop
+    mutable std::condition_variable m_asyncDone;  // producers and sync(): progress
+    std::deque<AsyncCommand> m_asyncQueue;
+    uint64_t m_asyncEnqueued = 0;   // commands queued so far (guarded by m_asyncMutex)
+    uint64_t m_asyncProcessed = 0;  // commands finished so far (guarded by m_asyncMutex)
+    size_t m_asyncQueuedBytes = 0;
+    bool m_asyncStop = false;
+    uint64_t m_asyncVBlankMark = 0; // m_asyncEnqueued at the previous VBlank (executor only)
+    int64_t m_asyncBusyUs = 0;      // GS thread busy time since the last VBlank (PS2X_PACE_LOG)
 
 private:
     void snapshotVRAM();

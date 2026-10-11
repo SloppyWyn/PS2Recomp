@@ -99,6 +99,7 @@ namespace ps2_syscalls
             {
                 runtime->eeScheduler().exitCurrent(deleteThread);
             };
+            invocations.back().completeTag = {GuestInvocationCompleteKind::ExitCurrent, deleteThread ? 1u : 0u};
             ee.invokeCurrentSequence(std::move(invocations));
         }
 

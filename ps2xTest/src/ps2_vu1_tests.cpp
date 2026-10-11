@@ -213,8 +213,108 @@ namespace
     }
 }
 
+namespace
+{
+    // PS2X_VU1_STATS is read when a VU1Interpreter is constructed.
+    void setVu1StatsEnv(bool on)
+    {
+#ifdef _WIN32
+        _putenv_s("PS2X_VU1_STATS", on ? "1" : "");
+#else
+        if (on)
+            setenv("PS2X_VU1_STATS", "1", 1);
+        else
+            unsetenv("PS2X_VU1_STATS");
+#endif
+    }
+
+    constexpr uint32_t kVuLowerNop = 0x8000033Cu;
+    constexpr uint32_t kVuUpperNopEBit = kVuUpperNop | 0x40000000u;
+    constexpr uint32_t kVuLowerDivQ1 = 0x81E003BCu; // DIV Q, vf0w, vf0w
+    constexpr uint32_t kVuLowerWaitQ = 0x800003BFu;
+
+    const VU1Interpreter::ProgramStats *findStats(const VU1Interpreter &vu, uint32_t entryPc)
+    {
+        for (const VU1Interpreter::ProgramStats &p : vu.programStats())
+        {
+            const uint64_t key = p.key.load();
+            if (key == 0u)
+                break;
+            if (static_cast<uint32_t>(key) == entryPc)
+                return &p;
+        }
+        return nullptr;
+    }
+}
+
 void register_ps2_vu1_tests()
 {
+    MiniTest::Case("PS2VU1Stats", [](TestCase &tc)
+    {
+        tc.Run("PS2X_VU1_STATS keys programs by entry pc and counts finished runs", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            for (uint32_t base : {0x0000u, 0x2000u})
+            {
+                writeVuInstructionPair(fx.code, base, kVuLowerNop, kVuUpperNopEBit);
+                writeVuInstructionPair(fx.code, base + 8u, kVuLowerNop, kVuUpperNop);
+            }
+            setVu1StatsEnv(true);
+            VU1Interpreter vu1;
+            setVu1StatsEnv(false);
+            t.IsTrue(vu1.statsEnabled(), "stats should be on");
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0x0000u, 0u, 0u, 64u);
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0x2000u, 0u, 0u, 64u);
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0x2000u, 0u, 0u, 64u);
+            const VU1Interpreter::ProgramStats *a = findStats(vu1, 0x0000u);
+            const VU1Interpreter::ProgramStats *b = findStats(vu1, 0x2000u);
+            t.IsTrue(a != nullptr && b != nullptr && a != b, "two entry points should get two slots");
+            if (a && b)
+            {
+                t.Equals(a->runs.load(), uint64_t{1}, "one finished run at 0x0000");
+                t.Equals(b->runs.load(), uint64_t{2}, "two finished runs at 0x2000");
+                t.Equals(a->pairs.load(), uint64_t{2}, "E-bit pair and its delay slot");
+                t.Equals(a->key.load() >> 32, b->key.load() >> 32, "same micro memory, same hash");
+            }
+            VU1Interpreter quiet;
+            t.IsTrue(!quiet.statsEnabled(), "stats should be off without the variable");
+        });
+
+        tc.Run("PS2X_VU1_STATS counts a wait cut by the cycle budget in full", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            writeVuInstructionPair(fx.code, 0u, kVuLowerDivQ1, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 8u, kVuLowerWaitQ, kVuUpperNopEBit);
+            writeVuInstructionPair(fx.code, 16u, kVuLowerNop, kVuUpperNop);
+            setVu1StatsEnv(true);
+            VU1Interpreter whole;
+            VU1Interpreter split;
+            setVu1StatsEnv(false);
+            whole.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 256u);
+            split.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 3u);
+            split.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 256u);
+            uint64_t wholeStalls = 0, splitStalls = 0, wholePairs = 0, splitPairs = 0, splitRuns = 0;
+            for (const VU1Interpreter::ProgramStats &p : whole.programStats())
+            {
+                wholeStalls += p.stallCycles.load();
+                wholePairs += p.pairs.load();
+            }
+            for (const VU1Interpreter::ProgramStats &p : split.programStats())
+            {
+                splitStalls += p.stallCycles.load();
+                splitPairs += p.pairs.load();
+                splitRuns += p.runs.load();
+            }
+            t.IsTrue(wholeStalls > 0u, "WAITQ after DIV should stall");
+            t.Equals(splitStalls, wholeStalls, "a budget cut must not lose stall cycles");
+            t.Equals(splitPairs, wholePairs, "the same pairs execute either way");
+            t.Equals(splitRuns, uint64_t{1}, "only the slice that reaches the end counts as a run");
+        });
+    });
+
+
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
         tc.Run("upper ADD applies the destination mask", [](TestCase &t)
@@ -1434,6 +1534,7 @@ void register_ps2_vu1_tests()
             const uint32_t mscalCmd = makeVifCmd(0x14u, 0u, 0u);
             mem.processVIF1Data(reinterpret_cast<const uint8_t *>(&mscalCmd), sizeof(mscalCmd));
 
+            gs.sync();
             const uint8_t *vramOut = mem.getGSVRAM();
             bool imageOk = true;
             for (uint32_t x = 0; x < 4u && imageOk; ++x)

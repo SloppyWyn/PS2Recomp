@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,13 @@ using namespace ps2_syscalls;
 namespace ps2_stubs
 {
     void resetSifState();
+}
+
+namespace ps2_stubs::snapshot
+{
+    // Kernel/ps2_snapshot_hooks.h: the deferred NOWAIT completion (also used live by RPC.cpp).
+    std::function<void(const R5900Context &, R5900Context &)> makeRpcClientComplete(PS2Runtime &runtime,
+                                                                                   const GuestInvocationCompleteTag &tag);
 }
 
 namespace
@@ -277,15 +285,21 @@ void register_ps2_sif_rpc_tests()
             SifSetRpcQueue(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifSetRpcQueue should succeed");
 
+            // sceSifRegisterRpc(sd, sid, func, buf, cfunc, cbuf, qd): the game's copy (0x11f408)
+            // stores t0/t1 at sd+0x10/0x14 and t2 at sd+0x40 (base). The O32 home slots at
+            // sp+0x10.. hold caller locals: fill them with decoys that must be ignored.
             setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0x9000u);          // cfunc
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, kClientCbufAddr);  // cbuf
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, kQdAddr);          // qd
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0xDEAD0010u);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, 0xDEAD0014u);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, 0xDEAD0018u);
 
             setRegU32(env.ctx, 4, kSdAddr);
             setRegU32(env.ctx, 5, kSid);
             setRegU32(env.ctx, 6, 0u); // no server callback
             setRegU32(env.ctx, 7, kServerBufAddr);
+            setRegU32(env.ctx, 8, 0x9000u);         // cfunc (t0)
+            setRegU32(env.ctx, 9, kClientCbufAddr); // cbuf (t1)
+            setRegU32(env.ctx, 10, kQdAddr);        // qd (t2)
             SifRegisterRpc(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifRegisterRpc should succeed");
 
@@ -294,8 +308,9 @@ void register_ps2_sif_rpc_tests()
             t.Equals(qdAfterRegister.link, kSdAddr, "queue link should point at registered server");
             t.Equals(static_cast<uint32_t>(sdAfterRegister.sid), kSid, "server sid should match registered sid");
             t.Equals(sdAfterRegister.buf, kServerBufAddr, "server buf should match register arg");
-            t.Equals(sdAfterRegister.cbuf, kClientCbufAddr, "server cbuf should match stack arg");
-            t.Equals(sdAfterRegister.base, kQdAddr, "server base should point to queue");
+            t.Equals(sdAfterRegister.cfunc, 0x9000u, "server cfunc should come from t0");
+            t.Equals(sdAfterRegister.cbuf, kClientCbufAddr, "server cbuf should come from t1");
+            t.Equals(sdAfterRegister.base, kQdAddr, "server base should point to the queue passed in t2");
 
             setRegU32(env.ctx, 4, kClientAddr);
             setRegU32(env.ctx, 5, kSid);
@@ -347,6 +362,77 @@ void register_ps2_sif_rpc_tests()
             setRegU32(env.ctx, 4, kClientAddr);
             SifCheckStatRpc(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), 0, "SifCheckStatRpc should report not busy after synchronous completion");
+
+            // A NOWAIT call completes later on the hardware (IOP work, then the RPC END
+            // interrupt): the reply lands in the receive buffer, but the client stays busy and
+            // the end function runs only once the caller has returned to the dispatcher
+            // (queued invocation). SRWZ's sound driver compares a reply counter against the
+            // value it saved right after the call: in-call completion never fires it.
+            std::memset(env.rdram.data() + kRecvAddr, 0, payload.size());
+            for (size_t i = 0; i < payload.size(); ++i)
+            {
+                payload[i] = static_cast<uint8_t>(0xA0u + i);
+            }
+            std::memcpy(env.rdram.data() + kSendAddr, payload.data(), payload.size());
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, 0x56u);
+            setRegU32(env.ctx, 6, K_SIF_RPC_MODE_NOWAIT);
+            setRegU32(env.ctx, 7, kSendAddr);
+            setRegU32(env.ctx, 8, static_cast<uint32_t>(payload.size()));
+            setRegU32(env.ctx, 9, kRecvAddr);
+            setRegU32(env.ctx, 10, static_cast<uint32_t>(payload.size()));
+            setRegU32(env.ctx, 11, 0u);
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "NOWAIT SifCallRpc should return 0 at once");
+            t.IsTrue(std::memcmp(env.rdram.data() + kRecvAddr, payload.data(), payload.size()) == 0,
+                     "NOWAIT: the reply is in the receive buffer");
+            setRegU32(env.ctx, 4, kClientAddr);
+            SifCheckStatRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 1, "NOWAIT: the client stays busy until the queued completion runs");
+
+            // The completion semaphore is signalled by the completion (the END packet), not in
+            // the call: a NOWAIT call whose end function the runtime does not know signals it.
+            const int sema = env.runtime.eeScheduler().createSemaphore(0, 4, 0u, 0u);
+            t.IsTrue(sema > 0, "test semaphore created");
+            auto *clientData = reinterpret_cast<SifRpcClientData *>(env.rdram.data() + kClientAddr);
+            clientData->hdr.sema_id = sema;
+            auto nowaitCall = [&](uint32_t rpc)
+            {
+                setRegU32(env.ctx, 4, kClientAddr);
+                setRegU32(env.ctx, 5, rpc);
+                setRegU32(env.ctx, 6, K_SIF_RPC_MODE_NOWAIT);
+                setRegU32(env.ctx, 7, kSendAddr);
+                setRegU32(env.ctx, 8, static_cast<uint32_t>(payload.size()));
+                setRegU32(env.ctx, 9, kRecvAddr);
+                setRegU32(env.ctx, 10, static_cast<uint32_t>(payload.size()));
+                setRegU32(env.ctx, 11, 0x00ABC000u); // no such function
+                setRegU32(env.ctx, 29, K_STACK_ADDR);
+                SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            };
+            nowaitCall(0x57u); // call sequence 3 on this client (1 = the WAIT call, 2 = the NOWAIT above)
+            nowaitCall(0x58u); // sequence 4
+            t.Equals(env.runtime.eeScheduler().semaphore(sema)->count, 0, "NOWAIT: the semaphore is not signalled in the call");
+            t.IsTrue(env.runtime.eeScheduler().hasDeferredInvocations(), "NOWAIT: completions are deferred");
+
+            auto complete = [&](uint32_t sequence)
+            {
+                GuestInvocationCompleteTag tag{GuestInvocationCompleteKind::RpcClientComplete,
+                                               static_cast<uint64_t>(kClientAddr) | (static_cast<uint64_t>(sequence) << 32u),
+                                               static_cast<uint64_t>(static_cast<uint32_t>(sema)) | (1ull << 32u)};
+                R5900Context base{};
+                ps2_stubs::snapshot::makeRpcClientComplete(env.runtime, tag)(base, base);
+            };
+            complete(3u);
+            t.Equals(env.runtime.eeScheduler().semaphore(sema)->count, 1, "completion signals the semaphore");
+            setRegU32(env.ctx, 4, kClientAddr);
+            SifCheckStatRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 1, "an older call's completion leaves the client busy while a newer call runs");
+            complete(4u);
+            t.Equals(env.runtime.eeScheduler().semaphore(sema)->count, 2, "the newer call's completion signals too");
+            setRegU32(env.ctx, 4, kClientAddr);
+            SifCheckStatRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 0, "the newest call's completion marks the client idle");
         });
 
         tc.Run("MCSERV RPC init and get info report a formatted PS2 card", [](TestCase &t)
@@ -496,15 +582,13 @@ void register_ps2_sif_rpc_tests()
             SifSetRpcQueue(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifSetRpcQueue should succeed");
 
-            setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, kServerCbufAddr);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, kQdAddr);
-
             setRegU32(env.ctx, 4, kSdAddr);
             setRegU32(env.ctx, 5, kSid);
             setRegU32(env.ctx, 6, 0u);
             setRegU32(env.ctx, 7, kServerBufAddr);
+            setRegU32(env.ctx, 8, 0u);              // cfunc (t0)
+            setRegU32(env.ctx, 9, kServerCbufAddr); // cbuf (t1)
+            setRegU32(env.ctx, 10, kQdAddr);        // qd (t2)
             SifRegisterRpc(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifRegisterRpc should succeed");
 
@@ -550,8 +634,11 @@ void register_ps2_sif_rpc_tests()
             t.Equals(getRegU32Result(env.ctx, 2), 0u, "removing the same queue twice should return 0");
         });
 
-        tc.Run("SifCallRpc falls back to stack ABI when register pack is implausible", [](TestCase &t)
+        tc.Run("SifCallRpc reads args 5-8 from t0-t3 and end_param from sp+0, never sp+0x10", [](TestCase &t)
         {
+            // sceSifCallRpc(cd, fno, mode, send, ssize, recv, rsize, end_func, end_param): the
+            // game's copy (0x11f130) takes ssize..end_func in t0-t3 and end_param (param_9) from
+            // the first 8-byte stack slot at sp+0; it reads nothing at sp+0x10.. (caller locals).
             TestEnv env;
 
             constexpr uint32_t kQdAddr = 0x0002A000u;
@@ -560,7 +647,9 @@ void register_ps2_sif_rpc_tests()
             constexpr uint32_t kServerBufAddr = 0x0002A300u;
             constexpr uint32_t kSendAddr = 0x0002A400u;
             constexpr uint32_t kRecvAddr = 0x0002A500u;
+            constexpr uint32_t kDecoyRecvAddr = 0x0002A600u;
             constexpr uint32_t kSid = 0x20000133u;
+            constexpr uint32_t kEndParam = 0x00C0FFEEu;
 
             SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
 
@@ -569,15 +658,13 @@ void register_ps2_sif_rpc_tests()
             SifSetRpcQueue(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifSetRpcQueue should succeed");
 
-            setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, kQdAddr);
-
             setRegU32(env.ctx, 4, kSdAddr);
             setRegU32(env.ctx, 5, kSid);
             setRegU32(env.ctx, 6, 0u);
             setRegU32(env.ctx, 7, kServerBufAddr);
+            setRegU32(env.ctx, 8, 0u);
+            setRegU32(env.ctx, 9, 0u);
+            setRegU32(env.ctx, 10, kQdAddr);
             SifRegisterRpc(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifRegisterRpc should succeed");
 
@@ -594,36 +681,80 @@ void register_ps2_sif_rpc_tests()
             }
             std::memcpy(env.rdram.data() + kSendAddr, payload.data(), payload.size());
             std::memset(env.rdram.data() + kRecvAddr, 0, payload.size());
+            std::memset(env.rdram.data() + kDecoyRecvAddr, 0, 0x40u);
 
+            // A plausible-looking second pack in the O32 home slots: the old handler could pick it.
             setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, static_cast<uint32_t>(payload.size()));
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, kRecvAddr);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, static_cast<uint32_t>(payload.size()));
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, kEndParam);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x04u, 0u);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 4u);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, kDecoyRecvAddr);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, 4u);
             writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x1Cu, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x20u, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, 0u);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x20u, 0x12345678u);
 
             setRegU32(env.ctx, 4, kClientAddr);
             setRegU32(env.ctx, 5, 0x99u);
             setRegU32(env.ctx, 6, 0u);
             setRegU32(env.ctx, 7, kSendAddr);
-            setRegU32(env.ctx, 8, 0x03000000u); // implausible size (> 0x02000000 threshold)
-            setRegU32(env.ctx, 9, 0x00000004u); // implausible guest pointer
-            setRegU32(env.ctx, 10, 0x03000001u);
-            setRegU32(env.ctx, 11, 0u);
+            setRegU32(env.ctx, 8, static_cast<uint32_t>(payload.size())); // ssize (t0)
+            setRegU32(env.ctx, 9, kRecvAddr);                              // recv (t1)
+            setRegU32(env.ctx, 10, static_cast<uint32_t>(payload.size())); // rsize (t2)
+            setRegU32(env.ctx, 11, 0u);                                    // end_func (t3)
 
             SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc should succeed with stack ABI fallback");
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc should succeed");
 
             const SifRpcServerData sdAfterCall = readGuestStruct<SifRpcServerData>(env.rdram.data(), kSdAddr);
             t.Equals(static_cast<uint32_t>(sdAfterCall.size), static_cast<uint32_t>(payload.size()),
-                     "stack ABI sendSize should be selected when register ABI is implausible");
-            t.Equals(sdAfterCall.recvbuf, kRecvAddr, "stack ABI recvBuf should be selected");
+                     "sendSize should come from t0");
+            t.Equals(sdAfterCall.recvbuf, kRecvAddr, "recvBuf should come from t1");
             t.Equals(static_cast<uint32_t>(sdAfterCall.rsize), static_cast<uint32_t>(payload.size()),
-                     "stack ABI recvSize should be selected");
+                     "recvSize should come from t2");
+            const SifRpcClientData clientAfterCall = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
+            t.Equals(clientAfterCall.end_param, kEndParam, "end_param should come from the stack slot at sp+0");
 
             t.IsTrue(std::memcmp(env.rdram.data() + kRecvAddr, payload.data(), payload.size()) == 0,
-                     "recv payload should match stack-selected transfer size");
+                     "recv payload should land in the t1 buffer");
+            bool decoyUntouched = true;
+            for (uint32_t i = 0; i < 0x40u; ++i)
+            {
+                decoyUntouched = decoyUntouched && env.rdram[kDecoyRecvAddr + i] == 0u;
+            }
+            t.IsTrue(decoyUntouched, "the sp+0x14 decoy receive buffer must not be written");
+        });
+
+        tc.Run("sceSifSendCmd takes dest and size from t0/t1, not the stack", [](TestCase &t)
+        {
+            // sceSifSendCmd(cid, pkt, pktsize, src, dest, size): the game's copy (0x11e530)
+            // forwards a0..t1 to _sceSifSendCmd(cid, 0, pkt, pktsize, src, dest, size).
+            TestEnv env;
+            constexpr uint32_t kPacketAddr = 0x00030000u;
+            constexpr uint32_t kSrcAddr = 0x00030100u;
+            constexpr uint32_t kDestAddr = 0x00030200u;
+            constexpr uint32_t kDecoyDestAddr = 0x00030300u;
+
+            for (uint32_t i = 0; i < 16u; ++i)
+            {
+                env.rdram[kSrcAddr + i] = static_cast<uint8_t>(0x31u + i);
+            }
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, kDecoyDestAddr);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, 16u);
+
+            setRegU32(env.ctx, 4, 0x80000010u);
+            setRegU32(env.ctx, 5, kPacketAddr);
+            setRegU32(env.ctx, 6, 0x10u);
+            setRegU32(env.ctx, 7, kSrcAddr);
+            setRegU32(env.ctx, 8, kDestAddr); // dest (t0)
+            setRegU32(env.ctx, 9, 8u);        // size (t1)
+            ps2_syscalls::sceSifSendCmd(env.rdram.data(), &env.ctx, &env.runtime);
+
+            t.IsTrue(getRegS32(env.ctx, 2) != 0, "sceSifSendCmd should return a non-zero id");
+            t.IsTrue(std::memcmp(env.rdram.data() + kDestAddr, env.rdram.data() + kSrcAddr, 8u) == 0,
+                     "8 bytes (t1) should be copied to dest (t0)");
+            t.Equals(static_cast<uint32_t>(env.rdram[kDestAddr + 8u]), 0u, "nothing past size (t1) should be copied");
+            t.Equals(static_cast<uint32_t>(env.rdram[kDecoyDestAddr]), 0u, "the sp+0x10 decoy dest must not be written");
         });
 
     });

@@ -48,3 +48,20 @@ namespace ps2_stubs
         TODO_NAMED("sceDeci2ReqSend", rdram, ctx, runtime);
     }
 }
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    // No state of its own: only this file's copy of the Helpers/Support.h globals.
+    void saveDeci2(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+    }
+
+    void loadDeci2(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
+    }
+}

@@ -9,6 +9,8 @@
 
 class PS2AudioBackend
 {
+    friend struct PS2SnapshotAccess;
+
 public:
     PS2AudioBackend();
     ~PS2AudioBackend();

@@ -4,9 +4,13 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -98,6 +102,31 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+
+    // Diagnostic: log changes to PMODE, SMODE2, DISPFB1/2, DISPLAY1/2 and BGCOLOR
+    // (first 400 changes) so "nothing presented" can be matched against what the
+    // game asked the CRTC to show.
+    inline void logGsPrivWrite(uint32_t addr, uint64_t oldVal, uint64_t newVal)
+    {
+        static std::atomic<uint32_t> s_count{0u};
+        if (oldVal == newVal || s_count.load(std::memory_order_relaxed) >= 400u)
+            return;
+        const uint32_t off = (addr - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        const char *name = nullptr;
+        switch (off)
+        {
+        case 0x0000: name = "PMODE"; break;
+        case 0x0020: name = "SMODE2"; break;
+        case 0x0070: name = "DISPFB1"; break;
+        case 0x0080: name = "DISPLAY1"; break;
+        case 0x0090: name = "DISPFB2"; break;
+        case 0x00A0: name = "DISPLAY2"; break;
+        case 0x00E0: name = "BGCOLOR"; break;
+        default: return;
+        }
+        s_count.fetch_add(1u, std::memory_order_relaxed);
+        std::cerr << "[gs:priv] " << name << " 0x" << std::hex << oldVal << " -> 0x" << newVal << std::dec << std::endl;
+    }
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
@@ -331,6 +360,8 @@ bool PS2Memory::initialize(size_t ramSize)
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
+    m_vif1DirectRemainQwc = 0u;
+    m_vif1DirectRemainHl = false;
     resetEeTimers();
 
     try
@@ -355,6 +386,7 @@ bool PS2Memory::initialize(size_t ramSize)
 
         // Initialize I/O registers
         m_ioRegisters.clear();
+        m_gifStatSlot = nullptr;
 
         // Initialize GS registers
         memset(&gs_regs, 0, sizeof(gs_regs));
@@ -402,6 +434,32 @@ bool PS2Memory::initialize(size_t ramSize)
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_eeTimerDeferredCycles = 0u;
+    m_eeTimerPendingInterrupts = 0u;
+    ++m_eeTimerGeneration;
+}
+
+void PS2Memory::syncEeTimers() noexcept
+{
+    if (m_eeTimerDeferredCycles == 0u)
+    {
+        return;
+    }
+    const uint64_t cycles = m_eeTimerDeferredCycles;
+    m_eeTimerDeferredCycles = 0u;
+    const uint32_t raised = advanceEeTimers(cycles);
+    if (raised != 0u)
+    {
+        m_eeTimerPendingInterrupts |= raised;
+        ++m_eeTimerGeneration;
+    }
+}
+
+uint32_t PS2Memory::takeEeTimerInterrupts() noexcept
+{
+    const uint32_t pending = m_eeTimerPendingInterrupts;
+    m_eeTimerPendingInterrupts = 0u;
+    return pending;
 }
 
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
@@ -413,9 +471,14 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
 
     constexpr uint32_t kGifStat = 0x10003020u;
     constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
+    if (!m_gifStatSlot)
+    {
+        auto gifStatIt = m_ioRegisters.find(kGifStat);
+        if (gifStatIt != m_ioRegisters.end())
+            m_gifStatSlot = &gifStatIt->second;
+    }
+    if (m_gifStatSlot)
+        *m_gifStatSlot &= ~kGifFqcMask;
 
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
@@ -735,6 +798,18 @@ uint16_t PS2Memory::read16(uint32_t address)
     return 0;
 }
 
+void PS2Memory::syncGsForPrivAccess(uint32_t regOff, bool isWrite, uint64_t value)
+{
+    if (!m_gsSyncCallback)
+        return;
+    constexpr uint32_t kGsSiglblidRegOffset = 0x1080u;
+    constexpr uint64_t kCsrSignalFinish = 0x3u; // write-one-to-clear
+    constexpr uint64_t kCsrReset = 0x200u;
+    if (regOff == kGsSiglblidRegOffset ||
+        (isWrite && regOff == kGsCsrRegOffset && (value & (kCsrSignalFinish | kCsrReset)) != 0u))
+        m_gsSyncCallback();
+}
+
 uint32_t PS2Memory::read32(uint32_t address)
 {
     if (address & 3)
@@ -746,6 +821,7 @@ uint32_t PS2Memory::read32(uint32_t address)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsForPrivAccess(regOff, false, 0u);
         if (regOff == kGsCsrRegOffset)
         {
             uint64_t val = gs_regs.csr.load();
@@ -793,6 +869,7 @@ uint64_t PS2Memory::read64(uint32_t address)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsForPrivAccess(regOff, false, 0u);
         if (regOff == kGsCsrRegOffset)
         {
             return gs_regs.csr.load();
@@ -955,6 +1032,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsForPrivAccess(regOff, true, static_cast<uint64_t>(value) << (off * 8u));
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
@@ -965,6 +1043,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         {
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
+            logGsPrivWrite(address, *reg, newVal);
             *reg = newVal;
         }
         return;
@@ -1014,6 +1093,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsForPrivAccess(regOff, true, value);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
@@ -1022,6 +1102,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
+            logGsPrivWrite(address, *reg, value);
             *reg = value;
         }
         return;
@@ -1128,6 +1209,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        // Deferred cycles ran under the old configuration: apply them first.
+        if (m_eeTimerDeferredCycles != 0u)
+        {
+            ++m_eeTimerLazySyncs;
+            syncEeTimers();
+        }
+        ++m_eeTimerGeneration;
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -1166,6 +1254,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         m_ioRegisters[address] = value;
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsForPrivAccess(regOff, true, static_cast<uint64_t>(value) << (off * 8u));
         if (regOff == kGsCsrRegOffset)
         {
             writeCsrHalf(gs_regs.csr, off, value);
@@ -1173,7 +1262,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
-            *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            const uint64_t newVal = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            logGsPrivWrite(address, *reg, newVal);
+            *reg = newVal;
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -1231,6 +1322,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                m_vif1DirectRemainQwc = 0u;
+                m_vif1DirectRemainHl = false;
                 m_path3Masked = false;
                 if (wasPath3Masked)
                     flushMaskedPath3Packets();
@@ -1311,6 +1404,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 return true;
             }
 
+            // toIPU (channel 4): there is no IPU here (MPEG decoding is done by the libmpeg
+            // stubs), so a start completes at once, like a transfer the IPU took immediately:
+            // MADR advanced, QWC 0, STR clear, D_STAT.CIS4 (and the DMAC handler) as at the end
+            // of a transfer. Otherwise a game that kicks it and polls STR (e.g. from an
+            // sceMpegCbNodata callback) waits forever. Chain mode is not modelled.
+            if (channelBase == 0x1000B400u)
+            {
+                if (((value >> 2u) & 0x3u) == 0u)
+                {
+                    m_ioRegisters[channelBase + 0x10u] = madr + (qwc & 0xFFFFu) * 16u;
+                }
+                m_ioRegisters[channelBase + 0x20u] = 0u;
+                completeDmacChannel(channelBase, 4u);
+                return true;
+            }
+
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
             {
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1344,8 +1453,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // The DMAC has no tag limit: a chain ends at END/RET-at-depth-0/an IRQ tag with TIE.
+                    // This bound only stops a corrupt, looping chain (a 3D pass can exceed 4096 tags).
+                    const int kMaxChainTags = 1 << 20;
+                    // Payload bound: the DMAC moves ~39 MB per NTSC field, so 64 MiB never cuts a real
+                    // frame's chain, and it keeps the uint32 size casts of the consumers safe.
+                    const size_t kMaxChainBytes = 64u * 1024u * 1024u;
+                    const char *chainStop = nullptr;
                     std::vector<uint8_t> chainBuf;
+                    std::vector<std::pair<uint32_t, uint32_t>> chainSrc;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1376,6 +1492,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 chunk = maxSz2 - src;
                             if (chunk == 0)
                                 break;
+                            if (vif1UnpackWatchEnabled())
+                                chainSrc.emplace_back(static_cast<uint32_t>(chainBuf.size()), scratch ? (0x70000000u | src) : src);
                             chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
                             bytes -= chunk;
                             src += chunk;
@@ -1395,6 +1513,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         // CHCR.TTE sends the DMAtag's upper 64 bits to the channel before
                         // the tag payload. VIF chains use those bytes for two VIFcodes.
+                        if (vif1UnpackWatchEnabled())
+                            chainSrc.emplace_back(static_cast<uint32_t>(chainBuf.size()), (tagScratch ? (0x70000000u | tagPhys) : tagPhys) + 8u);
                         chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
                     };
 
@@ -1519,8 +1639,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             endChain = true;
                         if (endChain)
                             break;
+                        if (chainBuf.size() >= kMaxChainBytes)
+                        {
+                            chainStop = "64 MiB of data";
+                            break;
+                        }
+                        if (tagsProcessed >= kMaxChainTags)
+                            chainStop = "1048576 tags";
                     }
 
+                    if (chainStop)
+                    {
+                        static std::atomic<uint32_t> s_chainLimitWarnings{0};
+                        if (s_chainLimitWarnings.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                            std::cerr << "[dma:chain] channel 0x" << std::hex << channelBase << std::dec << " stopped after "
+                                      << chainStop << " without an end tag (looping chain?)" << std::endl;
+                    }
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
                     m_ioRegisters[channelBase + 0x50] = asr1;
@@ -1535,6 +1669,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         pt.srcAddr = 0;
                         pt.qwc = 0;
                         pt.chainData = std::move(chainBuf);
+                        pt.chainSrc = std::move(chainSrc);
                         if (channelBase == 0x1000A000)
                         {
                             m_pendingGifTransfers.push_back(std::move(pt));
@@ -1806,7 +1941,11 @@ void PS2Memory::processPendingTransfers()
     {
         if (!p.chainData.empty())
         {
+            m_vif1SrcSegs = p.chainSrc.empty() ? nullptr : &p.chainSrc;
+            m_vif1SrcBase = p.chainData.data();
             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            m_vif1SrcSegs = nullptr;
+            m_vif1SrcBase = nullptr;
         }
         else if (p.qwc > 0)
         {
@@ -1947,6 +2086,52 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 {
     if (!data || sizeBytes < 16)
         return;
+
+    {
+        const uint32_t path = static_cast<uint32_t>(pathId);
+        if (path < 4u)
+        {
+            m_pathStats.gifPackets[path].fetch_add(1, std::memory_order_relaxed);
+            m_pathStats.gifBytes[path].fetch_add(sizeBytes, std::memory_order_relaxed);
+        }
+        // PS2X_PATH1_DUMP=[<skip>:]<n>: PATH1 (VU1 XGKICK) packets skip..skip+n-1 as hex qwords
+        // on stderr (up to 48 qwords each), to check what the VU1 microprograms actually send.
+        static uint32_t path1DumpSkip = 0u;
+        static const uint32_t path1DumpLimit = []
+        {
+            const char *value = std::getenv("PS2X_PATH1_DUMP");
+            if (!value)
+                return 0u;
+            char *end = nullptr;
+            uint32_t first = static_cast<uint32_t>(std::strtoul(value, &end, 0));
+            if (end && *end == ':')
+            {
+                path1DumpSkip = first;
+                return static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 0));
+            }
+            return first;
+        }();
+        static std::atomic<uint32_t> path1Dumped{0};
+        if (path == 1u && path1DumpLimit != 0u)
+        {
+            const uint32_t index = path1Dumped.fetch_add(1, std::memory_order_relaxed);
+            if (index >= path1DumpSkip && index - path1DumpSkip < path1DumpLimit)
+            {
+                std::ostringstream oss;
+                oss << "[path1:dump] n=" << index << " bytes=" << sizeBytes << std::hex;
+                const uint32_t qwords = std::min<uint32_t>(sizeBytes / 16u, 48u);
+                for (uint32_t q = 0; q < qwords; ++q)
+                {
+                    uint64_t lo = 0, hi = 0;
+                    std::memcpy(&lo, data + q * 16u, 8);
+                    std::memcpy(&hi, data + q * 16u + 8u, 8);
+                    oss << "\n  " << std::setw(2) << q << ": " << std::setfill('0') << std::setw(16) << hi
+                        << "_" << std::setw(16) << lo << std::setfill(' ');
+                }
+                std::cerr << oss.str() << std::endl;
+            }
+        }
+    }
 
     if (pathId == GifPathId::Path3)
     {
@@ -2284,6 +2469,12 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        // Lazy catch-up: the guest reads the count the deferred cycles produce.
+        if (m_eeTimerDeferredCycles != 0u)
+        {
+            ++m_eeTimerLazySyncs;
+            syncEeTimers();
+        }
         const EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -2306,6 +2497,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsForPrivAccess(regOff, false, 0u);
         if (regOff == kGsCsrRegOffset)
         {
             return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
@@ -2341,6 +2533,12 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 
     if (address == 0x10003020u) // GIF_STAT
     {
+        // advanceEeTimers clears FQC once any cycle has passed: with deferred cycles the
+        // reader must see the same.
+        if (m_eeTimerDeferredCycles != 0u)
+        {
+            syncEeTimers();
+        }
         uint32_t stat = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
         const uint32_t mode = m_ioRegisters.count(0x10003010u) ? m_ioRegisters[0x10003010u] : 0u;
         const uint32_t ctrl = m_ioRegisters.count(0x10003000u) ? m_ioRegisters[0x10003000u] : 0u;

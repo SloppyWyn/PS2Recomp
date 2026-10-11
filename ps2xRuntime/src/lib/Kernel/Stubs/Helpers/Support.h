@@ -1,10 +1,18 @@
 #include <algorithm>
+#include <iostream>
 #include <cctype>
+
+#include "ps2x/state_stream.h"
+#include "ps2_stub_abi.h" // ps2_abi::VarArgs (formatPs2StringWithVarArgs)
 
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
-    constexpr uint32_t kCdPseudoLbnStart = 0x00100000;
+    // Files registered by sceCdSearchFile get pseudo LSNs from here up. They share one LSN space
+    // with the disc image's real sectors (reads below the registry fall through to the image),
+    // so the base must lie above any real sector: 0x500000 sectors = 10 GB, above a dual-layer
+    // DVD (~4.17 M sectors); registration also moves past a larger image's sector count.
+    constexpr uint32_t kCdPseudoLbnStart = 0x00500000;
 
     struct CdFileEntry
     {
@@ -386,6 +394,10 @@ namespace
             return false;
         }
 
+        uint64_t imageSectors = 0;
+        if (tryGetCdImageTotalSectors(imageSectors) && imageSectors >= g_nextPseudoLbn)
+            g_nextPseudoLbn = static_cast<uint32_t>(std::min<uint64_t>(imageSectors + 1u, 0xF0000000u));
+
         CdFileEntry entry;
         entry.hostPath = path;
         entry.sizeBytes = static_cast<uint32_t>(std::min<uint64_t>(sizeBytes, 0xFFFFFFFFu));
@@ -551,6 +563,13 @@ namespace
     }
 
     std::unordered_map<uint32_t, FILE *> g_file_map;
+    // Path and mode of each g_file_map entry, so a snapshot can reopen the file.
+    struct StubFileInfo
+    {
+        std::string path;
+        std::string mode;
+    };
+    std::unordered_map<uint32_t, StubFileInfo> g_file_info;
     uint32_t g_next_file_handle = 1; // Start file handles > 0 (0 is NULL)
     std::mutex g_file_mutex;
 
@@ -773,6 +792,12 @@ namespace
         return out;
     }
 
+    // Variadic arguments of a direct EE call (printf, sprintf, ...). The EE passes arguments 1-8
+    // in a0-a3, t0-t3 (64-bit registers) and arguments 9 and up in 8-byte stack slots from the
+    // caller's sp+0. A 64-bit value (long long, or a double: soft-float) takes one register or
+    // one slot, like any other argument. Matches the game's printf (0x19f0c8) and sprintf
+    // (0x1a07a8), which spill a1..t3 as 8-byte slots right below the incoming stack arguments
+    // and walk them as one va_list.
     class Ps2VarArgCursor
     {
     public:
@@ -781,7 +806,7 @@ namespace
               m_ctx(ctx),
               m_runtime(runtime),
               m_fixedArgs(fixedArgs),
-              m_stackBase(getRegU32(ctx, 29) + 0x10)
+              m_stackBase(getRegU32(ctx, 29))
         {
             if (m_fixedArgs < 0)
             {
@@ -792,38 +817,33 @@ namespace
 
         uint32_t nextU32()
         {
-            const uint32_t value = readWordAtSlot(m_slotIndex);
-            ++m_slotIndex;
-            return value;
+            return static_cast<uint32_t>(nextU64());
         }
 
         uint64_t nextU64()
         {
-            // O32 ABI aligns 64-bit variadic values on even 32-bit slots.
-            if ((m_slotIndex & 1u) != 0u)
-            {
-                ++m_slotIndex;
-            }
-            const uint64_t low = readWordAtSlot(m_slotIndex);
-            const uint64_t high = readWordAtSlot(m_slotIndex + 1u);
-            m_slotIndex += 2u;
-            return low | (high << 32);
+            const uint64_t value = readSlot(m_slotIndex);
+            ++m_slotIndex;
+            return value;
         }
 
     private:
-        uint32_t readWordAtSlot(uint32_t slotIndex) const
+        uint64_t readSlot(uint32_t slotIndex) const
         {
             if (slotIndex < 8u)
             {
                 // EE calls use eight integer argument registers (a0-a3, t0-t3 / r4-r11).
-                return getRegU32(m_ctx, 4 + static_cast<int>(slotIndex));
+                uint64_t value = 0;
+                std::memcpy(&value, &m_ctx->r[4 + slotIndex], sizeof(value)); // low 64 bits
+                return value;
             }
 
-            const uint32_t stackIndex = slotIndex - 8u;
-            const uint32_t stackAddr = m_stackBase + stackIndex * 4u;
-            uint32_t value = 0;
-            (void)tryReadWordFromGuest(m_rdram, m_runtime, stackAddr, value);
-            return value;
+            const uint32_t stackAddr = m_stackBase + (slotIndex - 8u) * 8u;
+            uint32_t low = 0;
+            uint32_t high = 0;
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, stackAddr, low);
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, stackAddr + 4u, high);
+            return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32);
         }
 
         uint8_t *m_rdram;
@@ -834,6 +854,15 @@ namespace
         uint32_t m_slotIndex = 0;
     };
 
+    // A guest va_list (vfprintf, vsprintf, ...): a pointer to 8-byte slots, one per argument
+    // whatever its type. va_arg reads the slot and steps 8 bytes: an int, char, short or pointer
+    // is the low word of its slot, a long / long long / double (soft-float) the whole slot, with
+    // no extra alignment (slots are already 8-byte). That is the EE's 64-bit-register EABI: a
+    // varargs function spills a1..t3 with one 8-byte store each right below the incoming stack
+    // arguments (themselves 8-byte slots from the caller's sp+0) and walks them as one array.
+    // Matches the game's newlib vfprintf (SRWZ 0x1a19b0: `ap` is a u64*, every conversion
+    // reads *ap then ap++, %d as (int)*ap, %ld/%lld/%qd and %f as the full 64 bits) and SCE's
+    // own formatter (SRWZ 0x11ce48, called by sceSnprintf 0x11dc90 with an 8-byte slot array).
     class Ps2VaListCursor
     {
     public:
@@ -844,18 +873,17 @@ namespace
 
         uint32_t nextU32()
         {
-            uint32_t value = 0;
-            (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr, value);
-            m_curr += 4;
-            return value;
+            return static_cast<uint32_t>(nextU64());
         }
 
         uint64_t nextU64()
         {
-            m_curr = (m_curr + 7u) & ~7u;
-            const uint64_t low = nextU32();
-            const uint64_t high = nextU32();
-            return low | (high << 32);
+            uint32_t low = 0;
+            uint32_t high = 0;
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr, low);
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr + 4u, high);
+            m_curr += 8u;
+            return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32);
         }
 
     private:
@@ -988,6 +1016,11 @@ namespace
                     length = LengthMod::L;
                 }
             }
+            else if (*p == 'q')
+            {
+                ++p;
+                length = LengthMod::LL; // BSD/newlib quad, as the EE libc's vfprintf accepts
+            }
             else if (*p == 'j')
             {
                 ++p;
@@ -1060,10 +1093,26 @@ namespace
                 return true;
             };
 
-            const bool use64Integer = (length == LengthMod::LL || length == LengthMod::J);
+            // EE GCC's long is 64-bit (one register / one 8-byte slot), so %ld reads all 64 bits like
+            // %lld, as the game's vfprintf does (0x1a19b0: 'l', 'll' and 'q' all set its 64-bit flag).
+            const bool use64Integer = (length == LengthMod::L || length == LengthMod::LL || length == LengthMod::J);
+            // %h / %hh narrow the promoted int, as C (and the game's vfprintf for %h) does.
             auto readUnsignedInteger = [&]() -> uint64_t
             {
-                return use64Integer ? nextU64() : static_cast<uint64_t>(nextU32());
+                if (use64Integer)
+                {
+                    return nextU64();
+                }
+                const uint32_t value = nextU32();
+                if (length == LengthMod::H)
+                {
+                    return static_cast<uint16_t>(value);
+                }
+                if (length == LengthMod::HH)
+                {
+                    return static_cast<uint8_t>(value);
+                }
+                return value;
             };
             auto readSignedInteger = [&]() -> int64_t
             {
@@ -1071,7 +1120,16 @@ namespace
                 {
                     return static_cast<int64_t>(nextU64());
                 }
-                return static_cast<int64_t>(static_cast<int32_t>(nextU32()));
+                const uint32_t value = nextU32();
+                if (length == LengthMod::H)
+                {
+                    return static_cast<int16_t>(value);
+                }
+                if (length == LengthMod::HH)
+                {
+                    return static_cast<int8_t>(value);
+                }
+                return static_cast<int32_t>(value);
             };
 
             const char spec = *p++;
@@ -1198,6 +1256,20 @@ namespace
             { return cursor.nextU32(); },
             [&cursor]()
             { return cursor.nextU64(); },
+            [rdram, runtime](uint32_t addr)
+            { return readPs2CStringBounded(rdram, runtime, addr); });
+    }
+
+    // The same for a typed handler (ps2_stub_abi.h): the variable arguments it was given.
+    std::string formatPs2StringWithVarArgs(uint8_t *rdram, PS2Runtime *runtime, const char *format, ps2_abi::VarArgs &args)
+    {
+        return formatPs2StringCore(
+            rdram,
+            format,
+            [&args]()
+            { return args.nextU32(); },
+            [&args]()
+            { return args.nextU64(); },
             [rdram, runtime](uint32_t addr)
             { return readPs2CStringBounded(rdram, runtime, addr); });
     }
@@ -1484,13 +1556,16 @@ namespace
 
 namespace
 {
+    // libgraph's sceGsGParam: four shorts, in the order sceGsResetGraph stores them (SDK 3.1.0
+    // copy in SLPS-25887, 0x10c480: sh interlace +0, omode +2, ffmode (!= 0) +4, GS CSR REV +6).
     struct GsGParam
     {
-        uint8_t interlace;
-        uint8_t omode;
-        uint8_t ffmode;
-        uint8_t version;
+        int16_t interlace;
+        int16_t omode;
+        int16_t ffmode;
+        int16_t version;
     };
+    static_assert(sizeof(GsGParam) == 8, "GsGParam size mismatch");
 
     struct GsDispEnvMem
     {
@@ -1591,8 +1666,6 @@ namespace
     static_assert(sizeof(GsClearMem) == 96, "GsClearMem size mismatch");
     static_assert(sizeof(GsDBuffDcMem) == 0x330, "GsDBuffDcMem size mismatch");
 
-    constexpr uint32_t kGsParamScratchOffset = 0x100;
-    GsGParam g_gparam{1, 2, 1, 3}; // Default: interlaced NTSC, frame mode.
 
     static uint64_t makePmode(uint32_t en1, uint32_t en2, uint32_t mmod, uint32_t amod, uint32_t slbg, uint32_t alp)
     {
@@ -1735,55 +1808,18 @@ namespace
         uint32_t psm = 0;
     };
 
-    static GsSetDefImageArgs decodeGsSetDefImageArgs(uint8_t *rdram, R5900Context *ctx)
+    // sceGsSetDefLoadImage / sceGsSetDefStoreImage(img, bp, bw, psm, x, y, w, h):
+    // a1-a3 = bp, bw, psm; t0-t3 (regs 8-11) = x, y, w, h (EE ABI, arguments 5-8).
+    static GsSetDefImageArgs decodeGsSetDefImageArgs(R5900Context *ctx)
     {
         GsSetDefImageArgs decoded{};
-
-        const uint32_t reg8 = getRegU32(ctx, 8);
-        const uint32_t reg9 = getRegU32(ctx, 9);
-        const uint32_t reg10 = getRegU32(ctx, 10);
-        const uint32_t reg11 = getRegU32(ctx, 11);
-
-        const uint32_t stack0 = readStackU32(rdram, ctx, 16);
-        const uint32_t stack1 = readStackU32(rdram, ctx, 20);
-        const uint32_t stack2 = readStackU32(rdram, ctx, 24);
-        const uint32_t stack3 = readStackU32(rdram, ctx, 28);
-
-        const bool looksLikeCanonicalRegs = (reg10 != 0u || reg11 != 0u);
-        const bool looksLikeCanonicalStack = (stack2 != 0u || stack3 != 0u);
-
-        if (looksLikeCanonicalRegs || looksLikeCanonicalStack)
-        {
-            decoded.vramAddr = getRegU32(ctx, 5);
-            decoded.vramWidth = getRegU32(ctx, 6);
-            decoded.psm = getRegU32(ctx, 7);
-
-            if (looksLikeCanonicalRegs)
-            {
-                decoded.x = reg8;
-                decoded.y = reg9;
-                decoded.width = reg10;
-                decoded.height = reg11;
-            }
-            else
-            {
-                decoded.x = stack0;
-                decoded.y = stack1;
-                decoded.width = stack2;
-                decoded.height = stack3;
-            }
-            return decoded;
-        }
-
-        // Legacy code
-        // a1=x, a2=y, a3=w, stack/reg extension for h/vram/fbw/psm.
-        decoded.x = getRegU32(ctx, 5);
-        decoded.y = getRegU32(ctx, 6);
-        decoded.width = getRegU32(ctx, 7);
-        decoded.height = stack0 != 0u ? stack0 : reg8;
-        decoded.vramAddr = stack1 != 0u ? stack1 : reg9;
-        decoded.vramWidth = stack2 != 0u ? stack2 : reg10;
-        decoded.psm = stack3 != 0u ? stack3 : reg11;
+        decoded.vramAddr = getRegU32(ctx, 5);
+        decoded.vramWidth = getRegU32(ctx, 6);
+        decoded.psm = getRegU32(ctx, 7);
+        decoded.x = getRegU32(ctx, 8);
+        decoded.y = getRegU32(ctx, 9);
+        decoded.width = getRegU32(ctx, 10);
+        decoded.height = getRegU32(ctx, 11);
         return decoded;
     }
 
@@ -1805,15 +1841,15 @@ namespace
         return true;
     }
 
-    static bool writeGsDispEnv(uint8_t *rdram, uint32_t addr, uint64_t display, uint64_t dispfb)
+    // Writes a whole sceGsDispEnv (pmode, smode2, dispfb, display, bgcolor). The SDK's
+    // sceGsSetDefDispEnv fills every field; games keep the struct on the stack and hand
+    // it to sceGsPutDispEnv, so leaving pmode/smode2/bgcolor untouched hands garbage to
+    // PMODE (SRW Z's movie player: both CRT circuits off, nothing displayed).
+    static bool writeGsDispEnv(uint8_t *rdram, uint32_t addr, const GsDispEnvMem &env)
     {
         uint8_t *ptr = getMemPtr(rdram, addr);
         if (!ptr)
             return false;
-        GsDispEnvMem env{};
-        std::memcpy(&env, ptr, sizeof(env));
-        env.dispfb = dispfb;
-        env.display = display;
         std::memcpy(ptr, &env, sizeof(env));
         return true;
     }
@@ -1879,6 +1915,14 @@ namespace
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
         auto &regs = runtime->memory().gs();
+        if (regs.pmode != env.pmode || regs.dispfb2 != env.dispfb || regs.display2 != env.display)
+        {
+            static uint32_t s_dispEnvLogCount = 0u;
+            if (s_dispEnvLogCount++ < 64u)
+                std::cerr << "[gs:priv] DispEnv pmode=0x" << std::hex << env.pmode << " smode2=0x" << env.smode2
+                          << " dispfb=0x" << env.dispfb << " display=0x" << env.display << " bgcolor=0x" << env.bgcolor
+                          << std::dec << std::endl;
+        }
         regs.pmode = env.pmode;
         regs.smode2 = env.smode2;
         regs.dispfb1 = env.dispfb;
@@ -1939,15 +1983,105 @@ namespace
         env.dthe = {dthe ? 1u : 0u, GS_REG_DTHE};
         env.test2 = {makeTest(ztest), GS_REG_TEST_2};
     }
+}
 
-    static uint32_t writeGsGParamToScratch(PS2Runtime *runtime)
+namespace
+{
+    // Snapshots (docs/SNAPSHOT-DESIGN.md). This header's globals live in an anonymous
+    // namespace, so every stub file has its own copy; each file's snapshot hook calls
+    // these to save and restore its copy. Host caches (the cdrom leaf indexes, the disc
+    // image size) are not saved: they rebuild on first use.
+    [[maybe_unused]] void snapshotSaveSupport(ps2x::StateWriter &w)
     {
-        if (!runtime)
-            return 0;
-        uint8_t *scratch = runtime->memory().getScratchpad();
-        if (!scratch)
-            return 0;
-        std::memcpy(scratch + kGsParamScratchOffset, &g_gparam, sizeof(g_gparam));
-        return PS2_SCRATCHPAD_BASE + kGsParamScratchOffset;
+        w.sortedMap(g_cdFilesByKey, [&w](const CdFileEntry &entry)
+                    {
+                        w.str(entry.hostPath.string());
+                        w.u32(entry.sizeBytes);
+                        w.u32(entry.baseLbn);
+                        w.u32(entry.sectors); });
+        w.u32(g_nextPseudoLbn);
+        w.i32(g_lastCdError);
+        w.u32(g_cdMode);
+        w.u32(g_cdStreamingLbn);
+        w.u32(g_cdStreamingEndLbn);
+        w.boolean(g_cdInitialized);
+
+        std::lock_guard<std::mutex> lock(g_file_mutex);
+        w.size(g_file_map.size());
+        std::vector<uint32_t> handles;
+        for (const auto &[handle, file] : g_file_map)
+            handles.push_back(handle);
+        std::sort(handles.begin(), handles.end());
+        for (const uint32_t handle : handles)
+        {
+            FILE *file = g_file_map[handle];
+            const auto info = g_file_info.find(handle);
+            w.u32(handle);
+            w.str(info != g_file_info.end() ? info->second.path : std::string());
+            w.str(info != g_file_info.end() ? info->second.mode : std::string());
+            w.i64(file ? static_cast<int64_t>(std::ftell(file)) : -1);
+        }
+        w.u32(g_next_file_handle);
+
+        std::lock_guard<std::mutex> dmaLock(g_dmaStubMutex);
+        w.podMap(g_dmaPendingPolls);
+    }
+
+    [[maybe_unused]] void snapshotLoadSupport(ps2x::StateReader &r)
+    {
+        r.sortedMap(g_cdFilesByKey, [&r](CdFileEntry &entry)
+                    {
+                        entry.hostPath = std::filesystem::path(r.str());
+                        entry.sizeBytes = r.u32();
+                        entry.baseLbn = r.u32();
+                        entry.sectors = r.u32(); });
+        g_nextPseudoLbn = r.u32();
+        g_lastCdError = r.i32();
+        g_cdMode = r.u32();
+        g_cdStreamingLbn = r.u32();
+        g_cdStreamingEndLbn = r.u32();
+        g_cdInitialized = r.boolean();
+        g_cdLeafIndex.clear();
+        g_cdLoosePathIndex.clear();
+        g_cdLeafIndexRoot.clear();
+        g_cdLeafIndexBuilt = false;
+        g_cdImageSizeValid = false;
+
+        std::lock_guard<std::mutex> lock(g_file_mutex);
+        for (auto &[handle, file] : g_file_map)
+        {
+            if (file)
+                std::fclose(file);
+        }
+        g_file_map.clear();
+        g_file_info.clear();
+        const size_t count = r.size();
+        for (size_t i = 0; i < count; ++i)
+        {
+            const uint32_t handle = r.u32();
+            const std::string path = r.str();
+            std::string mode = r.str();
+            const int64_t position = r.i64();
+            // Reopen without truncating what the game already wrote.
+            if (!mode.empty() && mode[0] == 'w')
+                mode = mode.find('+') != std::string::npos ? "r+b" : "r+b";
+            else if (!mode.empty() && mode[0] == 'a')
+                mode = "ab";
+            FILE *file = path.empty() ? nullptr : ::fopen(path.c_str(), mode.c_str());
+            if (!file)
+            {
+                std::cerr << "[snapshot] libc file handle " << handle << " ('" << path
+                          << "') could not be reopened" << std::endl;
+                continue;
+            }
+            if (position > 0)
+                std::fseek(file, static_cast<long>(position), SEEK_SET);
+            g_file_map[handle] = file;
+            g_file_info[handle] = StubFileInfo{path, mode};
+        }
+        g_next_file_handle = r.u32();
+
+        std::lock_guard<std::mutex> dmaLock(g_dmaStubMutex);
+        r.podMap(g_dmaPendingPolls);
     }
 }

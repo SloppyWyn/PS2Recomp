@@ -40,6 +40,11 @@ namespace ps2x::iop
     class IopSubsystem;
 }
 
+namespace ps2x::audio
+{
+    class Spu2Output;
+}
+
 class PS2IopHostAdapter;
 class PS2IopTransport;
 class EeScheduler;
@@ -271,6 +276,9 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
 
 class PS2Runtime
 {
+    // Snapshot save/restore (ps2_snapshot.cpp) reads and writes the private state.
+    friend struct PS2SnapshotAccess;
+
 public:
     struct IoPaths
     {
@@ -345,6 +353,10 @@ public:
                              uint32_t fallthroughPc,
                              GuestBranchKind kind,
                              const char *debugName);
+    // PS2X_TRACE_CALLS hook (ps2_call_trace.h); returns true when the call was logged.
+    bool traceGuestCall(const R5900Context *ctx, uint32_t targetPc, uint32_t sourcePc, bool isCall);
+    // Guest state for the crash handler (ps2_crash.h), without taking locks.
+    std::string crashGuestReport();
     void reportMissingFunction(uint8_t *rdram,
                                R5900Context *ctx,
                                uint32_t targetPc,
@@ -482,7 +494,15 @@ private:
     [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
     void advanceIopEeCycles(uint64_t eeCycles) noexcept;
+    [[nodiscard]] uint64_t iopEeCyclesUntilNextEvent() const noexcept;
+    void setIopBatchedTiming(bool enabled) noexcept;
+    // Batched timing: runs the IOP up to the present before the EE observes or changes IOP
+    // state (RPC, SIF transfers, IOP memory, module loads). Only on the EE executor thread;
+    // free when batching is off.
+    void syncIopTime() const noexcept;
     void resetIop();
+    // SPU2 mixed output (PS2X_SPU2_WAV / PS2X_AUDIO_SPU2): finish and detach it.
+    void closeSpu2Output();
 
     friend class PS2IopTransport;
     friend class EeScheduler;
@@ -494,6 +514,7 @@ private:
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;
+    std::unique_ptr<ps2x::audio::Spu2Output> m_spu2Output;
     PSPadBackend m_padBackend;
     PS2RomDevice m_romDevice;
     PS2Vfs m_vfs;
@@ -530,6 +551,8 @@ public:
     std::atomic<uint32_t> m_debugRa{0};
     std::atomic<uint32_t> m_debugSp{0};
     std::atomic<uint32_t> m_debugGp{0};
+    // The EE context the scheduler is running now (for crash reports; live registers).
+    std::atomic<const R5900Context *> m_activeGuestContext{nullptr};
 
 private:
     struct LoadedModule

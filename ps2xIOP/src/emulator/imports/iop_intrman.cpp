@@ -111,3 +111,18 @@ namespace ps2x::iop::detail
         return true;
     }
 }
+
+namespace ps2x::iop::detail
+{
+    void IopIntrman::saveState(ps2x::StateWriter &w) const
+    {
+        w.podMap(m_handlers);
+        w.podMap(m_enabled);
+    }
+
+    void IopIntrman::loadState(ps2x::StateReader &r)
+    {
+        r.podMap(m_handlers);
+        r.podMap(m_enabled);
+    }
+}

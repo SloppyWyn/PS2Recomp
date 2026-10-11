@@ -12,10 +12,12 @@ namespace ps2recomp
     ControlFlowAnalyzer::ControlFlowAnalyzer(
         const std::vector<Section> &sections,
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
-        RecompilerReporter *reporter)
+        RecompilerReporter *reporter,
+        bool linkBranchResume)
         : m_sections(sections),
           m_configJumpTableTargetsByAddress(configuredJumpTableTargetsByAddress),
-          m_reporter(reporter)
+          m_reporter(reporter),
+          m_linkBranchResume(linkBranchResume)
     {
     }
 
@@ -159,6 +161,15 @@ namespace ps2recomp
                 else
                 {
                     queueExternalEntryTarget(target);
+                }
+
+                // A branch-and-link returns to branch+8 like a jal: the callee's jr $ra
+                // comes back through the scheduler when the call chain was switched out.
+                if (m_linkBranchResume && inst.opcode == OPCODE_REGIMM &&
+                    (inst.rt == REGIMM_BLTZAL || inst.rt == REGIMM_BGEZAL ||
+                     inst.rt == REGIMM_BLTZALL || inst.rt == REGIMM_BGEZALL))
+                {
+                    queueResumeEntryTarget(inst.address + 8u);
                 }
             }
             else if (isStaticJump)

@@ -96,7 +96,7 @@ namespace ps2recomp
         return targets;
     }
 
-    std::string ControlFlowEmitter::delaySlotCode() const
+    std::string ControlFlowEmitter::delaySlotCode(bool asDelaySlot) const
     {
         if (!hasRealDelaySlot())
         {
@@ -120,7 +120,16 @@ namespace ps2recomp
             code += " (Delay Slot)\n";
         }
 
+        if (m_gen.m_lean.memoryHelpers && asDelaySlot)
+        {
+            // Memory accesses in the delay slot publish pc/in_delay_slot/branch_pc on their
+            // slow path (PS2X_*_DS) instead of the branch code doing it around them.
+            m_gen.m_leanInDelaySlot = true;
+            m_gen.m_leanDelaySlotBranchPc = branchPc();
+        }
         code += m_gen.translateInstruction(m_delaySlot);
+        m_gen.m_leanInDelaySlot = false;
+        m_gen.m_leanDelaySlotBranchPc = 0;
         return code;
     }
 
@@ -131,11 +140,22 @@ namespace ps2recomp
             return;
         }
 
-        m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
-        m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
-        m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
-
         const std::string code = delaySlotCode();
+        // lean_codegen: the delay-slot state is observable only by code that reaches the
+        // runtime (raiseCop0Exception reads in_delay_slot/branch_pc, handleSyscall checks
+        // the flag). A delay slot that cannot get there (register ops, plain RAM access through
+        // the lean helpers, which publish the state themselves on their slow path) is emitted
+        // bare. A GIF-kick override is a runtime call, so it keeps the full protocol.
+        const bool publishDelayState =
+            !m_gen.m_lean.delaySlotFlags || !m_delaySlotOverride.empty() || CodeGenerator::leanTranslationObservesPc(code);
+
+        if (publishDelayState)
+        {
+            m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, delayPc());
+            m_ss << fmt::format("{}ctx->in_delay_slot = true;\n", indent);
+            m_ss << fmt::format("{}ctx->branch_pc = 0x{:X}u;\n", indent, branchPc());
+        }
+
         std::istringstream lines(code);
         std::string line;
         while (std::getline(lines, line))
@@ -146,7 +166,10 @@ namespace ps2recomp
             }
         }
 
-        m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        if (publishDelayState)
+        {
+            m_ss << fmt::format("{}ctx->in_delay_slot = false;\n", indent);
+        }
     }
 
     void ControlFlowEmitter::emitResumeFromDelaySlotEntry()
@@ -157,7 +180,31 @@ namespace ps2recomp
         }
 
         m_ss << fmt::format("    if (ctx->pc == 0x{:X}u) {{\n", delayPc());
-        emitDelaySlot("        ");
+        if (m_gen.m_resumeIntoOwner)
+        {
+            // Entered at the delay slot (a resume there, or a branch into it): the branch is
+            // not taken and the instruction just falls through, so it runs as a plain
+            // instruction, without in_delay_slot/branch_pc set (a syscall would be refused
+            // there, and a COP0 exception would record EPC at the branch with BD set).
+            if (hasRealDelaySlot())
+            {
+                m_ss << fmt::format("        ctx->pc = 0x{:X}u;\n", delayPc());
+                // lean_codegen: a plain instruction here too (no _DS memory helper).
+                std::istringstream lines(delaySlotCode(false));
+                std::string line;
+                while (std::getline(lines, line))
+                {
+                    if (!line.empty())
+                    {
+                        m_ss << "        " << line << "\n";
+                    }
+                }
+            }
+        }
+        else
+        {
+            emitDelaySlot("        ");
+        }
         m_ss << fmt::format("        ctx->pc = 0x{:X}u;\n", fallthroughPc());
 
         if (isInternalTarget(fallthroughPc()))
@@ -214,12 +261,31 @@ namespace ps2recomp
             return false;
         }
 
-        const std::string functionName = m_gen.getFunctionName(target);
+        std::string functionName = m_gen.getFunctionName(target);
+        bool viaOwner = false;
+        if (functionName.empty())
+        {
+            // resume_into_owner: the target is a label registered to its owner function;
+            // ctx->pc already holds the target, so the owner's pc switch lands on the label.
+            const auto ownerIt = m_gen.m_resumeOwnerByTarget.find(target);
+            if (ownerIt != m_gen.m_resumeOwnerByTarget.end())
+            {
+                functionName = m_gen.getFunctionName(ownerIt->second);
+                viaOwner = !functionName.empty();
+            }
+        }
         if (functionName.empty())
         {
             return false;
         }
 
+        if (viaOwner)
+        {
+            // A safe point like dispatchGuestBranch's: a chain of cross-function jumps into
+            // labels must still reach a checkpoint and must not grow the native stack without
+            // bound. ctx->pc holds the target, so the scheduler resumes the owner at the label.
+            m_ss << indent << "if (runtime->eeCheckpointDue()) { return; }\n";
+        }
         m_ss << indent << functionName << "(rdram, ctx, runtime); return;\n";
         return true;
     }
@@ -478,8 +544,13 @@ namespace ps2recomp
             }
         }
 
+        std::string condition = conditionalBranchExpression();
+        if (m_gen.m_lean.zeroFold)
+        {
+            condition = CodeGenerator::leanFoldZeroRegisters(std::move(condition));
+        }
         m_ss << "    {\n";
-        m_ss << "        const bool " << branchTakenVar << " = (" << conditionalBranchExpression() << ");\n";
+        m_ss << "        const bool " << branchTakenVar << " = (" << condition << ");\n";
 
         if (!unconditionalLinkCode.empty())
         {
@@ -554,7 +625,20 @@ namespace ps2recomp
     {
         (void)m_function;
         emitResumeFromDelaySlotEntry();
-        m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
+        const bool knownBranch =
+            m_branchInst.opcode == OPCODE_J || m_branchInst.opcode == OPCODE_JAL ||
+            (m_branchInst.opcode == OPCODE_SPECIAL &&
+             (m_branchInst.function == SPECIAL_JR || m_branchInst.function == SPECIAL_JALR)) ||
+            m_branchInst.isBranch;
+        // lean_codegen: nothing observes the branch's own pc. Between here and the next store
+        // (the target before a goto/dispatch/return, the fallthrough, or a delay slot's slow
+        // path) only the link register and the delay slot are touched; a trapping delay slot
+        // reports branch_pc, which the delay-slot protocol sets. The fallback path (an
+        // instruction with a delay slot the emitter does not know) keeps the store.
+        if (!m_gen.m_lean.pcStores || !knownBranch)
+        {
+            m_ss << fmt::format("    ctx->pc = 0x{:X}u;\n", branchPc());
+        }
 
         if (m_branchInst.opcode == OPCODE_J || m_branchInst.opcode == OPCODE_JAL)
         {

@@ -141,9 +141,9 @@ namespace ps2recomp
         case MMI2_PMSUBW:
             return translatePMSUBW(inst);
         case MMI2_PMFHI:
-            return fmt::format("SET_GPR_U64(ctx, {}, ctx->hi);", rd);
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_set_epi64x((int64_t)ctx->hi1, (int64_t)ctx->hi));", rd); // 128-bit HI
         case MMI2_PMFLO:
-            return fmt::format("SET_GPR_U64(ctx, {}, ctx->lo);", rd);
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_set_epi64x((int64_t)ctx->lo1, (int64_t)ctx->lo));", rd); // 128-bit LO
         case MMI2_PINTH:
             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PINTH(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
         case MMI2_PMULTW:
@@ -228,15 +228,15 @@ namespace ps2recomp
         switch (subfunc)
         {
         case PMFHL_LW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LW(ctx->hi, ctx->lo));", inst.rd);
+            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LW(ctx->hi, ctx->lo, ctx->hi1, ctx->lo1));", inst.rd);
         case PMFHL_UW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_UW(ctx->hi, ctx->lo));", inst.rd);
+            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_UW(ctx->hi, ctx->lo, ctx->hi1, ctx->lo1));", inst.rd);
         case PMFHL_SLW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SLW(ctx->hi, ctx->lo));", inst.rd);
+            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SLW(ctx->hi, ctx->lo, ctx->hi1, ctx->lo1));", inst.rd);
         case PMFHL_LH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LH(ctx->hi, ctx->lo));", inst.rd);
+            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LH(ctx->hi, ctx->lo, ctx->hi1, ctx->lo1));", inst.rd);
         case PMFHL_SH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SH(ctx->hi, ctx->lo));", inst.rd);
+            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SH(ctx->hi, ctx->lo, ctx->hi1, ctx->lo1));", inst.rd);
         default:
             return emitUnhandledInstruction(inst, fmt::format("Unhandled PMFHL instruction: function 0x{:X}", subfunc));
         }
@@ -249,7 +249,7 @@ namespace ps2recomp
         switch (subfunc)
         {
         case PMFHL_LW:
-            return fmt::format("{{ __m128i val = GPR_VEC(ctx, {}); ctx->lo = _mm_extract_epi32(val, 0); ctx->hi = _mm_extract_epi32(val, 1); }}", inst.rs);
+            return fmt::format("ps2_pmthl_lw(GPR_VEC(ctx, {}), ctx->hi, ctx->lo, ctx->hi1, ctx->lo1);", inst.rs);
         default:
             return emitUnhandledInstruction(inst, fmt::format("Unhandled PMTHL instruction: function 0x{:X}", subfunc));
         }
@@ -585,13 +585,13 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMTHI(const Instruction &inst)
     {
-        return fmt::format("ctx->hi = GPR_U32(ctx, {});", inst.rs); // PMTHI uses standard HI/LO
+        return fmt::format("{{ const __m128i v = GPR_VEC(ctx, {}); ctx->hi = (uint64_t)PS2_EXTRACT_EPI64_0(v); ctx->hi1 = (uint64_t)PS2_EXTRACT_EPI64_1(v); }}", inst.rs); // HI = rs (128 bits)
     }
 
 
     std::string CodeGenerator::translatePMTLO(const Instruction &inst)
     {
-        return fmt::format("ctx->lo = GPR_U32(ctx, {});", inst.rs); // PMTLO uses standard HI/LO
+        return fmt::format("{{ const __m128i v = GPR_VEC(ctx, {}); ctx->lo = (uint64_t)PS2_EXTRACT_EPI64_0(v); ctx->lo1 = (uint64_t)PS2_EXTRACT_EPI64_1(v); }}", inst.rs); // LO = rs (128 bits)
     }
 
 

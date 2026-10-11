@@ -233,3 +233,34 @@ namespace ps2_syscalls
 #endif
     }
 }
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_syscalls::snapshot
+{
+    void saveDeci2(ps2x::StateWriter &w)
+    {
+        std::lock_guard<std::mutex> lock(g_deci2Mutex);
+        w.sortedMap(g_deci2Sessions, [&w](const Deci2Session &session)
+                    {
+                        w.u16(session.protocol);
+                        w.u32(session.opt);
+                        w.u32(session.handler);
+                        w.u32(session.userArea);
+                        w.boolean(session.locked); });
+        w.i32(g_nextDeci2Socket);
+    }
+
+    void loadDeci2(ps2x::StateReader &r)
+    {
+        std::lock_guard<std::mutex> lock(g_deci2Mutex);
+        r.sortedMap(g_deci2Sessions, [&r](Deci2Session &session)
+                    {
+                        session.protocol = r.u16();
+                        session.opt = r.u32();
+                        session.handler = r.u32();
+                        session.userArea = r.u32();
+                        session.locked = r.boolean(); });
+        g_nextDeci2Socket = r.i32();
+    }
+}

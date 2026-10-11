@@ -18,3 +18,20 @@ namespace ps2_stubs
         TODO_NAMED("sceRpcGetFPacket2", rdram, ctx, runtime);
     }
 }
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    // No state of its own: only this file's copy of the Helpers/Support.h globals.
+    void saveRpc(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+    }
+
+    void loadRpc(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
+    }
+}

@@ -4,6 +4,7 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace ps2x::iop::detail
 {
@@ -300,6 +301,60 @@ namespace ps2x::iop::detail
         }
     }
 
+    std::string IopKernel::describeThreads(bool readyOnly) const
+    {
+        static constexpr char kStates[] = {'D', 'R', 'X', 'S', 'L', 'M', 'E', 'U', 'Z'};
+        std::string text;
+        char item[64];
+        for (const auto &[id, thread] : m_threads)
+        {
+            const bool runnable = thread.state == IopThreadState::Ready || thread.state == IopThreadState::Running;
+            if (readyOnly && !runnable)
+                continue;
+            const size_t state = static_cast<size_t>(thread.state);
+            std::snprintf(item, sizeof(item), "%s%d:%c:%u:%X", text.empty() ? "" : " ", id,
+                          state < sizeof(kStates) ? kStates[state] : '?', thread.priority, thread.cpu.pc);
+            text += item;
+            if (thread.state == IopThreadState::Semaphore || thread.state == IopThreadState::EventFlag)
+            {
+                std::snprintf(item, sizeof(item), ":w%d", thread.waitId);
+                text += item;
+            }
+            if (thread.wakeupCount != 0)
+            {
+                std::snprintf(item, sizeof(item), ":k%d", thread.wakeupCount);
+                text += item;
+            }
+        }
+        return text;
+    }
+
+    std::string IopKernel::describeSyncObjects() const
+    {
+        std::string text;
+        char item[64];
+        for (const auto &[id, sema] : m_semaphores)
+        {
+            uint32_t waiters = 0u;
+            for (const auto &[threadId, thread] : m_threads)
+                if (thread.state == IopThreadState::Semaphore && thread.waitId == id)
+                    ++waiters;
+            std::snprintf(item, sizeof(item), "%ssem%d:%d/%d", text.empty() ? "" : " ", id, sema.current, sema.maximum);
+            text += item;
+            if (waiters)
+            {
+                std::snprintf(item, sizeof(item), ":%uw", waiters);
+                text += item;
+            }
+        }
+        for (const auto &[id, flag] : m_eventFlags)
+        {
+            std::snprintf(item, sizeof(item), "%sef%d:%X", text.empty() ? "" : " ", id, flag.bits);
+            text += item;
+        }
+        return text;
+    }
+
     bool IopKernel::referThreadStatus(int id, uint32_t outputAddress)
     {
         if (id == 0 && m_currentThread != nullptr)
@@ -415,6 +470,23 @@ namespace ps2x::iop::detail
                 cpu.yielded = true;
                 setV0(0);
             }
+            else if (m_callContextWait && m_callContextWait([this, id] {
+                         const auto sema = m_semaphores.find(id);
+                         return sema == m_semaphores.end() || sema->second.current > 0;
+                     }))
+            {
+                // Outside a thread: time passed until an interrupt signalled it.
+                const auto sema = m_semaphores.find(id);
+                if (sema == m_semaphores.end())
+                    setV0(-1);
+                else
+                {
+                    --sema->second.current;
+                    setV0(0);
+                }
+            }
+            else
+                setV0(-419); // outside a thread and nothing scheduled can signal it
             return true;
         }
         case 11:
@@ -618,7 +690,26 @@ namespace ps2x::iop::detail
                 cpu.yielded = true;
             }
             else
-                setV0(-418);
+            {
+                // Outside a thread: let time pass until an interrupt sets the bits.
+                const int id = event->second.id;
+                const uint32_t resultAddress = cpu.gpr[7];
+                auto ready = [this, id, bits, mode] {
+                    const auto flag = m_eventFlags.find(id);
+                    return flag == m_eventFlags.end() || eventSatisfied(flag->second, bits, mode);
+                };
+                const auto flag = (m_callContextWait && m_callContextWait(ready)) ? m_eventFlags.find(id) : m_eventFlags.end();
+                if (flag == m_eventFlags.end())
+                    setV0(-418);
+                else
+                {
+                    if (resultAddress != 0u)
+                        m_memory.write32(resultAddress, flag->second.bits);
+                    if ((mode & 0x10u) != 0u)
+                        flag->second.bits = 0u;
+                    setV0(0);
+                }
+            }
             return true;
         }
         case 13:
@@ -671,6 +762,11 @@ namespace ps2x::iop::detail
 
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
     {
+        return beginNextReadyBefore(currentCycle, UINT32_MAX);
+    }
+
+    IopThread *IopKernel::beginNextReadyBefore(uint64_t currentCycle, uint32_t priority)
+    {
         for (auto &[id, thread] : m_threads)
         {
             if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
@@ -686,7 +782,7 @@ namespace ps2x::iop::detail
                 (thread.priority == next->priority && thread.id < next->id))
                 next = &thread;
         }
-        if (next == nullptr)
+        if (next == nullptr || next->priority > priority)
             return nullptr;
 
         m_currentThread = next;
@@ -705,6 +801,16 @@ namespace ps2x::iop::detail
                 nextWake = std::min(nextWake, thread.wakeCycle);
         }
         return nextWake;
+    }
+
+    bool IopKernel::hasRunnableThread() const noexcept
+    {
+        for (const auto &[id, thread] : m_threads)
+        {
+            if (thread.state == IopThreadState::Ready || thread.state == IopThreadState::Running)
+                return true;
+        }
+        return false;
     }
 
     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
@@ -740,5 +846,32 @@ namespace ps2x::iop::detail
             if (pc >= base && pc < base + size)
                 thread.state = IopThreadState::Dead;
         }
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopKernel::saveState(ps2x::StateWriter &w) const
+    {
+        w.podMap(m_threads);
+        w.podMap(m_semaphores);
+        w.podMap(m_eventFlags);
+        w.u32(m_nextThreadId);
+        w.u32(m_nextSemaphoreId);
+        w.u32(m_nextEventFlagId);
+        w.i32(m_currentThread ? m_currentThread->id : 0);
+    }
+
+    void IopKernel::loadState(ps2x::StateReader &r)
+    {
+        r.podMap(m_threads);
+        r.podMap(m_semaphores);
+        r.podMap(m_eventFlags);
+        m_nextThreadId = r.u32();
+        m_nextSemaphoreId = r.u32();
+        m_nextEventFlagId = r.u32();
+        const int current = r.i32();
+        const auto it = m_threads.find(current);
+        m_currentThread = (current != 0 && it != m_threads.end()) ? &it->second : nullptr;
     }
 }

@@ -162,8 +162,12 @@ struct RpcServerState
 struct RpcClientState
 {
     bool busy = false;
+    // Named padding, zeroed: the snapshot hooks write this struct as raw bytes (podMap), so
+    // equal states give equal bytes (the typed-stub differential compares them).
+    uint8_t reserved[3] = {};
     uint32_t last_rpc = 0;
     uint32_t sid = 0;
+    uint32_t callSequence = 0; // bumped by every sceSifCallRpc on this client
 };
 
 struct SifRpcDebugEvent

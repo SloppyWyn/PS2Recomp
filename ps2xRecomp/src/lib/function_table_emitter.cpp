@@ -105,15 +105,30 @@ namespace ps2recomp
             addEntry(address, name);
         }
 
-        for (const auto &[ownerStart, targets] : cg.m_resumeEntryTargetsByOwner)
+        // An address several owners register (nested Ghidra functions) goes to the first one
+        // seen. With resume_into_owner that is the outermost (lowest start), the same choice
+        // as the absorbed labels and CodeGenerator::m_resumeOwnerByTarget; otherwise the map's
+        // order, as before.
+        std::vector<const std::pair<const uint32_t, std::vector<uint32_t>> *> owners;
+        owners.reserve(cg.m_resumeEntryTargetsByOwner.size());
+        for (const auto &entry : cg.m_resumeEntryTargetsByOwner)
         {
-            const std::string ownerName = cg.getFunctionName(ownerStart);
+            owners.push_back(&entry);
+        }
+        if (cg.m_resumeIntoOwner)
+        {
+            std::sort(owners.begin(), owners.end(), [](const auto *a, const auto *b)
+                      { return a->first < b->first; });
+        }
+        for (const auto *entry : owners)
+        {
+            const std::string ownerName = cg.getFunctionName(entry->first);
             if (ownerName.empty())
             {
                 continue;
             }
 
-            for (uint32_t target : targets)
+            for (uint32_t target : entry->second)
             {
                 addEntry(target, ownerName);
             }
@@ -169,6 +184,55 @@ namespace ps2recomp
         ss << "    }\n";
         ss << "};\n";
         ss << "static const GeneratedFunctionTableInitializer g_generatedFunctionTableInitializer;\n";
+        ss << "}\n";
+
+        // Guest names for the runtime (ps2_guest_names.h): every function and fragment with
+        // its guest range, so logs, traces and crash reports can print name+offset.
+        std::vector<const Function *> named;
+        for (const auto &function : functions)
+        {
+            if ((function.isRecompiled || function.isStub || function.isSkipped) && !function.name.empty())
+            {
+                named.push_back(&function);
+            }
+        }
+        std::sort(named.begin(), named.end(), [](const Function *a, const Function *b)
+                  { return a->start < b->start; });
+        ss << "\n#include \"ps2_guest_names.h\"\n";
+        ss << "namespace {\n";
+        ss << "const PS2GuestFunctionName g_ps2GuestFunctionNames[] = {\n";
+        for (const Function *function : named)
+        {
+            uint32_t flags = 0u;
+            if (function->name.rfind("entry_", 0) == 0)
+                flags |= 1u; // PS2X_GUEST_NAME_FRAGMENT
+            if (function->isStub)
+                flags |= 2u; // PS2X_GUEST_NAME_STUB
+            if (function->isSkipped)
+                flags |= 4u; // PS2X_GUEST_NAME_SKIPPED
+            const auto display = cg.m_guestDisplayNames.find(function->start);
+            const std::string &shownName =
+                display != cg.m_guestDisplayNames.end() && !display->second.empty() ? display->second : function->name;
+            std::string escaped;
+            for (const char ch : shownName)
+            {
+                const auto byte = static_cast<unsigned char>(ch);
+                if (byte < 0x20u || byte >= 0x7fu)
+                    continue;
+                if (ch == '"' || ch == '\\' || ch == '?') // '?': no trigraphs
+                    escaped.push_back('\\');
+                escaped.push_back(ch);
+            }
+            ss << "    {0x" << std::hex << function->start << "u, 0x" << function->end << "u, \"" << escaped
+               << "\", " << std::dec << flags << "u},\n";
+        }
+        if (named.empty())
+        {
+            ss << "    {0u, 0u, nullptr, 0u},\n";
+        }
+        ss << "};\n";
+        ss << "const bool g_ps2GuestFunctionNamesRegistered = ps2xRegisterGuestFunctionNames(\n";
+        ss << "    g_ps2GuestFunctionNames, sizeof(g_ps2GuestFunctionNames) / sizeof(g_ps2GuestFunctionNames[0]));\n";
         ss << "}\n";
 
         return ss.str();

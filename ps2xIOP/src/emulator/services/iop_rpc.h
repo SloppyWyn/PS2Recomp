@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
+#include "ps2x/state_stream.h"
 
 namespace ps2x::iop
 {
@@ -38,6 +39,11 @@ namespace ps2x::iop::detail
         {
             return executeGuestFunction(address, a0, a1, a2, a3, gp);
         }
+        // An RPC request about to be served by a server whose thread has priority `priority`:
+        // on the hardware the request readies that thread, which runs only once every thread
+        // that goes before it (higher or equal priority, ready or preempted mid-work) has
+        // blocked. Runs those threads now. Default: nothing (tests, executors without threads).
+        virtual void runThreadsBeforeServer(uint32_t priority) { (void)priority; }
     };
 
     class IopRpcBridge
@@ -46,6 +52,10 @@ namespace ps2x::iop::detail
         IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept;
 
         void reset();
+
+        // Snapshots (docs/SNAPSHOT-DESIGN.md).
+        void saveState(ps2x::StateWriter &w) const;
+        void loadState(ps2x::StateReader &r);
         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
@@ -66,6 +76,7 @@ namespace ps2x::iop::detail
             uint32_t callback = 0;
             uint32_t callbackBuffer = 0;
             uint32_t queue = 0;
+            uint32_t threadPriority = 0; // of the thread that registered it; 0 = not in a thread
         };
 
         IopHost &m_host;

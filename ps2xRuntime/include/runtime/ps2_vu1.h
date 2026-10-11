@@ -2,6 +2,7 @@
 #define PS2_VU1_H
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 
 class GS;
@@ -37,6 +38,8 @@ struct VU1State
 
 class VU1Interpreter
 {
+    friend struct PS2SnapshotAccess;
+
 public:
     enum class Unit : uint8_t
     {
@@ -62,7 +65,36 @@ public:
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
 
+    // PS2X_VU1_STATS=1 (VU1 only; off: no counting): cumulative work per micro program entry,
+    // written by the thread running the VU at the end of each run() slice, read by the tick-line
+    // printer. key = FNV-1a hash of all of micro memory when it ran << 32 | the pc it was entered
+    // at (MSCAL start, or where an MSCNT/budget slice resumed). runs counts slices that reached
+    // the end of the program (E bit or D/T halt); pairs, cycles and stall cycles (waiting before
+    // a pair could issue) count every slice.
+    struct ProgramStats
+    {
+        std::atomic<uint64_t> key{0}; // 0: free slot
+        std::atomic<uint64_t> runs{0};
+        std::atomic<uint64_t> pairs{0};
+        std::atomic<uint64_t> cycles{0};
+        std::atomic<uint64_t> stallCycles{0};
+    };
+    static constexpr uint32_t kMaxStatsPrograms = 32u;
+    bool statsEnabled() const { return m_statsEnabled; }
+    const std::array<ProgramStats, kMaxStatsPrograms> &programStats() const { return m_programStats; }
+    uint64_t statsOverflowRuns() const { return m_statsOverflowRuns.load(std::memory_order_relaxed); }
+
 private:
+    bool m_statsEnabled = false;
+    uint64_t m_statsCodeGeneration = ~0ull;
+    const uint8_t *m_statsCode = nullptr;
+    uint32_t m_statsCodeHash = 0;
+    std::array<ProgramStats, kMaxStatsPrograms> m_programStats{};
+    std::atomic<uint64_t> m_statsOverflowRuns{0};
+    void recordRunStats(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory,
+                        uint32_t entryPc, bool programEnded,
+                        uint64_t pairs, uint64_t cycles, uint64_t stallCycles);
+
     enum Pipeline : uint8_t
     {
         PipelineNone = 0,
@@ -216,6 +248,20 @@ private:
     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
+    // Earliest readyCycle among the pending entries above (UINT64_MAX: none; 0: unknown, scan):
+    // commitReadyPipelines skips its scan of every slot until m_cycle reaches it. Not saved in
+    // snapshots (a load sets 0).
+    uint64_t m_nextCommitCycle = 0;
+    // The same per pipeline (0: scan it).
+    enum PipeKind : uint32_t { kPipeFlag, kPipeFdiv, kPipeEfu, kPipeStore, kPipeVf, kPipeVi, kPipeAcc, kPipeCount };
+    std::array<uint64_t, kPipeCount> m_pipeNext{};
+    void noteReady(PipeKind kind, uint64_t readyCycle) noexcept
+    {
+        if (readyCycle < m_pipeNext[kind])
+            m_pipeNext[kind] = readyCycle;
+        if (readyCycle < m_nextCommitCycle)
+            m_nextCommitCycle = readyCycle;
+    }
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};

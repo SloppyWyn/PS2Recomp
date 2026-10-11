@@ -149,3 +149,20 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 }
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    // No state of its own: only this file's copy of the Helpers/Support.h globals.
+    void saveFileIo(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+    }
+
+    void loadFileIo(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
+    }
+}

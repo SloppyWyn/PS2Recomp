@@ -433,12 +433,14 @@
     X(sceMcMkdir)                             \
     X(sceMcOpen)                              \
     X(sceMcRead)                              \
+    X(sceMcReadFast)                          \
     X(sceMcRename)                            \
     X(sceMcSeek)                              \
     X(sceMcSetFileInfo)                       \
     X(sceMcSync)                              \
     X(sceMcUnformat)                          \
     X(sceMcWrite)                             \
+    X(sceMcWriteFast)                         \
     X(sceMpegAddBs)                           \
     X(sceMpegAddCallback)                     \
     X(sceMpegAddStrCallback)                  \

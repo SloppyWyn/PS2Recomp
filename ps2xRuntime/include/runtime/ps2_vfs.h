@@ -51,6 +51,8 @@ public:
 
 class PS2Vfs
 {
+    friend struct PS2SnapshotAccess;
+
 public:
     PS2Vfs() = default;
     ~PS2Vfs();
@@ -74,6 +76,7 @@ private:
         std::unique_ptr<IPS2OpenFile> file;
         std::string device;
         std::string path;
+        uint32_t flags = 0u; // open flags, so a snapshot can reopen the file
     };
 
     mutable std::mutex m_mutex;

@@ -226,6 +226,16 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+        // Optional second argument: a disc image (2048-byte sectors) that CD reads come
+        // from, so sector reads see the real disc layout instead of only loose files.
+        if (argc >= 3 && argv[2] && argv[2][0] != '\0')
+        {
+            PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+            paths.cdImage = std::filesystem::path(argv[2]);
+            PS2Runtime::setIoPaths(paths);
+            std::cout << "CD image: " << PS2Runtime::getIoPaths().cdImage.string() << std::endl;
+        }
+
         runtime.run();
 
 #ifdef _DEBUG

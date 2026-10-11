@@ -1,3 +1,4 @@
+#include "runtime/ps2_deterministic.h"
 #include "Common.h"
 #include "MemoryCard.h"
 
@@ -21,6 +22,11 @@ namespace ps2_stubs
         constexpr int32_t kMcCmdUnformat = 0x11;
         constexpr int32_t kMcCmdGetEntSpace = 0x12;
         constexpr int32_t kMcCmdRename = 0x13;
+        // The *Fast variants report their own RPC function numbers through
+        // sceMcSync (checked against SDK 3.1.0 libmc: sceMcReadFast stores 0x16,
+        // sceMcWriteFast 0x1B into the pending-command slot).
+        constexpr int32_t kMcCmdReadFast = 0x16;
+        constexpr int32_t kMcCmdWriteFast = 0x1B;
 
         constexpr int32_t kMcResultSucceed = 0;
         constexpr int32_t kMcResultChangedCard = -1;
@@ -252,17 +258,10 @@ namespace ps2_stubs
             return resolved.lexically_normal();
         }
 
-        bool localtimeSafeMc(const std::time_t *value, std::tm *out)
-        {
-#ifdef _WIN32
-            return localtime_s(out, value) == 0;
-#else
-            return localtime_r(value, out) != nullptr;
-#endif
-        }
-
         std::time_t fileTimeToTimeTMc(std::filesystem::file_time_type value)
         {
+            if (ps2x::det::enabled())
+                return ps2x::det::epoch(); // host file times differ between runs
             const auto systemTime = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
                 value - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
             return std::chrono::system_clock::to_time_t(systemTime);
@@ -287,7 +286,7 @@ namespace ps2_stubs
         void writeMcDateTime(SceMcStDateTime &out, std::time_t value)
         {
             std::tm tm{};
-            if (!localtimeSafeMc(&value, &tm))
+            if (!ps2x::det::calendar(&value, &tm))
             {
                 std::memset(&out, 0, sizeof(out));
                 return;
@@ -509,17 +508,29 @@ namespace ps2_stubs
         return snapshot;
     }
 
-    void sceMcChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcChangeThreadPriority(int level)
+    PS2_STUB_TYPED(int32_t, sceMcChangeThreadPriority, int32_t level)
+    {
+        (void)level;
+        return 0;
+    }
+
+    void sceMcChangeThreadPriority_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
     }
 
-    void sceMcChdir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceMcChangeThreadPriority)
+
+    // The body of sceMcChdir after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcChdirBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7)
     {
-        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
-        const uint32_t pathAddr = getRegU32(ctx, 6);
-        const uint32_t currentDirAddr = getRegU32(ctx, 7);
+        (void)ctx;
+        (void)runtime;
+        const int32_t port = static_cast<int32_t>(r4);
+        const int32_t slot = static_cast<int32_t>(r5);
+        const uint32_t pathAddr = r6;
+        const uint32_t currentDirAddr = r7;
         const std::string requestedDir =
             (pathAddr != 0u) ? readPs2CStringBounded(rdram, pathAddr, kMcMaxPathLen) : std::string{};
 
@@ -558,12 +569,28 @@ namespace ps2_stubs
         RUNTIME_LOG("[MC] Chdir port=" << port << " '" << requestedDir
                                        << "' -> result=" << result << " cwd='" << currentDir << "'");
         writeMcCString(rdram, currentDirAddr, currentDir);
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcChdir(int port, int slot, const char *newDir, char *currentDir)
+    PS2_STUB_TYPED(int32_t, sceMcChdir, int32_t port, int32_t slot, ps2_abi::gptr newDir, ps2_abi::gptr currentDir)
     {
-        const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
+        return sceMcChdirBody(rdram, ctx, runtime, static_cast<uint32_t>(port), static_cast<uint32_t>(slot), static_cast<uint32_t>(newDir), static_cast<uint32_t>(currentDir));
+    }
+
+    void sceMcChdir_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcChdirBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcChdir)
+
+    // The body of sceMcClose after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcCloseBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4)
+    {
+        (void)ctx;
+        (void)runtime;
+        const int32_t fd = static_cast<int32_t>(r4);
         int32_t result = kMcResultNoEntry;
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
@@ -578,14 +605,30 @@ namespace ps2_stubs
             }
             setMcCommandResultLocked(kMcCmdClose, result);
         }
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcDelete(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcClose(int fd)
+    PS2_STUB_TYPED(int32_t, sceMcClose, int32_t fd)
     {
-        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
-        const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+        return sceMcCloseBody(rdram, ctx, runtime, static_cast<uint32_t>(fd));
+    }
+
+    void sceMcClose_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcCloseBody(rdram, ctx, runtime, getRegU32(ctx, 4)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcClose)
+
+    // The body of sceMcDelete after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcDeleteBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5, uint32_t r6)
+    {
+        (void)ctx;
+        (void)runtime;
+        const int32_t port = static_cast<int32_t>(r4);
+        const int32_t slot = static_cast<int32_t>(r5);
+        const std::string path = readPs2CStringBounded(rdram, r6, kMcMaxPathLen);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -626,10 +669,43 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdDelete, result);
         }
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcDelete(int port, int slot, const char *name)
+    PS2_STUB_TYPED(int32_t, sceMcDelete, int32_t port, int32_t slot, ps2_abi::gptr name)
+    {
+        return sceMcDeleteBody(rdram, ctx, runtime, static_cast<uint32_t>(port), static_cast<uint32_t>(slot), static_cast<uint32_t>(name));
+    }
+
+    void sceMcDelete_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcDeleteBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcDelete)
+
+    // int sceMcEnd(void)
+    PS2_STUB0_TYPED(int32_t, sceMcEnd)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_mcStateMutex);
+            closeMcFilesLocked();
+            g_mcNextFd = 1;
+            g_mcLastCmd = 0;
+            g_mcLastResult = 0;
+            g_mcCommandPending = false;
+            for (McPortState &state : g_mcPorts)
+            {
+                state.currentDir = "/";
+            }
+        }
+
+        // libmc teardown is just a local state reset in this immediate runtime model.
+        return 0;
+    }
+
+    void sceMcEnd_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
@@ -648,9 +724,14 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
-    void sceMcFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceMcEnd)
+
+    // The body of sceMcFlush after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcFlushBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4)
     {
-        const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
+        (void)ctx;
+        (void)runtime;
+        const int32_t fd = static_cast<int32_t>(r4);
         int32_t result = kMcResultNoEntry;
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
@@ -661,13 +742,29 @@ namespace ps2_stubs
             }
             setMcCommandResultLocked(kMcCmdFlush, result);
         }
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcFormat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcFlush(int fd)
+    PS2_STUB_TYPED(int32_t, sceMcFlush, int32_t fd)
     {
-        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
+        return sceMcFlushBody(rdram, ctx, runtime, static_cast<uint32_t>(fd));
+    }
+
+    void sceMcFlush_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcFlushBody(rdram, ctx, runtime, getRegU32(ctx, 4)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcFlush)
+
+    // The body of sceMcFormat after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcFormatBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5)
+    {
+        (void)ctx;
+        (void)runtime;
+        const int32_t port = static_cast<int32_t>(r4);
+        const int32_t slot = static_cast<int32_t>(r5);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -691,16 +788,32 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdFormat, result);
         }
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcGetDir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcFormat(int port, int slot)
+    PS2_STUB_TYPED(int32_t, sceMcFormat, int32_t port, int32_t slot)
     {
-        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
-        const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
-        const int32_t maxEntries = static_cast<int32_t>(getRegU32(ctx, 8));
-        const uint32_t tableAddr = getRegU32(ctx, 9);
+        return sceMcFormatBody(rdram, ctx, runtime, static_cast<uint32_t>(port), static_cast<uint32_t>(slot));
+    }
+
+    void sceMcFormat_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcFormatBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcFormat)
+
+    // The body of sceMcGetDir after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcGetDirBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r8, uint32_t r9)
+    {
+        (void)ctx;
+        (void)runtime;
+        const int32_t port = static_cast<int32_t>(r4);
+        const int32_t slot = static_cast<int32_t>(r5);
+        const std::string rawPath = readPs2CStringBounded(rdram, r6, kMcMaxPathLen);
+        const int32_t maxEntries = static_cast<int32_t>(r8);
+        const uint32_t tableAddr = r9;
 
         std::vector<SceMcTblGetDir> entries;
         int32_t result = kMcResultNoEntry;
@@ -764,7 +877,7 @@ namespace ps2_stubs
                     if (std::filesystem::exists(hostDir, ec) && !ec &&
                         std::filesystem::is_directory(hostDir, ec))
                     {
-                        const std::time_t now = std::time(nullptr);
+                        const std::time_t now = ps2x::det::now();
                         auto appendSpecial = [&](const std::string &name)
                         {
                             if (!wildcardMatch(pattern, name))
@@ -844,10 +957,37 @@ namespace ps2_stubs
         }
         RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
                                         << "' maxent=" << maxEntries << " -> result=" << result);
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcGetEntSpace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcGetDir(int port, int slot, const char *name, unsigned mode, int maxent, sceMcTblGetDir *table)
+    PS2_STUB_TYPED(int32_t, sceMcGetDir, int32_t port, int32_t slot, ps2_abi::gptr name, uint32_t mode, int32_t maxent, ps2_abi::gptr table)
+    {
+        (void)mode;
+        return sceMcGetDirBody(rdram, ctx, runtime, static_cast<uint32_t>(port), static_cast<uint32_t>(slot), static_cast<uint32_t>(name), static_cast<uint32_t>(maxent), static_cast<uint32_t>(table));
+    }
+
+    void sceMcGetDir_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcGetDirBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 8), getRegU32(ctx, 9)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcGetDir)
+
+    // int sceMcGetEntSpace(int port, int slot, const char *path)
+    PS2_STUB_TYPED(int32_t, sceMcGetEntSpace, int32_t port, int32_t slot, ps2_abi::gptr path)
+    {
+        (void)port;
+        (void)slot;
+        (void)path;
+        {
+            std::lock_guard<std::mutex> lock(g_mcStateMutex);
+            setMcCommandResultLocked(kMcCmdGetEntSpace, 1024);
+        }
+        return 0;
+    }
+
+    void sceMcGetEntSpace_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
@@ -856,13 +996,18 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
-    void sceMcGetInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceMcGetEntSpace)
+
+    // The body of sceMcGetInfo after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcGetInfoBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8)
     {
-        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
-        const uint32_t typePtr = getRegU32(ctx, 6);
-        const uint32_t freePtr = getRegU32(ctx, 7);
-        const uint32_t formatPtr = getRegU32(ctx, 8);
+        (void)ctx;
+        (void)runtime;
+        const int32_t port = static_cast<int32_t>(r4);
+        const int32_t slot = static_cast<int32_t>(r5);
+        const uint32_t typePtr = r6;
+        const uint32_t freePtr = r7;
+        const uint32_t formatPtr = r8;
 
         int32_t cardType = 0;
         int32_t freeBlocks = 0;
@@ -908,15 +1053,58 @@ namespace ps2_stubs
         RUNTIME_LOG("[MC] GetInfo port=" << port << " type=" << cardType
                                          << " free=" << freeBlocks << " format=" << format
                                          << " result=" << result);
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcGetSlotMax(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcGetInfo(int port, int slot, int *type, int *free, int *format)
+    PS2_STUB_TYPED(int32_t, sceMcGetInfo, int32_t port, int32_t slot, ps2_abi::gptr type, ps2_abi::gptr freeBlocks, ps2_abi::gptr format)
+    {
+        return sceMcGetInfoBody(rdram, ctx, runtime, static_cast<uint32_t>(port), static_cast<uint32_t>(slot), static_cast<uint32_t>(type), static_cast<uint32_t>(freeBlocks), static_cast<uint32_t>(format));
+    }
+
+    void sceMcGetInfo_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcGetInfoBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 8)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcGetInfo)
+
+    // int sceMcGetSlotMax(int port)
+    PS2_STUB_TYPED(int32_t, sceMcGetSlotMax, int32_t port)
+    {
+        (void)port;
+        return 1;
+    }
+
+    void sceMcGetSlotMax_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 1);
     }
 
-    void sceMcInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceMcGetSlotMax)
+
+    // int sceMcInit(void)
+    PS2_STUB0_TYPED(int32_t, sceMcInit)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_mcStateMutex);
+            closeMcFilesLocked();
+            g_mcNextFd = 1;
+            g_mcLastCmd = 0;
+            g_mcLastResult = 0;
+            g_mcCommandPending = false;
+            for (McPortState &state : g_mcPorts)
+            {
+                state.currentDir = "/";
+                state.formatted = true;
+            }
+        }
+        ensureMcRootExists(0);
+        ensureMcRootExists(1);
+        return 0;
+    }
+
+    void sceMcInit_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
@@ -936,11 +1124,16 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
-    void sceMcMkdir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceMcInit)
+
+    // The body of sceMcMkdir after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcMkdirBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5, uint32_t r6)
     {
-        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
-        const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+        (void)ctx;
+        (void)runtime;
+        const int32_t port = static_cast<int32_t>(r4);
+        const int32_t slot = static_cast<int32_t>(r5);
+        const std::string path = readPs2CStringBounded(rdram, r6, kMcMaxPathLen);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -977,15 +1170,31 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdMkdir, result);
         }
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcOpen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcMkdir(int port, int slot, const char *name)
+    PS2_STUB_TYPED(int32_t, sceMcMkdir, int32_t port, int32_t slot, ps2_abi::gptr name)
     {
-        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
-        const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
-        const uint32_t flags = getRegU32(ctx, 7);
+        return sceMcMkdirBody(rdram, ctx, runtime, static_cast<uint32_t>(port), static_cast<uint32_t>(slot), static_cast<uint32_t>(name));
+    }
+
+    void sceMcMkdir_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcMkdirBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcMkdir)
+
+    // The body of sceMcOpen after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcOpenBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7)
+    {
+        (void)ctx;
+        (void)runtime;
+        const int32_t port = static_cast<int32_t>(r4);
+        const int32_t slot = static_cast<int32_t>(r5);
+        const std::string path = readPs2CStringBounded(rdram, r6, kMcMaxPathLen);
+        const uint32_t flags = r7;
 
         int32_t result = kMcResultNoEntry;
         {
@@ -1040,53 +1249,114 @@ namespace ps2_stubs
             }
             setMcCommandResultLocked(kMcCmdOpen, result);
         }
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcOpen(int port, int slot, const char *name, int mode)
+    PS2_STUB_TYPED(int32_t, sceMcOpen, int32_t port, int32_t slot, ps2_abi::gptr name, int32_t mode)
     {
-        const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
-        const uint32_t dstAddr = getRegU32(ctx, 5);
-        const int32_t size = static_cast<int32_t>(getRegU32(ctx, 6));
-        uint8_t *dst = (size > 0) ? getMemPtr(rdram, dstAddr) : nullptr;
+        return sceMcOpenBody(rdram, ctx, runtime, static_cast<uint32_t>(port), static_cast<uint32_t>(slot), static_cast<uint32_t>(name), static_cast<uint32_t>(mode));
+    }
 
-        int32_t result = kMcResultNoEntry;
+    void sceMcOpen_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcOpenBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcOpen)
+
+    namespace
+    {
+        // Shared body of sceMcRead and sceMcReadFast: (fd, buf, size) in a0..a2,
+        // the byte count (or a negative libmc error) reported through sceMcSync.
+        // After decoding: (fd, buf, size); the result goes to sceMcSync, v0 is 0. Shared by the typed
+        // and the legacy form (mcReadCommon decodes from the registers, as before).
+        void mcReadBody(uint8_t *rdram, int32_t cmd, int32_t fd, uint32_t dstAddr, int32_t size)
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            auto it = g_mcFiles.find(fd);
-            if (size <= 0)
-            {
-                result = 0;
-            }
-            else if (it == g_mcFiles.end() || !it->second.file)
-            {
-                result = kMcResultNoEntry;
-            }
-            else if (!dst)
-            {
-                result = kMcResultDeniedPermit;
-            }
-            else
-            {
-                const size_t bytesRead = std::fread(dst, 1u, static_cast<size_t>(size), it->second.file);
-                result = std::ferror(it->second.file) ? kMcResultDeniedPermit : static_cast<int32_t>(bytesRead);
-                if (std::ferror(it->second.file))
-                {
-                    std::clearerr(it->second.file);
-                }
-            }
+            uint8_t *dst = (size > 0) ? getMemPtr(rdram, dstAddr) : nullptr;
 
-            setMcCommandResultLocked(kMcCmdRead, result);
+            int32_t result = kMcResultNoEntry;
+            {
+                std::lock_guard<std::mutex> lock(g_mcStateMutex);
+                auto it = g_mcFiles.find(fd);
+                if (size <= 0)
+                {
+                    result = 0;
+                }
+                else if (it == g_mcFiles.end() || !it->second.file)
+                {
+                    result = kMcResultNoEntry;
+                }
+                else if (!dst)
+                {
+                    result = kMcResultDeniedPermit;
+                }
+                else
+                {
+                    const size_t bytesRead = std::fread(dst, 1u, static_cast<size_t>(size), it->second.file);
+                    result = std::ferror(it->second.file) ? kMcResultDeniedPermit : static_cast<int32_t>(bytesRead);
+                    if (std::ferror(it->second.file))
+                    {
+                        std::clearerr(it->second.file);
+                    }
+                }
+
+                setMcCommandResultLocked(cmd, result);
+            }
         }
-        setReturnS32(ctx, 0);
+
+        void mcReadCommon(uint8_t *rdram, R5900Context *ctx, int32_t cmd)
+        {
+            const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
+            const uint32_t dstAddr = getRegU32(ctx, 5);
+            const int32_t size = static_cast<int32_t>(getRegU32(ctx, 6));
+            mcReadBody(rdram, cmd, fd, dstAddr, size);
+            setReturnS32(ctx, 0);
+        }
     }
 
-    void sceMcRename(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcRead(int fd, void *buff, int size)
+    PS2_STUB_TYPED(int32_t, sceMcRead, int32_t fd, ps2_abi::gptr buff, int32_t size)
     {
-        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
-        const std::string oldPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
-        const std::string newPath = readPs2CStringBounded(rdram, getRegU32(ctx, 7), kMcMaxPathLen);
+        (void)runtime;
+        mcReadBody(rdram, kMcCmdRead, fd, buff, size);
+        return 0;
+    }
+
+    void sceMcRead_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        mcReadCommon(rdram, ctx, kMcCmdRead);
+    }
+
+    PS2_STUB_DISPATCH(sceMcRead)
+
+    // int sceMcReadFast(int fd, void *buf, int size): the IOP DMAs straight into
+    // buf (the SDK copy bounces misaligned head/tail bytes through its own buffer);
+    // for the host the result is the same as sceMcRead.
+    // int sceMcReadFast(int fd, void *buff, int size)
+    PS2_STUB_TYPED(int32_t, sceMcReadFast, int32_t fd, ps2_abi::gptr buff, int32_t size)
+    {
+        (void)runtime;
+        mcReadBody(rdram, kMcCmdReadFast, fd, buff, size);
+        return 0;
+    }
+
+    void sceMcReadFast_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        mcReadCommon(rdram, ctx, kMcCmdReadFast);
+    }
+
+    PS2_STUB_DISPATCH(sceMcReadFast)
+
+    // The body of sceMcRename after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcRenameBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7)
+    {
+        (void)ctx;
+        (void)runtime;
+        const int32_t port = static_cast<int32_t>(r4);
+        const int32_t slot = static_cast<int32_t>(r5);
+        const std::string oldPath = readPs2CStringBounded(rdram, r6, kMcMaxPathLen);
+        const std::string newPath = readPs2CStringBounded(rdram, r7, kMcMaxPathLen);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -1116,14 +1386,30 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdRename, result);
         }
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcRename(int port, int slot, const char *org, const char *newName)
+    PS2_STUB_TYPED(int32_t, sceMcRename, int32_t port, int32_t slot, ps2_abi::gptr org, ps2_abi::gptr newName)
     {
-        const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t offset = static_cast<int32_t>(getRegU32(ctx, 5));
-        const int32_t origin = static_cast<int32_t>(getRegU32(ctx, 6));
+        return sceMcRenameBody(rdram, ctx, runtime, static_cast<uint32_t>(port), static_cast<uint32_t>(slot), static_cast<uint32_t>(org), static_cast<uint32_t>(newName));
+    }
+
+    void sceMcRename_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcRenameBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcRename)
+
+    // The body of sceMcSeek after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcSeekBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5, uint32_t r6)
+    {
+        (void)ctx;
+        (void)runtime;
+        const int32_t fd = static_cast<int32_t>(r4);
+        const int32_t offset = static_cast<int32_t>(r5);
+        const int32_t origin = static_cast<int32_t>(r6);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -1154,14 +1440,30 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdSeek, result);
         }
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcSetFileInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcSeek(int fd, int offset, int mode)
+    PS2_STUB_TYPED(int32_t, sceMcSeek, int32_t fd, int32_t offset, int32_t origin)
     {
-        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
-        const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+        return sceMcSeekBody(rdram, ctx, runtime, static_cast<uint32_t>(fd), static_cast<uint32_t>(offset), static_cast<uint32_t>(origin));
+    }
+
+    void sceMcSeek_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcSeekBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcSeek)
+
+    // The body of sceMcSetFileInfo after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcSetFileInfoBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5, uint32_t r6)
+    {
+        (void)ctx;
+        (void)runtime;
+        const int32_t port = static_cast<int32_t>(r4);
+        const int32_t slot = static_cast<int32_t>(r5);
+        const std::string path = readPs2CStringBounded(rdram, r6, kMcMaxPathLen);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -1187,13 +1489,31 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdSetFileInfo, result);
         }
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcSetFileInfo(int port, int slot, const char *name, const char *info, unsigned valid)
+    PS2_STUB_TYPED(int32_t, sceMcSetFileInfo, int32_t port, int32_t slot, ps2_abi::gptr name, ps2_abi::gptr info, uint32_t valid)
     {
-        const uint32_t cmdPtr = getRegU32(ctx, 5);
-        const uint32_t resultPtr = getRegU32(ctx, 6);
+        (void)info;
+        (void)valid;
+        return sceMcSetFileInfoBody(rdram, ctx, runtime, static_cast<uint32_t>(port), static_cast<uint32_t>(slot), static_cast<uint32_t>(name));
+    }
+
+    void sceMcSetFileInfo_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcSetFileInfoBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcSetFileInfo)
+
+    // The body of sceMcSync after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcSyncBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r5, uint32_t r6)
+    {
+        (void)ctx;
+        (void)runtime;
+        const uint32_t cmdPtr = r5;
+        const uint32_t resultPtr = r6;
         int32_t cmd = 0;
         int32_t result = 0;
         bool hadPending = false;
@@ -1209,8 +1529,7 @@ namespace ps2_stubs
         // on it to tell idle polling apart from command completion.
         if (!hadPending)
         {
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         RUNTIME_LOG("[MC] Sync cmd=" << cmd << " result=" << result);
@@ -1231,13 +1550,30 @@ namespace ps2_stubs
         }
 
         // 1 = command finished in this runtime's immediate model.
-        setReturnS32(ctx, 1);
+        return 1;
     }
 
-    void sceMcUnformat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcSync(int mode, int *cmd, int *result)
+    PS2_STUB_TYPED(int32_t, sceMcSync, int32_t mode, ps2_abi::gptr cmd, ps2_abi::gptr result)
     {
-        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
-        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
+        (void)mode;
+        return sceMcSyncBody(rdram, ctx, runtime, static_cast<uint32_t>(cmd), static_cast<uint32_t>(result));
+    }
+
+    void sceMcSync_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcSyncBody(rdram, ctx, runtime, getRegU32(ctx, 5), getRegU32(ctx, 6)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcSync)
+
+    // The body of sceMcUnformat after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sceMcUnformatBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t r4, uint32_t r5)
+    {
+        (void)ctx;
+        (void)runtime;
+        const int32_t port = static_cast<int32_t>(r4);
+        const int32_t slot = static_cast<int32_t>(r5);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -1261,50 +1597,106 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdUnformat, result);
         }
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceMcWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceMcUnformat(int port, int slot)
+    PS2_STUB_TYPED(int32_t, sceMcUnformat, int32_t port, int32_t slot)
     {
-        const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
-        const uint32_t srcAddr = getRegU32(ctx, 5);
-        const int32_t size = static_cast<int32_t>(getRegU32(ctx, 6));
-        const uint8_t *src = (size > 0) ? getConstMemPtr(rdram, srcAddr) : nullptr;
+        return sceMcUnformatBody(rdram, ctx, runtime, static_cast<uint32_t>(port), static_cast<uint32_t>(slot));
+    }
 
-        int32_t result = kMcResultNoEntry;
+    void sceMcUnformat_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, sceMcUnformatBody(rdram, ctx, runtime, getRegU32(ctx, 4), getRegU32(ctx, 5)));
+    }
+
+    PS2_STUB_DISPATCH(sceMcUnformat)
+
+    namespace
+    {
+        // Shared body of sceMcWrite and sceMcWriteFast.
+        // After decoding: (fd, buf, size); the result goes to sceMcSync, v0 is 0. Shared by the typed
+        // and the legacy form (mcWriteCommon decodes from the registers, as before).
+        void mcWriteBody(uint8_t *rdram, int32_t cmd, int32_t fd, uint32_t srcAddr, int32_t size)
         {
-            std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            auto it = g_mcFiles.find(fd);
-            if (size <= 0)
+            const uint8_t *src = (size > 0) ? getConstMemPtr(rdram, srcAddr) : nullptr;
+
+            int32_t result = kMcResultNoEntry;
             {
-                result = 0;
-            }
-            else if (it == g_mcFiles.end() || !it->second.file)
-            {
-                result = kMcResultNoEntry;
-            }
-            else if (!src)
-            {
-                result = kMcResultDeniedPermit;
-            }
-            else
-            {
-                const size_t bytesWritten = std::fwrite(src, 1u, static_cast<size_t>(size), it->second.file);
-                result = std::ferror(it->second.file) ? kMcResultDeniedPermit : static_cast<int32_t>(bytesWritten);
-                if (!std::ferror(it->second.file))
+                std::lock_guard<std::mutex> lock(g_mcStateMutex);
+                auto it = g_mcFiles.find(fd);
+                if (size <= 0)
                 {
-                    std::fflush(it->second.file);
+                    result = 0;
+                }
+                else if (it == g_mcFiles.end() || !it->second.file)
+                {
+                    result = kMcResultNoEntry;
+                }
+                else if (!src)
+                {
+                    result = kMcResultDeniedPermit;
                 }
                 else
                 {
-                    std::clearerr(it->second.file);
+                    const size_t bytesWritten = std::fwrite(src, 1u, static_cast<size_t>(size), it->second.file);
+                    result = std::ferror(it->second.file) ? kMcResultDeniedPermit : static_cast<int32_t>(bytesWritten);
+                    if (!std::ferror(it->second.file))
+                    {
+                        std::fflush(it->second.file);
+                    }
+                    else
+                    {
+                        std::clearerr(it->second.file);
+                    }
                 }
-            }
 
-            setMcCommandResultLocked(kMcCmdWrite, result);
+                setMcCommandResultLocked(cmd, result);
+            }
         }
-        setReturnS32(ctx, 0);
+
+        void mcWriteCommon(uint8_t *rdram, R5900Context *ctx, int32_t cmd)
+        {
+            const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
+            const uint32_t srcAddr = getRegU32(ctx, 5);
+            const int32_t size = static_cast<int32_t>(getRegU32(ctx, 6));
+            mcWriteBody(rdram, cmd, fd, srcAddr, size);
+            setReturnS32(ctx, 0);
+        }
     }
+
+    // int sceMcWrite(int fd, const void *buff, int size)
+    PS2_STUB_TYPED(int32_t, sceMcWrite, int32_t fd, ps2_abi::gptr buff, int32_t size)
+    {
+        (void)runtime;
+        mcWriteBody(rdram, kMcCmdWrite, fd, buff, size);
+        return 0;
+    }
+
+    void sceMcWrite_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        mcWriteCommon(rdram, ctx, kMcCmdWrite);
+    }
+
+    PS2_STUB_DISPATCH(sceMcWrite)
+
+    // int sceMcWriteFast(int fd, const void *buf, int size): same as sceMcWrite
+    // for the host (the SDK copy only skips the EE-side staging buffer).
+    // int sceMcWriteFast(int fd, const void *buff, int size)
+    PS2_STUB_TYPED(int32_t, sceMcWriteFast, int32_t fd, ps2_abi::gptr buff, int32_t size)
+    {
+        (void)runtime;
+        mcWriteBody(rdram, kMcCmdWriteFast, fd, buff, size);
+        return 0;
+    }
+
+    void sceMcWriteFast_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        mcWriteCommon(rdram, ctx, kMcCmdWriteFast);
+    }
+
+    PS2_STUB_DISPATCH(sceMcWriteFast)
 
     void mcCallMessageTypeSe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -1528,5 +1920,77 @@ namespace ps2_stubs
     void mcWriteStartSaveFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 1);
+    }
+}
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    void saveMemoryCard(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+        std::lock_guard<std::mutex> lock(g_mcStateMutex);
+        w.i32(g_mcNextFd);
+        w.i32(g_mcLastCmd);
+        w.boolean(g_mcCommandPending);
+        w.i32(g_mcLastResult);
+        w.sortedMap(g_mcFiles, [&w](const McOpenFile &file)
+                    {
+                        w.i32(file.port);
+                        w.str(file.hostPath.string());
+                        w.i64(file.file ? static_cast<int64_t>(std::ftell(file.file)) : -1); });
+        for (const McPortState &port : g_mcPorts)
+        {
+            w.str(port.currentDir);
+            w.boolean(port.formatted);
+        }
+        w.i32(g_cvMcFileCursor);
+    }
+
+    void loadMemoryCard(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
+        std::lock_guard<std::mutex> lock(g_mcStateMutex);
+        for (auto &[fd, file] : g_mcFiles)
+        {
+            if (file.file)
+                std::fclose(file.file);
+        }
+        g_mcFiles.clear();
+        g_mcNextFd = r.i32();
+        g_mcLastCmd = r.i32();
+        g_mcCommandPending = r.boolean();
+        g_mcLastResult = r.i32();
+        const size_t count = r.size();
+        for (size_t i = 0; i < count; ++i)
+        {
+            const int32_t fd = r.pod<int32_t>();
+            McOpenFile file{};
+            file.port = r.i32();
+            file.hostPath = std::filesystem::path(r.str());
+            const int64_t position = r.i64();
+            // The open mode is not kept: reopen for update without truncating, read-only
+            // if the file is not writable.
+            file.file = std::fopen(file.hostPath.string().c_str(), "r+b");
+            if (!file.file)
+                file.file = std::fopen(file.hostPath.string().c_str(), "rb");
+            if (!file.file)
+            {
+                std::cerr << "[snapshot] memory card fd " << fd << " ('" << file.hostPath.string()
+                          << "') could not be reopened" << std::endl;
+                continue;
+            }
+            if (position > 0)
+                std::fseek(file.file, static_cast<long>(position), SEEK_SET);
+            g_mcFiles.emplace(fd, std::move(file));
+        }
+        for (McPortState &port : g_mcPorts)
+        {
+            port.currentDir = r.str();
+            port.formatted = r.boolean();
+        }
+        g_cvMcFileCursor = r.i32();
     }
 }

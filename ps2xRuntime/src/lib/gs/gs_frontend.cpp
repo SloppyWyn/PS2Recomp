@@ -1,14 +1,34 @@
+#include "runtime/ps2_deterministic.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_pace_log.h"
+#include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <sstream>
+
+// PS2X_GS_LOG_LIMIT=N raises every GS debug log cap (GIF tags, primitives, kicks,
+// register writes, copies) to N lines; unset keeps the small defaults.
+static uint32_t gsDebugLogLimit(uint32_t fallback)
+{
+    static const uint32_t s_limit = []() -> uint32_t
+    {
+        const char *value = std::getenv("PS2X_GS_LOG_LIMIT");
+        if (!value || !*value)
+            return 0u;
+        const unsigned long parsed = std::strtoul(value, nullptr, 10);
+        return parsed > 0xFFFFFFFul ? 0xFFFFFFFu : static_cast<uint32_t>(parsed);
+    }();
+    return s_limit != 0u ? s_limit : fallback;
+}
+
 
 namespace
 {
@@ -113,6 +133,8 @@ GS::GS()
 
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
+    // A re-init (new local memory) must not swap the memory under queued commands.
+    sync();
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
@@ -120,10 +142,24 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
         m_backend = std::make_unique<GSCpuBackend>();
     m_backend->Initialize(vram, vramSize);
     reset();
+    // Asynchronous by default, as on the console; PS2X_GS_ASYNC=0 keeps the GS on the caller's
+    // thread (synchronous: every GIF packet is rasterised before the call returns).
+    const char *asyncValue = std::getenv("PS2X_GS_ASYNC");
+    // Deterministic mode (ps2_deterministic.h): synchronous, so GS results reach the guest at fixed points.
+    const bool wantAsync = !(asyncValue && std::strcmp(asyncValue, "0") == 0) && !ps2x::det::enabled();
+    if (!m_async && wantAsync)
+    {
+        m_async = true;
+        m_asyncThread = std::thread([this]
+                                    { asyncThreadMain(); });
+        m_asyncThreadId = m_asyncThread.get_id();
+        std::cout << "[gs] asynchronous GS thread (PS2X_GS_ASYNC=0 for a synchronous GS)" << std::endl;
+    }
 }
 
 void GS::reset()
 {
+    sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
@@ -197,6 +233,7 @@ GSContext &GS::activeContext()
 
 void GS::snapshotVRAM()
 {
+    sync();
     // Presentation/debug snapshots run outside m_stateMutex so the EE can keep
     // feeding the GS while a backend performs host-side conversion. Keep the
     // selected backend alive and unswappable for the duration of the call.
@@ -212,6 +249,7 @@ void GS::snapshotVRAM()
 
 const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
 {
+    sync();
     m_snapshotMutex.lock();
     if (m_displaySnapshot.empty())
     {
@@ -225,6 +263,7 @@ const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
 
 GSDebugSnapshot GS::getDebugSnapshot() const
 {
+    sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
 
     GSDebugSnapshot snapshot{};
@@ -265,6 +304,7 @@ GSDebugSnapshot GS::getDebugSnapshot() const
 
 std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
 {
+    sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
 
     std::vector<GSDebugHistoryEntry> out;
@@ -475,6 +515,7 @@ void GS::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp
 
 bool GS::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const
 {
+    sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!m_hasPreferredDisplaySource)
     {
@@ -526,6 +567,9 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 void GS::latchHostPresentationFrame()
 {
+    // The picture of everything the guest has sent so far: the GS thread may lag the EE by up
+    // to a VBlank, and the guest has already switched the display to the buffer it just drew.
+    sync();
     GSPresentationRequest request{};
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -638,7 +682,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+void GS::processGIFPacketImpl(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
@@ -736,7 +780,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
-bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+bool GS::processNativePackedGIFPacketImpl(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
@@ -783,6 +827,20 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
+    if (!runInline())
+    {
+        if (!data || sizeBytes == 0u)
+            return;
+        AsyncCommand command;
+        command.kind = AsyncKind::UploadImage;
+        command.q[0] = bitbltbuf;
+        command.q[1] = trxpos;
+        command.q[2] = trxreg;
+        command.q[3] = trxdir;
+        command.data.assign(data, data + sizeBytes);
+        enqueue(std::move(command));
+        return;
+    }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
@@ -913,7 +971,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         bool adk = ((hi >> 47) & 1) != 0;
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
-            if (debugIndex < 64u)
+            if (debugIndex < gsDebugLogLimit(64u))
             {
                 RUNTIME_LOG("[gs:packed-xyzf] idx=" << debugIndex
                                                     << " x=" << x
@@ -951,7 +1009,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         bool adk = ((hi >> 47) & 1) != 0;
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
-            if (debugIndex < 64u)
+            if (debugIndex < gsDebugLogLimit(64u))
             {
                 RUNTIME_LOG("[gs:packed-xyz] idx=" << debugIndex
                                                    << " x=" << x
@@ -987,7 +1045,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
     {
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
-            if (debugIndex < 64u)
+            if (debugIndex < gsDebugLogLimit(64u))
             {
                 RUNTIME_LOG("[gs:packed-xyzf3] idx=" << debugIndex
                                                      << " x=" << static_cast<uint32_t>(lo & 0xFFFFu)
@@ -1018,7 +1076,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
     {
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
-            if (debugIndex < 64u)
+            if (debugIndex < gsDebugLogLimit(64u))
             {
                 RUNTIME_LOG("[gs:packed-xyz3] idx=" << debugIndex
                                                     << " x=" << static_cast<uint32_t>(lo & 0xFFFFu)
@@ -1061,6 +1119,15 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    if (!runInline())
+    {
+        AsyncCommand command;
+        command.kind = AsyncKind::WriteRegister;
+        command.reg = regAddr;
+        command.q[0] = value;
+        enqueue(std::move(command));
+        return;
+    }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     writeRegisterUnlocked(regAddr, value);
 }
@@ -1101,7 +1168,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         if (interestingReg)
         {
             const uint32_t debugIndex = s_debugGsRegisterCount.fetch_add(1, std::memory_order_relaxed);
-            if (debugIndex < 128u)
+            if (debugIndex < gsDebugLogLimit(128u))
             {
                 RUNTIME_LOG("[gs:reg] idx=" << debugIndex
                                             << " reg=0x" << std::hex << static_cast<uint32_t>(regAddr)
@@ -1124,7 +1191,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         regAddr == GS_REG_SCISSOR_2;
     PS2_IF_AGRESSIVE_LOGS({
         if (isCopyRelevantReg &&
-            s_debugCopyRegCount.fetch_add(1u, std::memory_order_relaxed) < 64u)
+            s_debugCopyRegCount.fetch_add(1u, std::memory_order_relaxed) < gsDebugLogLimit(64u))
         {
             RUNTIME_LOG("[gs:copy-reg] reg=0x"
                         << std::hex << static_cast<uint32_t>(regAddr)
@@ -1531,7 +1598,7 @@ void GS::vertexKick(bool drawing)
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t debugIndex = s_debugGsVertexKickCount.fetch_add(1, std::memory_order_relaxed);
-        if (debugIndex < 96u)
+        if (debugIndex < gsDebugLogLimit(96u))
         {
             RUNTIME_LOG("[gs:kick] idx=" << debugIndex
                                          << " drawing=" << static_cast<uint32_t>(drawing ? 1u : 0u)
@@ -1614,13 +1681,13 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 }
 
 
-bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+bool GS::clearFramebufferContextImpl(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
-bool GS::clearActiveFramebuffer(uint32_t rgba)
+bool GS::clearActiveFramebufferImpl(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
@@ -1628,12 +1695,14 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }
 
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 {
+    sync();
     if (!backend)
         backend = std::make_unique<GSCpuBackend>();
 
@@ -1663,15 +1732,244 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
+    sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
 }
 
-void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+void GS::writeVramImpl(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_backend)
         m_backend->WriteVram(psm, base, bw, x, y, value);
+}
+
+void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+{
+    if (!runInline())
+    {
+        if (!data || sizeBytes < 16u)
+            return;
+        AsyncCommand command;
+        command.kind = AsyncKind::GifPacket;
+        command.data.assign(data, data + sizeBytes);
+        enqueue(std::move(command));
+        return;
+    }
+    processGIFPacketImpl(data, sizeBytes);
+}
+
+bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+{
+    if (!runInline())
+    {
+        // The result depends only on the packet's own layout: decide it here.
+        if (!data || sizeBytes < 16u || !m_backend || !validatePackedGifPacket(data, sizeBytes))
+            return false;
+        AsyncCommand command;
+        command.kind = AsyncKind::NativePackedGifPacket;
+        command.data.assign(data, data + sizeBytes);
+        enqueue(std::move(command));
+        return true;
+    }
+    return processNativePackedGIFPacketImpl(data, sizeBytes);
+}
+
+bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+{
+    if (!runInline())
+    {
+        // Queued like a GIF packet; no caller uses the result.
+        AsyncCommand command;
+        command.kind = AsyncKind::ClearContext;
+        command.u[0] = contextIndex;
+        command.u[1] = rgba;
+        enqueue(std::move(command));
+        return m_backend != nullptr;
+    }
+    return clearFramebufferContextImpl(contextIndex, rgba);
+}
+
+bool GS::clearActiveFramebuffer(uint32_t rgba)
+{
+    if (!runInline())
+    {
+        AsyncCommand command;
+        command.kind = AsyncKind::ClearActive;
+        command.u[0] = rgba;
+        enqueue(std::move(command));
+        return m_backend != nullptr;
+    }
+    return clearActiveFramebufferImpl(rgba);
+}
+
+void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+{
+    if (!runInline())
+    {
+        AsyncCommand command;
+        command.kind = AsyncKind::WriteVram;
+        command.u[0] = psm;
+        command.u[1] = base;
+        command.u[2] = bw;
+        command.u[3] = x;
+        command.u[4] = y;
+        command.q[0] = value;
+        enqueue(std::move(command));
+        return;
+    }
+    writeVramImpl(psm, base, bw, x, y, value);
+}
+
+// ---------------------------------------------------------------- asynchronous GS
+namespace
+{
+    // Back-pressure: the producer waits while this much is queued (a menu frame is a few
+    // hundred KiB of packets, a movie picture upload ~1.3 MiB).
+    constexpr size_t kAsyncMaxQueuedBytes = 64u * 1024u * 1024u;
+    constexpr size_t kAsyncMaxQueuedCommands = 65536u;
+}
+
+GS::~GS()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_asyncMutex);
+        m_asyncStop = true;
+    }
+    m_asyncWork.notify_all();
+    if (m_asyncThread.joinable())
+        m_asyncThread.join();
+}
+
+bool GS::runInline() const noexcept
+{
+    return !m_async || std::this_thread::get_id() == m_asyncThreadId;
+}
+
+void GS::enqueue(AsyncCommand &&command)
+{
+    const size_t bytes = command.data.size();
+    {
+        std::unique_lock<std::mutex> lock(m_asyncMutex);
+        m_asyncDone.wait(lock, [&]
+                         { return m_asyncQueue.empty() ||
+                                  (m_asyncQueuedBytes + bytes <= kAsyncMaxQueuedBytes &&
+                                   m_asyncQueue.size() < kAsyncMaxQueuedCommands); });
+        m_asyncQueue.push_back(std::move(command));
+        m_asyncQueuedBytes += bytes;
+        ++m_asyncEnqueued;
+    }
+    m_asyncWork.notify_one();
+}
+
+void GS::sync() const
+{
+    if (runInline())
+        return;
+    std::unique_lock<std::mutex> lock(m_asyncMutex);
+    const uint64_t target = m_asyncEnqueued;
+    m_asyncDone.wait(lock, [&]
+                     { return m_asyncProcessed >= target; });
+}
+
+void GS::throttleAtVBlank()
+{
+    if (!m_async)
+        return;
+    std::unique_lock<std::mutex> lock(m_asyncMutex);
+    const uint64_t target = m_asyncVBlankMark;
+    m_asyncVBlankMark = m_asyncEnqueued;
+    const bool wait = m_asyncProcessed < target;
+    const auto start = std::chrono::steady_clock::now();
+    if (wait)
+        m_asyncDone.wait(lock, [&]
+                         { return m_asyncProcessed >= target; });
+    if (ps2x::pace::enabled()) [[unlikely]]
+    {
+        const long long waited = wait ? static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()) : 0ll;
+        ps2x::pace::line("GSQ busy=%lld queued=%llu bytes=%llu throttle=%lld",
+                         static_cast<long long>(m_asyncBusyUs),
+                         static_cast<unsigned long long>(m_asyncEnqueued - m_asyncProcessed),
+                         static_cast<unsigned long long>(m_asyncQueuedBytes), waited);
+    }
+    m_asyncBusyUs = 0;
+}
+
+void GS::execute(const AsyncCommand &command)
+{
+    const uint8_t *data = command.data.data();
+    const uint32_t size = static_cast<uint32_t>(command.data.size());
+    switch (command.kind)
+    {
+    case AsyncKind::GifPacket:
+        processGIFPacketImpl(data, size);
+        break;
+    case AsyncKind::NativePackedGifPacket:
+        processNativePackedGIFPacketImpl(data, size);
+        break;
+    case AsyncKind::UploadImage:
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        uploadImageNativeUnlocked(command.q[0], command.q[1], command.q[2], command.q[3], data, size);
+        break;
+    }
+    case AsyncKind::WriteRegister:
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        writeRegisterUnlocked(command.reg, command.q[0]);
+        break;
+    }
+    case AsyncKind::ClearContext:
+        clearFramebufferContextImpl(command.u[0], command.u[1]);
+        break;
+    case AsyncKind::ClearActive:
+        clearActiveFramebufferImpl(command.u[0]);
+        break;
+    case AsyncKind::WriteVram:
+        writeVramImpl(command.u[0], command.u[1], command.u[2], command.u[3], command.u[4], static_cast<uint32_t>(command.q[0]));
+        break;
+    }
+}
+
+void GS::asyncThreadMain()
+{
+    for (;;)
+    {
+        AsyncCommand command;
+        {
+            std::unique_lock<std::mutex> lock(m_asyncMutex);
+            m_asyncWork.wait(lock, [&]
+                             { return m_asyncStop || !m_asyncQueue.empty(); });
+            if (m_asyncQueue.empty())
+                return;
+            command = std::move(m_asyncQueue.front());
+            m_asyncQueue.pop_front();
+        }
+        const auto start = std::chrono::steady_clock::now();
+        // A command that throws must still count as processed, or sync() and the VBlank
+        // throttle would wait for it forever. (Synchronously, the exception reached the guest
+        // call that sent the packet; here there is no such caller: log it and go on.)
+        try
+        {
+            execute(command);
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[gs:async] command " << static_cast<int>(command.kind) << " threw: " << e.what() << std::endl;
+        }
+        catch (...)
+        {
+            std::cerr << "[gs:async] command " << static_cast<int>(command.kind) << " threw" << std::endl;
+        }
+        const int64_t busy = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+        {
+            std::lock_guard<std::mutex> lock(m_asyncMutex);
+            m_asyncQueuedBytes -= command.data.size();
+            ++m_asyncProcessed;
+            m_asyncBusyUs += busy;
+        }
+        m_asyncDone.notify_all();
+    }
 }
 
 GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const

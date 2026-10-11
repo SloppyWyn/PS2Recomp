@@ -6,6 +6,12 @@ namespace ps2_stubs
 {
     void resetMpegStubState();
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr);
+    // Stream callback mode: -1 = PS2X_MPEG_SYNC_STRCB, 0 = queued, 1 = synchronous inside the
+    // no-data callback only, 2 = synchronous always. Rollback: -1 = PS2X_MPEG_DEMUX_BACKPRESSURE.
+    void setMpegStreamCallbackModeForTesting(int mode);
+    void setMpegDemuxRollbackForTesting(int enabled);
+    size_t mpegDemuxReplayBytesForTesting(uint32_t mpegAddr);
+    uint64_t mpegVideoBytesFedForTesting();
     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
     void notifyMpegCdStreamEof(PS2Runtime *runtime = nullptr);

@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "ps2recomp/control_flow_analyzer.h"
+#include "ps2recomp/types.h"
 
 namespace ps2recomp
 {
@@ -52,7 +53,27 @@ namespace ps2recomp
         void setBootstrapInfo(const BootstrapInfo &info);
         void setRelocationCallNames(const std::unordered_map<uint32_t, std::string> &callNames);
         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
+        // Names shown by the runtime for these guest addresses (instead of Function::name).
+        void setGuestDisplayNames(const std::unordered_map<uint32_t, std::string> &names) { m_guestDisplayNames = names; }
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
+        // resume_into_owner (RecompilerConfig::resumeIntoOwner): set before setResumeEntryTargets.
+        void setResumeIntoOwner(bool enabled) { m_resumeIntoOwner = enabled; }
+        // lean_codegen (RecompilerConfig::leanCodegen).
+        void setLeanCodegen(bool enabled) { m_lean = enabled ? RecompilerConfig::LeanOptions::all() : RecompilerConfig::LeanOptions{}; }
+        // ...or one trim at a time (RecompilerConfig::lean).
+        void setLeanOptions(const RecompilerConfig::LeanOptions &options) { m_lean = options; }
+        // The lines lean output puts after the standard includes (empty when no trim is on).
+        std::string leanIncludeLines() const;
+        // lean_codegen: true when the translated instruction `code` can reach the runtime
+        // (a `runtime->` call, a syscall/stub call, an unhandled-instruction throw, a
+        // lambda-style READ*/WRITE* macro or its own `ctx->pc` store), so `ctx->pc` must be
+        // exact before it. Lean memory helpers (PS2X_READ*/PS2X_WRITE*) publish the pc
+        // themselves on their slow path and do not count.
+        static bool leanTranslationObservesPc(const std::string &code);
+        // lean_codegen: GPR_*(ctx, 0) reads of $zero become literals.
+        static std::string leanFoldZeroRegisters(std::string code);
+        // Name of the runtime header lean output includes after ps2_runtime_macros.h.
+        static constexpr const char *kLeanMacrosHeader = "ps2_runtime_lean_macros.h";
         void setEmitInstructionComments(bool emitInstructionComments);
         void setReporter(RecompilerReporter *reporter);
 
@@ -66,6 +87,18 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::string> m_relocationCallNames;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_configJumpTableTargetsByAddress;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
+        // resume_into_owner only: resume address -> start of the owner function registered
+        // for it, so a direct jump to such an address calls the owner (its pc switch takes
+        // it to the label) instead of going through the scheduler.
+        std::unordered_map<uint32_t, uint32_t> m_resumeOwnerByTarget;
+        bool m_resumeIntoOwner = false;
+        RecompilerConfig::LeanOptions m_lean;
+        // lean_codegen: set by ControlFlowEmitter while the delay slot of the branch at
+        // m_leanDelaySlotBranchPc is translated, so a memory access there publishes the
+        // delay-slot state on its slow path (raiseCop0Exception reads in_delay_slot/branch_pc).
+        bool m_leanInDelaySlot = false;
+        uint32_t m_leanDelaySlotBranchPc = 0;
+        std::unordered_map<uint32_t, std::string> m_guestDisplayNames;
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
         bool m_emitInstructionComments = true;

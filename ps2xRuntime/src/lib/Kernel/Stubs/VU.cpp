@@ -1,6 +1,8 @@
 #include "Common.h"
 #include "VU.h"
 
+#include <limits>
+
 namespace ps2_stubs
 {
 
@@ -88,6 +90,38 @@ namespace ps2_stubs
             }
         }
 
+        // A float as the VU leaves it: Inf/NaN -> +-MAX, denormal -> +-0.
+        float vuClamp(float value)
+        {
+            uint32_t ignored = 0u;
+            return _mm_cvtss_f32(ps2x_vu0::normalizeResult(_mm_set1_ps(value), ignored));
+        }
+
+        // Q of "vdiv Q, num, den": +-MAX when den is 0.
+        float vuDivide(float num, float den)
+        {
+            if (den == 0.0f)
+                return (std::signbit(num) != std::signbit(den)) ? -std::numeric_limits<float>::max()
+                                                                 : std::numeric_limits<float>::max();
+            return vuClamp(num / den);
+        }
+
+        // libvu0 sceVu0Normalize: xyz scaled by 1/|xyz| (vsqrt, vdiv), w = 0.
+        void normalizeXyz(const float (&s)[4], float (&o)[4])
+        {
+            const float len = std::sqrt((s[0] * s[0]) + (s[1] * s[1]) + (s[2] * s[2]));
+            const float q = vuDivide(1.0f, len);
+            for (int i = 0; i < 3; ++i)
+                o[i] = vuClamp(s[i] * q);
+            o[3] = 0.0f;
+        }
+
+        // FTOI0/FTOI4 as the VU does them: truncating, saturating.
+        int32_t vuFtoi(float value, double scale)
+        {
+            return ps2x_vu0::floatToInt(vuClamp(value), scale);
+        }
+
         void makeIdentityMatrix(float (&out)[16])
         {
             std::fill(std::begin(out), std::end(out), 0.0f);
@@ -146,43 +180,42 @@ namespace ps2_stubs
             mulVuMatrix(in, rot, out);
         }
 
-        // Applies the matrix to the vertex, perspective-divides xyz by w
-        // (w==0 maps to a zero divide rather than Inf/NaN), then converts
-        // x/y to 12.4 fixed point (x16) unconditionally. z/w take the same
-        // x16 conversion when fullFtoi4 is set; otherwise they are plain
-        // integer-truncated (FTOI0) after the divide instead.
-        void rotTransPersOne(const float (&m)[16], const float (&v)[4], bool fullFtoi4, int32_t (&out)[4])
+        // libvu0 sceVu0RotTransPers(N): v' = v*m; Q = 1/v'.w (+-MAX for w = 0); xyz *= Q (w kept);
+        // FTOI4 on all four fields, and with a non-zero mode (the SDK's "mode" argument) FTOI0 on
+        // z and w instead (checked against the game's own copy at 0x10fc60).
+        void rotTransPersOne(const float (&m)[16], const float (&v)[4], bool zwFtoi0, int32_t (&out)[4])
         {
             float t[4];
             t[0] = (m[0] * v[0]) + (m[4] * v[1]) + (m[8] * v[2]) + (m[12] * v[3]);
             t[1] = (m[1] * v[0]) + (m[5] * v[1]) + (m[9] * v[2]) + (m[13] * v[3]);
             t[2] = (m[2] * v[0]) + (m[6] * v[1]) + (m[10] * v[2]) + (m[14] * v[3]);
             t[3] = (m[3] * v[0]) + (m[7] * v[1]) + (m[11] * v[2]) + (m[15] * v[3]);
-            const float q = (t[3] != 0.0f) ? (1.0f / t[3]) : 0.0f;
-            t[0] *= q;
-            t[1] *= q;
-            t[2] *= q;
-            out[0] = static_cast<int32_t>(t[0] * 16.0f);
-            out[1] = static_cast<int32_t>(t[1] * 16.0f);
-            out[2] = fullFtoi4 ? static_cast<int32_t>(t[2] * 16.0f) : static_cast<int32_t>(t[2]);
-            out[3] = fullFtoi4 ? static_cast<int32_t>(t[3] * 16.0f) : static_cast<int32_t>(t[3]);
+            const float q = vuDivide(1.0f, vuClamp(t[3]));
+            t[0] = vuClamp(t[0] * q);
+            t[1] = vuClamp(t[1] * q);
+            t[2] = vuClamp(t[2] * q);
+            out[0] = vuFtoi(t[0], 16.0);
+            out[1] = vuFtoi(t[1], 16.0);
+            out[2] = vuFtoi(t[2], zwFtoi0 ? 1.0 : 16.0);
+            out[3] = vuFtoi(t[3], zwFtoi0 ? 1.0 : 16.0);
         }
 
-        // Guard-band proxy for the COP2 sticky clip flags: nonzero => the
-        // vertex is offscreen. Not the hardware per-plane flag layout.
-        constexpr float kScreenClipGuard = 4096.0f;
-        int32_t screenClipCode(const float (&v)[4])
+        // libvu0 sceVu0ClipScreen: the status flags of "vsub.xyw (v - 0)" and "vsub.xy (4096 - v)"
+        // masked with 0xc0: ZS (0x40) when x, y, w or 4096-x, 4096-y is zero, SS (0x80) when one
+        // is negative. Non-zero = the vertex is off the 4096x4096 GS drawing area.
+        int32_t screenClipStatus(const float (&v)[4])
         {
-            int32_t code = 0;
-            if (v[0] > kScreenClipGuard)
-                code |= 0x1;
-            if (v[0] < -kScreenClipGuard)
-                code |= 0x2;
-            if (v[1] > kScreenClipGuard)
-                code |= 0x4;
-            if (v[1] < -kScreenClipGuard)
-                code |= 0x8;
-            return code;
+            const float values[5] = {v[0], v[1], v[3], 4096.0f - v[0], 4096.0f - v[1]};
+            int32_t status = 0;
+            for (const float value : values)
+            {
+                const float c = vuClamp(value);
+                if (c == 0.0f)
+                    status |= 0x40;
+                if (std::signbit(c))
+                    status |= 0x80;
+            }
+            return status;
         }
     }
 
@@ -247,10 +280,7 @@ namespace ps2_stubs
             };
             auto normalize = [](const float (&s)[4], float (&o)[4])
             {
-                const float len = std::sqrt((s[0] * s[0]) + (s[1] * s[1]) + (s[2] * s[2]) + (s[3] * s[3]));
-                const float inv = (len > 1.0e-6f) ? (1.0f / len) : 0.0f;
-                for (int i = 0; i < 4; ++i)
-                    o[i] = s[i] * inv;
+                normalizeXyz(s, o);
             };
             float rawCross[4]{}, row0[4]{}, row1[4]{}, row2[4]{};
             cross(up, fwd, rawCross);
@@ -301,33 +331,45 @@ namespace ps2_stubs
 
     void sceVu0ClipAll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // libvu0 (game copy at 0x10ff50): a0 = min, a1 = max, a2 = matrix, a3 = vertices, t0 = count.
+        // For each vertex v' = v*m; inside when x - min.x*w, y - min.y*w, w - min.w and
+        // max.x*w - x, max.y*w - y, max.w - w are all > 0 (no Z or S flag). Returns 0 at the first
+        // inside vertex, 1 when every vertex is outside.
         const uint32_t loAddr = getRegU32(ctx, 4);
         const uint32_t hiAddr = getRegU32(ctx, 5);
         const uint32_t matAddr = getRegU32(ctx, 6);
         uint32_t vAddr = getRegU32(ctx, 7);
         const int32_t count = static_cast<int32_t>(getRegU32(ctx, 8));
         float lo[4]{}, hi[4]{}, m[16]{};
-        int32_t result = 0;
+        int32_t result = 1;
         if (readVuVec4f(rdram, loAddr, lo) && readVuVec4f(rdram, hiAddr, hi) && readVuMatrix4f(rdram, matAddr, m))
         {
-            result = 1;
-            for (int32_t i = 0; i < count; ++i)
+            // The SDK loop is a do-while on the count (0 would run 2^32 times); one vertex at least.
+            int32_t remaining = count > 0 ? count : 1;
+            do
             {
                 float v[4]{};
                 if (!readVuVec4f(rdram, vAddr, v))
                     break;
-                const float tx = (m[0] * v[0]) + (m[4] * v[1]) + (m[8] * v[2]) + (m[12] * v[3]);
-                const float ty = (m[1] * v[0]) + (m[5] * v[1]) + (m[9] * v[2]) + (m[13] * v[3]);
-                const float tw = (m[3] * v[0]) + (m[7] * v[1]) + (m[11] * v[2]) + (m[15] * v[3]);
-                const bool outsideX = (tx < lo[0] * tw) || (tx > hi[0] * tw);
-                const bool outsideY = (ty < lo[1] * tw) || (ty > hi[1] * tw);
-                if (!outsideX && !outsideY)
+                const float tx = vuClamp((m[0] * v[0]) + (m[4] * v[1]) + (m[8] * v[2]) + (m[12] * v[3]));
+                const float ty = vuClamp((m[1] * v[0]) + (m[5] * v[1]) + (m[9] * v[2]) + (m[13] * v[3]));
+                const float tw = vuClamp((m[3] * v[0]) + (m[7] * v[1]) + (m[11] * v[2]) + (m[15] * v[3]));
+                const float checks[6] = {tx - vuClamp(lo[0] * tw), ty - vuClamp(lo[1] * tw), tw - lo[3],
+                                         vuClamp(hi[0] * tw) - tx, vuClamp(hi[1] * tw) - ty, hi[3] - tw};
+                bool inside = true;
+                for (const float c : checks)
+                {
+                    const float n = vuClamp(c);
+                    if (n == 0.0f || std::signbit(n))
+                        inside = false;
+                }
+                if (inside)
                 {
                     result = 0;
                     break;
                 }
                 vAddr += 16u;
-            }
+            } while (--remaining != 0);
         }
         setReturnS32(ctx, result);
     }
@@ -339,7 +381,7 @@ namespace ps2_stubs
         int32_t code = 0;
         if (readVuVec4f(rdram, vAddr, v))
         {
-            code = screenClipCode(v);
+            code = screenClipStatus(v);
         }
         setReturnS32(ctx, code);
     }
@@ -353,15 +395,15 @@ namespace ps2_stubs
         int32_t code = 0;
         if (readVuVec4f(rdram, v0Addr, v0))
         {
-            code |= screenClipCode(v0);
+            code |= screenClipStatus(v0);
         }
         if (readVuVec4f(rdram, v1Addr, v1))
         {
-            code |= screenClipCode(v1);
+            code |= screenClipStatus(v1);
         }
         if (readVuVec4f(rdram, v2Addr, v2))
         {
-            code |= screenClipCode(v2);
+            code |= screenClipStatus(v2);
         }
         setReturnS32(ctx, code);
     }
@@ -413,10 +455,10 @@ namespace ps2_stubs
         float src[4]{}, out[4]{};
         if (readVuVec4f(rdram, srcAddr, src))
         {
-            const float q = (divisor != 0.0f) ? (1.0f / divisor) : 0.0f;
+            const float q = vuDivide(1.0f, divisor);
             for (int i = 0; i < 4; ++i)
             {
-                out[i] = src[i] * q;
+                out[i] = vuClamp(src[i] * q);
             }
             (void)writeVuVec4f(rdram, dstAddr, out);
         }
@@ -431,10 +473,10 @@ namespace ps2_stubs
         float src[4]{}, out[4]{};
         if (readVuVec4f(rdram, srcAddr, src))
         {
-            const float q = (divisor != 0.0f) ? (1.0f / divisor) : 0.0f;
-            out[0] = src[0] * q;
-            out[1] = src[1] * q;
-            out[2] = src[2] * q;
+            const float q = vuDivide(1.0f, divisor);
+            out[0] = vuClamp(src[0] * q);
+            out[1] = vuClamp(src[1] * q);
+            out[2] = vuClamp(src[2] * q);
             out[3] = src[3];
             (void)writeVuVec4f(rdram, dstAddr, out);
         }
@@ -553,7 +595,8 @@ namespace ps2_stubs
         float dot = 0.0f;
         if (readVuVec4f(rdram, lhsAddr, lhs) && readVuVec4f(rdram, rhsAddr, rhs))
         {
-            dot = (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]) + (lhs[3] * rhs[3]);
+            // xyz only, like libvu0 (vmul.xyz, then x + y + z).
+            dot = (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]);
         }
 
         if (ctx)
@@ -699,10 +742,10 @@ namespace ps2_stubs
         float m0[16]{}, m1[16]{}, out[16]{};
         if (readVuMatrix4f(rdram, m0Addr, m0) && readVuMatrix4f(rdram, m1Addr, m1))
         {
-            // out = m0 * m1 (first source . second source), matching the
-            // file's mulVuMatrix(lhs,rhs)=lhs.rhs convention and the RotMatrix
-            // / ViewScreenMatrix siblings (first operand on the left).
-            mulVuMatrix(m0, m1, out);
+            // sceVu0MulMatrix(m0, m1, m2): libvu0 loads m1's rows into vf4-vf7 and, for each row
+            // of m2, writes row.x*m1[0] + row.y*m1[1] + row.z*m1[2] + row.w*m1[3]: m0 = m2 . m1
+            // (row vectors; checked against the game's own copy at 0x10e9f8).
+            mulVuMatrix(m1, m0, out);
             (void)writeVuMatrix4f(rdram, dstAddr, out);
         }
         setReturnS32(ctx, 0);
@@ -727,20 +770,13 @@ namespace ps2_stubs
 
     void sceVu0Normalize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // libvu0: vsqrt of x*x+y*y+z*z, Q = 1/len, out.xyz = v.xyz*Q, out.w = 0.
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         float src[4]{}, out[4]{};
         if (readVuVec4f(rdram, srcAddr, src))
         {
-            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]) + (src[3] * src[3]));
-            if (len > 1.0e-6f)
-            {
-                const float invLen = 1.0f / len;
-                for (int i = 0; i < 4; ++i)
-                {
-                    out[i] = src[i] * invLen;
-                }
-            }
+            normalizeXyz(src, out);
             (void)writeVuVec4f(rdram, dstAddr, out);
         }
         setReturnS32(ctx, 0);
@@ -757,12 +793,11 @@ namespace ps2_stubs
         float l0[4]{}, l1[4]{}, l2[4]{};
         if (readVuVec4f(rdram, l0Addr, l0) && readVuVec4f(rdram, l1Addr, l1) && readVuVec4f(rdram, l2Addr, l2))
         {
+            // libvu0: ScaleVector(tmp, light, -1) then Normalize(row, tmp) (xyz, w = 0).
             auto negNormalize = [](const float (&s)[4], float (&o)[4])
             {
-                const float len = std::sqrt((s[0] * s[0]) + (s[1] * s[1]) + (s[2] * s[2]) + (s[3] * s[3]));
-                const float inv = (len > 1.0e-6f) ? (1.0f / len) : 0.0f;
-                for (int i = 0; i < 4; ++i)
-                    o[i] = -s[i] * inv;
+                const float negated[4] = {-s[0], -s[1], -s[2], -s[3]};
+                normalizeXyz(negated, o);
             };
             float r0[4]{}, r1[4]{}, r2[4]{};
             negNormalize(l0, r0);
@@ -888,12 +923,12 @@ namespace ps2_stubs
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t matAddr = getRegU32(ctx, 5);
         const uint32_t vAddr = getRegU32(ctx, 6);
-        const bool fullFtoi4 = (getRegU32(ctx, 7) != 0);
+        const bool zwFtoi0 = (getRegU32(ctx, 7) != 0);
         float m[16]{}, v[4]{};
         if (readVuMatrix4f(rdram, matAddr, m) && readVuVec4f(rdram, vAddr, v))
         {
             int32_t out[4]{};
-            rotTransPersOne(m, v, fullFtoi4, out);
+            rotTransPersOne(m, v, zwFtoi0, out);
             (void)writeVuVec4i(rdram, dstAddr, out);
         }
         setReturnS32(ctx, 0);
@@ -905,7 +940,7 @@ namespace ps2_stubs
         const uint32_t matAddr = getRegU32(ctx, 5);
         uint32_t vAddr = getRegU32(ctx, 6);
         const int32_t count = static_cast<int32_t>(getRegU32(ctx, 7));
-        const bool fullFtoi4 = (getRegU32(ctx, 8) != 0);
+        const bool zwFtoi0 = (getRegU32(ctx, 8) != 0);
         float m[16]{};
         if (readVuMatrix4f(rdram, matAddr, m))
         {
@@ -916,7 +951,7 @@ namespace ps2_stubs
                 if (!readVuVec4f(rdram, vAddr, v))
                     break;
                 int32_t out[4]{};
-                rotTransPersOne(m, v, fullFtoi4, out);
+                rotTransPersOne(m, v, zwFtoi0, out);
                 (void)writeVuVec4i(rdram, outAddr, out);
                 vAddr += 16u;
                 outAddr += 16u;
@@ -930,16 +965,8 @@ namespace ps2_stubs
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         float src[4]{}, out[4]{};
-        float scale = ctx ? ctx->f[12] : 0.0f;
-        if (scale == 0.0f)
-        {
-            uint32_t raw = getRegU32(ctx, 6);
-            std::memcpy(&scale, &raw, sizeof(scale));
-            if (scale == 0.0f)
-            {
-                scale = static_cast<float>(getRegU32(ctx, 6));
-            }
-        }
+        // libvu0: the scale is the float argument in f12 (vmulx.xyzw by it); a zero scale is 0.
+        const float scale = ctx ? ctx->f[12] : 0.0f;
 
         if (readVuVec4f(rdram, srcAddr, src))
         {
@@ -1099,5 +1126,22 @@ namespace ps2_stubs
         mulVuMatrix(scaleMat, projMat, out);
         (void)writeVuMatrix4f(rdram, dstAddr, out);
         setReturnS32(ctx, 0);
+    }
+}
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    // No state of its own: only this file's copy of the Helpers/Support.h globals.
+    void saveVu(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+    }
+
+    void loadVu(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
     }
 }

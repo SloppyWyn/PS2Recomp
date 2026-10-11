@@ -148,6 +148,9 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
 
+// COP2 macro-mode semantics (VF0/VI0 read-only, VU float clamping, MAC/status flags).
+#include "ps2_vu0_macro.h"
+
 // Memory access helpers - Hybrid Fast/Slow Path
 // Fast path: Direct RDRAM access (masked).
 // Slow path: Full runtime->Load/Store
@@ -591,17 +594,83 @@ inline __m128i _mm_custom_srav_epi32(__m128i a, __m128i count)
     return _mm_loadu_si128((__m128i *)result);
 }
 
-// PMFHL function implementations
-inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+// PMFHL / PMTHL: moves between a GPR and the 128-bit HI/LO pair. The context keeps
+// LO = {lo1 (bits 127:64), lo (bits 63:0)} and HI = {hi1, hi}, the same split that
+// MULT1/MFLO1/MFHI1 use (lo/hi = LO0/HI0, lo1/hi1 = LO1/HI1).
+// EE Core Instruction Set Manual, PMFHL (and PCSX2's interpreter, MMI.cpp):
+//   .LW : rd.w = { LO0[31:0],  HI0[31:0],  LO1[31:0],  HI1[31:0]  }   (w0..w3)
+//   .UW : rd.w = { LO0[63:32], HI0[63:32], LO1[63:32], HI1[63:32] }
+//   .SLW: rd.d0 = sat32(HI0[31:0]:LO0[31:0]) sign-extended, rd.d1 = same for HI1:LO1
+//   .LH : rd.h = { LO0.h0, LO0.h2, HI0.h0, HI0.h2, LO1.h0, LO1.h2, HI1.h0, HI1.h2 }
+//   .SH : rd.h = sat16 of the words { LO0.w0, LO0.w1, HI0.w0, HI0.w1, LO1.w0, LO1.w1, HI1.w0, HI1.w1 }
+// A 64-bit product on the EE is usually `multu` + `pmfhl.lw` (the low doubleword is
+// HI0[31:0]:LO0[31:0]); soft-float __muldf3 builds its 128-bit mantissa product that way.
+static inline int32_t ps2_pmfhl_sat32(uint64_t hi, uint64_t lo)
 {
-    return _mm_set1_epi64x(static_cast<long long>(value));
+    const int64_t v = static_cast<int64_t>(Ps2HiLoToU64(hi, lo));
+    if (v > 0x7FFFFFFFll)
+        return 0x7FFFFFFF;
+    if (v < -0x80000000ll)
+        return static_cast<int32_t>(0x80000000u);
+    return static_cast<int32_t>(v);
 }
 
-#define PS2_PMFHL_LW(hi, lo) _mm_unpacklo_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_UW(hi, lo) _mm_unpackhi_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_SLW(hi, lo) _mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
-#define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
+static inline int16_t ps2_pmfhl_sat16(uint32_t w)
+{
+    const int32_t v = static_cast<int32_t>(w);
+    if (v > 0x7FFF)
+        return 0x7FFF;
+    if (v < -0x8000)
+        return static_cast<int16_t>(-0x8000);
+    return static_cast<int16_t>(v);
+}
+
+static inline __m128i ps2_pmfhl_lw(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    return _mm_set_epi32(static_cast<int>(static_cast<uint32_t>(hi1)), static_cast<int>(static_cast<uint32_t>(lo1)),
+                         static_cast<int>(static_cast<uint32_t>(hi)), static_cast<int>(static_cast<uint32_t>(lo)));
+}
+
+static inline __m128i ps2_pmfhl_uw(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    return _mm_set_epi32(static_cast<int>(static_cast<uint32_t>(hi1 >> 32)), static_cast<int>(static_cast<uint32_t>(lo1 >> 32)),
+                         static_cast<int>(static_cast<uint32_t>(hi >> 32)), static_cast<int>(static_cast<uint32_t>(lo >> 32)));
+}
+
+static inline __m128i ps2_pmfhl_slw(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    return _mm_set_epi64x(static_cast<int64_t>(ps2_pmfhl_sat32(hi1, lo1)), static_cast<int64_t>(ps2_pmfhl_sat32(hi, lo)));
+}
+
+static inline __m128i ps2_pmfhl_lh(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    auto h = [](uint64_t v, int i) { return static_cast<short>(static_cast<uint16_t>(v >> (16 * i))); };
+    return _mm_set_epi16(h(hi1, 2), h(hi1, 0), h(lo1, 2), h(lo1, 0), h(hi, 2), h(hi, 0), h(lo, 2), h(lo, 0));
+}
+
+static inline __m128i ps2_pmfhl_sh(uint64_t hi, uint64_t lo, uint64_t hi1, uint64_t lo1)
+{
+    auto s = [](uint64_t v, int i) { return static_cast<short>(ps2_pmfhl_sat16(static_cast<uint32_t>(v >> (32 * i)))); };
+    return _mm_set_epi16(s(hi1, 1), s(hi1, 0), s(lo1, 1), s(lo1, 0), s(hi, 1), s(hi, 0), s(lo, 1), s(lo, 0));
+}
+
+// PMTHL.LW: LO0[31:0] = rs.w0, HI0[31:0] = rs.w1, LO1[31:0] = rs.w2, HI1[31:0] = rs.w3; the
+// upper word of each doubleword is left as it was (as PCSX2 does).
+static inline void ps2_pmthl_lw(__m128i rs, uint64_t &hi, uint64_t &lo, uint64_t &hi1, uint64_t &lo1)
+{
+    alignas(16) uint32_t w[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(w), rs);
+    lo = (lo & 0xFFFFFFFF00000000ull) | w[0];
+    hi = (hi & 0xFFFFFFFF00000000ull) | w[1];
+    lo1 = (lo1 & 0xFFFFFFFF00000000ull) | w[2];
+    hi1 = (hi1 & 0xFFFFFFFF00000000ull) | w[3];
+}
+
+#define PS2_PMFHL_LW(hi, lo, hi1, lo1) ps2_pmfhl_lw((hi), (lo), (hi1), (lo1))
+#define PS2_PMFHL_UW(hi, lo, hi1, lo1) ps2_pmfhl_uw((hi), (lo), (hi1), (lo1))
+#define PS2_PMFHL_SLW(hi, lo, hi1, lo1) ps2_pmfhl_slw((hi), (lo), (hi1), (lo1))
+#define PS2_PMFHL_LH(hi, lo, hi1, lo1) ps2_pmfhl_lh((hi), (lo), (hi1), (lo1))
+#define PS2_PMFHL_SH(hi, lo, hi1, lo1) ps2_pmfhl_sh((hi), (lo), (hi1), (lo1))
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)

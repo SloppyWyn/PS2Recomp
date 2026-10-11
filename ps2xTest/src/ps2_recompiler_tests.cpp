@@ -12,7 +12,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace ps2recomp;
@@ -1471,6 +1473,112 @@ void register_ps2_recompiler_tests()
             std::filesystem::remove_all(tempRoot, removeError);
         });
 
+        tc.Run("CollectDirectCallees finds unqualified direct calls to generated names only", [](TestCase &t) {
+            const std::unordered_set<std::string> names = {"FUN_00100000_0x100000", "SignalSema_0x11ad00", "entry_0x100008"};
+            const std::string code =
+                "    FUN_00100000_0x100000(rdram, ctx, runtime); return;\n"
+                "    ps2_syscalls::SignalSema(rdram, ctx, runtime);\n"
+                "    SignalSema_0x11ad00(rdram, ctx, runtime);\n"
+                "    unknown_0x1(rdram, ctx, runtime);\n"
+                "void entry_0x100008(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n"
+                "    SignalSema_0x11ad00(rdram, ctx, runtime);\n";
+            const std::vector<std::string> callees = PS2Recompiler::CollectDirectCallees(code, names);
+            t.Equals(callees.size(), static_cast<size_t>(2u), "two distinct generated callees");
+            t.IsTrue(callees.size() == 2u && callees[0] == "FUN_00100000_0x100000" && callees[1] == "SignalSema_0x11ad00",
+                     "callees are sorted; the qualified runtime handler, unknown names and definitions are left out");
+            t.Equals(PS2Recompiler::GroupOutputFileName(0x00104000u), std::string("ps2x_group_00104000.cpp"),
+                     "group file name carries the window start");
+        });
+
+        tc.Run("grouped output: one file per address window, unchanged files keep their mtime, layout switches clean up", [](TestCase &t) {
+            const std::string uniqueSuffix =
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::filesystem::path tempRoot =
+                std::filesystem::temp_directory_path() / ("ps2recomp-grouped-" + uniqueSuffix);
+            const std::filesystem::path elfPath = tempRoot / "grouped.elf";
+            const std::filesystem::path configPath = tempRoot / "grouped.toml";
+            const std::filesystem::path outputPath = tempRoot / "output";
+            std::filesystem::create_directories(tempRoot);
+
+            auto writeConfig = [&](uint32_t groupBytes)
+            {
+                bool ok = writeRecompilerTestConfig(configPath, elfPath, outputPath, {});
+                std::ofstream extra(configPath, std::ios::app);
+                extra << "output_group_bytes = " << groupBytes << "\n";
+                return ok && static_cast<bool>(extra);
+            };
+            auto generate = [&]()
+            {
+                PS2Recompiler recompiler(configPath.string());
+                const bool ok = recompiler.initialize() && recompiler.recompile();
+                if (ok)
+                {
+                    recompiler.generateOutput();
+                }
+                return ok;
+            };
+            auto cppFiles = [&]()
+            {
+                std::vector<std::string> files;
+                for (const auto &entry : std::filesystem::directory_iterator(outputPath))
+                {
+                    if (entry.path().extension() == ".cpp")
+                    {
+                        files.push_back(entry.path().filename().string());
+                    }
+                }
+                std::sort(files.begin(), files.end());
+                return files;
+            };
+
+            const bool elfWritten = writeMinimalMipsElfWithStandaloneEntryBlock(elfPath);
+            t.IsTrue(elfWritten && writeConfig(0x100u), "grouped output inputs should be generated");
+            if (elfWritten)
+            {
+                // Old layout first: one file per function.
+                t.IsTrue(writeConfig(0u) && generate(), "per-function output should generate");
+                const std::vector<std::string> perFunction = cppFiles();
+                t.IsTrue(perFunction.size() >= 3u, "per-function layout writes several .cpp files");
+
+                // Grouped: the per-function files are replaced by one group file.
+                t.IsTrue(writeConfig(0x100u) && generate(), "grouped output should generate");
+                const std::vector<std::string> grouped = cppFiles();
+                t.IsTrue(grouped.size() == 2u && grouped[0] == "ps2x_group_00100000.cpp" && grouped[1] == "register_functions.cpp",
+                         "grouped layout leaves exactly the group file and register_functions.cpp");
+                const std::filesystem::path groupPath = outputPath / "ps2x_group_00100000.cpp";
+                std::ifstream groupFile(groupPath);
+                const std::string group{std::istreambuf_iterator<char>(groupFile), std::istreambuf_iterator<char>()};
+                groupFile.close();
+                t.IsTrue(group.find("ps2_recompiled_functions.h") == std::string::npos &&
+                             group.find("ps2_recompiled_stubs.h") == std::string::npos,
+                         "a group file does not include the generated headers");
+                t.IsTrue(group.find("void entry_00100000") != std::string::npos,
+                         "the group file holds the window's functions");
+
+                // Regenerating the same thing leaves every file untouched.
+                const auto old = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24);
+                std::filesystem::last_write_time(groupPath, old);
+                std::filesystem::last_write_time(outputPath / "register_functions.cpp", old);
+                t.IsTrue(generate(), "grouped output should regenerate");
+                t.IsTrue(std::filesystem::last_write_time(groupPath) == old &&
+                             std::filesystem::last_write_time(outputPath / "register_functions.cpp") == old,
+                         "unchanged generated files keep their modification time");
+
+                // A file the recompiler did not write is never removed.
+                { std::ofstream keep(outputPath / "user_notes.cpp"); keep << "// mine\n"; }
+
+                // Back to one file per function: the group file goes (manifest), user files stay.
+                t.IsTrue(writeConfig(0u) && generate(), "per-function output should regenerate");
+                std::vector<std::string> back = cppFiles();
+                back.erase(std::remove(back.begin(), back.end(), "user_notes.cpp"), back.end());
+                t.IsTrue(back == perFunction, "switching back restores exactly the per-function file set");
+                t.IsTrue(std::filesystem::exists(outputPath / "user_notes.cpp"), "files not written by the recompiler stay");
+            }
+
+            std::error_code removeError;
+            std::filesystem::remove_all(tempRoot, removeError);
+        });
+
         tc.Run("standalone entry_ blocks register resume points for their JAL return addresses", [](TestCase &t) {
             const std::string uniqueSuffix =
                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
@@ -1894,6 +2002,169 @@ void register_ps2_recompiler_tests()
                 }
             }
 
+            std::error_code removeError;
+            std::filesystem::remove_all(tempRoot, removeError);
+        });
+
+        tc.Run("resume_into_owner absorbs nested entry_ labels into their owner, standalone ones stay", [](TestCase &t) {
+            // owner [0x1000,0x1018) with Ghidra labels entry_1008 and entry_1010 inside it (the
+            // second one a delay slot), inner [0x1010,0x1018) nested in owner with the label
+            // 0x1014 inside both, and entry_2000 outside every function.
+            std::vector<Function> functions = {
+                makeFunction("owner", 0x1000u, 0x1018u),
+                makeFunction("entry_1008", 0x1008u, 0x1010u),
+                makeFunction("entry_1010", 0x1010u, 0x1014u),
+                makeFunction("inner", 0x1010u, 0x1018u),
+                makeFunction("entry_1014", 0x1014u, 0x1018u),
+                makeFunction("entry_2000", 0x2000u, 0x2008u),
+                makeFunction("entry_3000", 0x3000u, 0x3008u), // nested in a stub: stays
+                makeFunction("stub_fn", 0x2ff0u, 0x3010u),
+            };
+            functions.back().isStub = true;
+            functions.back().isRecompiled = false;
+
+            std::unordered_map<uint32_t, std::vector<Instruction>> decodedFunctions;
+            decodedFunctions[0x1000u] = {
+                makeNopLike(0x1000u), makeNopLike(0x1004u), makeNopLike(0x1008u),
+                makeAbsJump(0x100Cu, 0x1000u, OPCODE_J), makeNopLike(0x1010u),
+                makeNopLike(0x1014u)};
+            decodedFunctions[0x1008u] = {makeNopLike(0x1008u), makeAbsJump(0x100Cu, 0x1000u, OPCODE_J)};
+            decodedFunctions[0x1010u] = {makeNopLike(0x1010u), makeNopLike(0x1014u)};
+            decodedFunctions[0x1014u] = {makeNopLike(0x1014u)};
+            decodedFunctions[0x2000u] = {makeNopLike(0x2000u), makeNopLike(0x2004u)};
+            decodedFunctions[0x3000u] = {makeNopLike(0x3000u), makeNopLike(0x3004u)};
+            // "inner" is both a real function at 0x1010 and the start of entry_1010: a real
+            // function owns its own start, so entry_1010 is absorbed into owner, not inner.
+
+            std::unordered_map<uint32_t, std::vector<uint32_t>> targetsByOwner;
+            const size_t absorbed = PS2Recompiler::AbsorbNestedEntryFragments(functions, decodedFunctions, targetsByOwner);
+            t.Equals(absorbed, static_cast<size_t>(3), "the three labels inside real functions are absorbed");
+
+            auto byName = [&](const char *name) -> const Function & {
+                return *std::find_if(functions.begin(), functions.end(), [&](const Function &f) { return f.name == name; });
+            };
+            t.IsFalse(byName("entry_1008").isRecompiled, "a nested label is no longer a function");
+            t.IsFalse(byName("entry_1010").isRecompiled, "a nested label at a real function's start is absorbed too");
+            t.IsFalse(byName("entry_1014").isRecompiled, "a label inside two functions is absorbed");
+            t.IsTrue(byName("entry_2000").isRecompiled, "a label outside every function stays a fragment");
+            t.IsTrue(byName("entry_3000").isRecompiled, "a label inside a stub-bound function stays a fragment");
+            t.IsTrue(byName("owner").isRecompiled && byName("inner").isRecompiled, "real functions are untouched");
+            t.IsFalse(decodedFunctions.contains(0x1008u), "absorbed labels lose their decoded slice");
+            t.IsTrue(decodedFunctions.contains(0x2000u), "standalone fragments keep theirs");
+
+            const auto ownerTargets = targetsByOwner[0x1000u];
+            t.IsTrue(std::find(ownerTargets.begin(), ownerTargets.end(), 0x1008u) != ownerTargets.end(),
+                     "the owner gets the label as a resume target");
+            t.IsTrue(std::find(ownerTargets.begin(), ownerTargets.end(), 0x1010u) != ownerTargets.end(),
+                     "0x1010 goes to owner (inner starts there, so it is not 'inside' inner)");
+            t.IsTrue(std::find(ownerTargets.begin(), ownerTargets.end(), 0x1014u) != ownerTargets.end() &&
+                         !targetsByOwner.contains(0x1010u),
+                     "a label inside nested functions goes to the outermost (lowest start)");
+            t.IsFalse(targetsByOwner.contains(0x2000u) || targetsByOwner.contains(0x2ff0u),
+                      "standalone and stub-nested labels register nowhere");
+
+            // The function table then maps the label to the owner and the owner's switch
+            // jumps to it; the fragment is neither generated nor registered nor named.
+            CodeGenerator gen({}, {});
+            gen.setResumeIntoOwner(true);
+            gen.setRenamedFunctions({{0x1000u, "owner_0x1000"}, {0x1010u, "inner_0x1010"}, {0x2000u, "entry_2000_0x2008"}});
+            gen.setResumeEntryTargets(targetsByOwner);
+            const std::string registration = gen.generateFunctionRegistration(functions, {});
+            t.IsTrue(registration.find("= owner_0x1000; // 0x1008") != std::string::npos,
+                     "the table maps the absorbed label to its owner");
+            t.IsTrue(registration.find("= owner_0x1000; // 0x1014") != std::string::npos,
+                     "the table maps a doubly nested label to the outermost owner");
+            t.IsTrue(registration.find("= entry_2000_0x2008; // 0x2000") != std::string::npos,
+                     "the standalone fragment is still registered");
+            t.IsTrue(registration.find("\"entry_1008\"") == std::string::npos,
+                     "the absorbed label is not in the name table");
+            t.IsTrue(registration.find("\"entry_2000\"") != std::string::npos,
+                     "the standalone fragment is in the name table");
+
+            const std::string generated = gen.generateFunction(byName("owner"), decodedFunctions.at(0x1000u), false);
+            t.IsTrue(generated.find("case 0x1008u: goto label_1008;") != std::string::npos,
+                     "the owner's pc switch has a case for the absorbed label");
+            t.IsTrue(generated.find("label_1008:") != std::string::npos, "and the label exists");
+            t.IsTrue(generated.find("case 0x1010u: goto label_1010;") != std::string::npos &&
+                         generated.find("label_1010:") != std::string::npos,
+                     "a label at a delay slot gets a case and a label (resumed through the delay-slot entry)");
+        });
+
+        tc.Run("resume_into_owner is off by default and read from [general]", [](TestCase &t) {
+            const std::string uniqueSuffix =
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::filesystem::path tempRoot =
+                std::filesystem::temp_directory_path() / ("ps2recomp-resume-owner-" + uniqueSuffix);
+            std::filesystem::create_directories(tempRoot);
+            const std::filesystem::path configPath = tempRoot / "cfg.toml";
+            {
+                std::ofstream configFile(configPath);
+                configFile << "[general]\ninput = \"x.elf\"\noutput = \"out\"\n";
+            }
+            ConfigManager manager(configPath.string());
+            t.IsFalse(manager.loadConfig().resumeIntoOwner, "resume_into_owner defaults to off");
+            {
+                std::ofstream configFile(configPath);
+                configFile << "[general]\ninput = \"x.elf\"\noutput = \"out\"\nresume_into_owner = true\n";
+            }
+            t.IsTrue(manager.loadConfig().resumeIntoOwner, "resume_into_owner = true is read");
+            std::error_code removeError;
+            std::filesystem::remove_all(tempRoot, removeError);
+        });
+
+        tc.Run("lean_codegen is off by default and read from [general]", [](TestCase &t) {
+            const std::string uniqueSuffix =
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::filesystem::path tempRoot =
+                std::filesystem::temp_directory_path() / ("ps2recomp-lean-codegen-" + uniqueSuffix);
+            std::filesystem::create_directories(tempRoot);
+            const std::filesystem::path configPath = tempRoot / "cfg.toml";
+            {
+                std::ofstream configFile(configPath);
+                configFile << "[general]\ninput = \"x.elf\"\noutput = \"out\"\n";
+            }
+            ConfigManager manager(configPath.string());
+            t.IsFalse(manager.loadConfig().leanCodegen, "lean_codegen defaults to off");
+            {
+                std::ofstream configFile(configPath);
+                configFile << "[general]\ninput = \"x.elf\"\noutput = \"out\"\nlean_codegen = true\n";
+            }
+            t.IsTrue(manager.loadConfig().leanCodegen, "lean_codegen = true is read");
+            {
+                const RecompilerConfig lean = manager.loadConfig();
+                t.IsTrue(lean.lean.pcStores && lean.lean.memoryHelpers && lean.lean.delaySlotFlags && lean.lean.gprScalar && lean.lean.zeroFold,
+                         "lean_codegen = true turns every trim on");
+            }
+            {
+                std::ofstream configFile(configPath);
+                configFile << "[general]\ninput = \"x.elf\"\noutput = \"out\"\nlean_codegen = true\nlean_gpr_scalar = false\n";
+            }
+            {
+                const RecompilerConfig lean = manager.loadConfig();
+                t.IsTrue(lean.lean.pcStores && lean.lean.memoryHelpers && !lean.lean.gprScalar,
+                         "a per-trim key read after lean_codegen switches that trim off");
+            }
+            {
+                std::ofstream configFile(configPath);
+                configFile << "[general]\ninput = \"x.elf\"\noutput = \"out\"\nlean_memory_helpers = true\n";
+            }
+            {
+                const RecompilerConfig lean = manager.loadConfig();
+                t.IsTrue(lean.lean.memoryHelpers && !lean.lean.pcStores && !lean.lean.gprScalar && lean.lean.any(),
+                         "a per-trim key alone turns on just that trim");
+            }
+            {
+                RecompilerConfig inCode;
+                inCode.leanCodegen = true; // set in code, per-trim options untouched
+                const RecompilerConfig::LeanOptions eff = inCode.effectiveLeanOptions();
+                t.IsTrue(eff.pcStores && eff.memoryHelpers && eff.delaySlotFlags && eff.gprScalar && eff.zeroFold,
+                         "leanCodegen = true set in code means every trim");
+                RecompilerConfig merged;
+                merged.leanCodegen = true;
+                merged.lean = RecompilerConfig::LeanOptions::all();
+                merged.lean.gprScalar = false;
+                t.IsFalse(merged.effectiveLeanOptions().gprScalar, "a merged per-trim override is kept");
+            }
             std::error_code removeError;
             std::filesystem::remove_all(tempRoot, removeError);
         });

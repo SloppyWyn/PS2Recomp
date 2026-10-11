@@ -64,6 +64,8 @@ namespace ps2recomp
             }
         }
         case COP2_QMTC2:
+            if (rd == 0)
+                return "// QMTC2 to VF0 dropped (VF0 is hardwired to (0,0,0,1))";
             return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps(GPR_VEC(ctx, {}));", rd, rt);
         case COP2_CTC2:
         {
@@ -79,7 +81,8 @@ namespace ps2recomp
             switch (rd)
             {
             case VU0_CR_STATUS:
-                return fmt::format("ctx->vu0_status = static_cast<uint16_t>(GPR_U32(ctx, {}) & 0xFFFFu);", rt);
+                // Only the sticky flags (bits 6-11) are writable.
+                return fmt::format("ps2x_vu0::writeStatus(ctx, GPR_U32(ctx, {}));", rt);
             case VU0_CR_MAC:
             case VU0_CR_TPC:
             case VU0_CR_VPU_STAT:
@@ -87,7 +90,7 @@ namespace ps2recomp
             case VU0_CR_CLIP:
                 return fmt::format("ctx->vu0_clip_flags = GPR_U32(ctx, {}) & 0x00FFFFFFu;", rt);
             case VU0_CR_R:
-                return fmt::format("ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(GPR_U32(ctx, {}))));", rt);
+                return fmt::format("ps2x_vu0::setR(ctx, GPR_U32(ctx, {}));", rt);
             case VU0_CR_I:
                 return fmt::format("{{ uint32_t tmp = GPR_U32(ctx, {}); std::memcpy(&ctx->vu0_i, &tmp, sizeof(tmp)); }}", rt);
             case VU0_CR_Q:
@@ -226,59 +229,28 @@ namespace ps2recomp
                     return m_codeGenerator.translateVU_VISWR(inst);
                 case VU0_S2_VABS:
                 {
-                    uint8_t dest_mask = inst.vectorInfo.vectorField;
-                    return fmt::format("{{ __m128 res = _mm_and_ps(ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))); "
-                                       "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
-                                       "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
-                                       inst.rd,
-                                       (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
-                                       (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
-                                       inst.rt, inst.rt);
+                    // ABS ft, fs: no flags; VF0 writes dropped.
+                    const std::string dst = inst.rt == 0 ? std::string("nullptr") : fmt::format("&ctx->vu0_vf[{}]", inst.rt);
+                    return fmt::format("ps2x_vu0::store({}, _mm_and_ps(ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))), 0x{:X}u);",
+                                       dst, inst.rd, inst.vectorInfo.vectorField & 0xFu);
                 }
                 case VU0_S2_VMOVE:
                 {
-                    uint8_t dest_mask = inst.vectorInfo.vectorField;
-                    return fmt::format(
-                        "{{ __m128i mask = _mm_set_epi32({}, {}, {}, {}); "
-                        "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _mm_castsi128_ps(mask)); }}",
-                        (dest_mask & 0x1) ? -1 : 0,
-                        (dest_mask & 0x2) ? -1 : 0,
-                        (dest_mask & 0x4) ? -1 : 0,
-                        (dest_mask & 0x8) ? -1 : 0,
-                        inst.rt, inst.rt, inst.rd);
+                    const std::string dst = inst.rt == 0 ? std::string("nullptr") : fmt::format("&ctx->vu0_vf[{}]", inst.rt);
+                    return fmt::format("ps2x_vu0::store({}, ctx->vu0_vf[{}], 0x{:X}u);", dst, inst.rd, inst.vectorInfo.vectorField & 0xFu);
                 }
                 case VU0_S2_VMR32:
                 {
-                    uint8_t dest_mask = inst.vectorInfo.vectorField;
-                    return fmt::format(
-                        "{{ __m128 res = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,3,2,1)); "
-                        "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
-                        "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
-                        inst.rd, inst.rd,
-                        (dest_mask & 0x1) ? -1 : 0,
-                        (dest_mask & 0x2) ? -1 : 0,
-                        (dest_mask & 0x4) ? -1 : 0,
-                        (dest_mask & 0x8) ? -1 : 0,
-                        inst.rt, inst.rt);
+                    // MR32: fs rotated (fs.y, fs.z, fs.w, fs.x).
+                    const std::string dst = inst.rt == 0 ? std::string("nullptr") : fmt::format("&ctx->vu0_vf[{}]", inst.rt);
+                    return fmt::format("ps2x_vu0::store({}, _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,3,2,1)), 0x{:X}u);",
+                                       dst, inst.rd, inst.rd, inst.vectorInfo.vectorField & 0xFu);
                 }
                 case VU0_S2_VCLIPw:
                 {
-                    uint8_t field = inst.function & 0x3;
-                    std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
-
-                    return fmt::format(
-                        "{{ __m128 fs = ctx->vu0_vf[{}]; "
-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
-                        "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
-                        "__m128 gt = _mm_cmpgt_ps(fs, ft); "
-                        "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
-                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
-                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
-                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
-                        inst.rd, inst.rt, inst.rt, shuffle_pattern);
+                    // CLIPw.xyz fs, ft.w: judgment against |ft.w| into the clip flag history.
+                    return fmt::format("ps2x_vu0::clip(ctx, ctx->vu0_vf[{}], ps2x_vu0::lane(ctx->vu0_vf[{}], {}u));",
+                                       inst.rd, inst.rt, inst.function & 0x3u);
                 }
                 case VU0_S2_VNOP:
                     return fmt::format("// NOP operation, no action needed for VU0");

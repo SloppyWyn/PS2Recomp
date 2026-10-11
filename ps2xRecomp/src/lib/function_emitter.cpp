@@ -49,6 +49,10 @@ namespace ps2recomp
             ss << "#include <ps2_recompiled_stubs.h>\n\n";
             ss << "#include \"ps2_syscalls.h\"\n";
             ss << "#include \"ps2_stubs.h\"\n\n";
+            if (cg.m_lean.any())
+            {
+                ss << cg.leanIncludeLines() << "\n";
+            }
             ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
             ss << "#include \"ps2_log.h\"\n";
             ss << "#endif\n\n";
@@ -200,10 +204,16 @@ namespace ps2recomp
                         continue;
                     }
 
-                    ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
-                       << std::dec;
                     const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
-                    ss << "    " << cg.translateInstruction(inst, memoryHint);
+                    const std::string code = cg.translateInstruction(inst, memoryHint);
+                    // lean_codegen: publish the pc only before code that can reach the runtime
+                    // (lean memory helpers publish it themselves on their slow path).
+                    if (!cg.m_lean.pcStores || CodeGenerator::leanTranslationObservesPc(code))
+                    {
+                        ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
+                           << std::dec;
+                    }
+                    ss << "    " << code;
                     if (inst.isMmio)
                     {
                         ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;

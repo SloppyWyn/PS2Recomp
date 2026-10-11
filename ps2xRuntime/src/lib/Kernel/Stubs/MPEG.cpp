@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_snapshot.h"
 
 #if !defined(PS2X_HAS_FFMPEG)
 #define PS2X_HAS_FFMPEG 1
@@ -20,6 +21,9 @@ extern "C"
 #include <memory>
 
 #include "Syscalls/Helpers/State.h"
+#include "ps2_snapshot_hooks.h"
+
+#include <sstream>
 
 namespace ps2_stubs
 {
@@ -478,6 +482,92 @@ namespace ps2_stubs
             bool stream = false;
         };
 
+        // Snapshots (docs/SNAPSHOT-DESIGN.md): FFmpeg's decoder cannot be serialised, so
+        // each playback logs every call it makes into its decoder since the second-newest
+        // MPEG sequence header (about two GOPs). A restore feeds the log to a fresh decoder,
+        // which then holds the same reference pictures; the replayed output is dropped
+        // (those pictures were already produced, and the undelivered ones are restored
+        // from the snapshot's queue).
+        struct MpegDecoderCall
+        {
+            std::vector<uint8_t> data; // empty when flush
+            int64_t pts90k = -1;
+            int64_t dts90k = -1;
+            bool flush = false;
+        };
+
+        // Largest decoder replay log kept per playback (docs/SNAPSHOT-DESIGN.md): 64 MB, or
+        // PS2X_MPEG_REPLAY_MB. A stream whose sequence headers are far apart (or that has
+        // only one) needs the log to cover everything since the last header, so a snapshot
+        // late in a long movie needs a larger limit; the bytes stay in host memory.
+        size_t mpegReplayLimitBytes()
+        {
+            static const size_t limit = []
+            {
+                size_t megabytes = 64u;
+                if (const char *value = std::getenv("PS2X_MPEG_REPLAY_MB"); value && *value)
+                {
+                    const unsigned long parsed = std::strtoul(value, nullptr, 10);
+                    if (parsed >= 1ul && parsed <= 4096ul)
+                        megabytes = static_cast<size_t>(parsed);
+                }
+                return megabytes * 1024u * 1024u;
+            }();
+            return limit;
+        }
+
+        uint64_t mpegFrameFingerprint(const MpegDecodedFrame &frame)
+        {
+            // FNV-1a over the size and every 61st byte: cheap enough for every picture, and
+            // neighbouring movie pictures differ in sampled bytes.
+            uint64_t hash = 1469598103934665603ull;
+            const auto mix = [&hash](uint64_t value)
+            {
+                hash ^= value;
+                hash *= 1099511628211ull;
+            };
+            mix(static_cast<uint64_t>(frame.width));
+            mix(static_cast<uint64_t>(frame.height));
+            for (size_t i = 0; i < frame.rgba.size(); i += 61u)
+                mix(frame.rgba[i]);
+            return hash;
+        }
+
+        struct MpegStreamCallbackEvent
+        {
+            uint32_t mpegAddr = 0u;
+            uint32_t streamType = 0u;
+            uint32_t dataAddr = 0u;
+            uint32_t len = 0u;
+            uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
+            uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
+            std::vector<MpegRegisteredCallback> callbacks;
+            // Where the packet sits in the playback's PSS byte stream (MpegPlaybackState::
+            // pssBufferStartPos counts every byte the demuxer has taken in): its start code
+            // and its payload.
+            uint64_t packetPos = 0u;
+            uint64_t payloadPos = 0u;
+            // The same, as offsets into the input of the demux call that delivers the event
+            // (or into a replay region, see MpegDemuxReplay); packetOffset < 0: the packet
+            // began in an earlier call's input, which the caller has already moved past.
+            int64_t packetOffset = -1;
+            uint32_t payloadOffset = 0u;
+        };
+
+        // libmpeg's demuxer stops at a packet whose stream callback returns 0 (the game's
+        // ring for that stream is full) and reports only the bytes before it as consumed, so
+        // the caller presents that packet again later. The runtime parses (and feeds the
+        // video in) everything a demux call is given before the callbacks run, so when it
+        // reports fewer bytes it keeps the unreported tail here: the bytes, and the stream
+        // events in them still to be delivered. When the caller presents those bytes again,
+        // their events are delivered from here instead of parsing (and decoding) them twice.
+        // Invariant: while it is not empty, the region ends where the parser's input ends.
+        struct MpegDemuxReplay
+        {
+            std::vector<uint8_t> bytes;
+            std::vector<MpegStreamCallbackEvent> events; // offsets relative to bytes[0]
+        };
+
         constexpr uint64_t kPictureClockOne = 1ull << 32u;
         // NTSC-style fields at ~59.94 Hz to keep MPEG timing yet (29.97 fps).
         constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
@@ -493,6 +583,9 @@ namespace ps2_stubs
             uint32_t imageBufferAddr = 0u;
             bool sawInput = false;
             bool sawSequenceEnd = false;
+            // The sceMpegCbBackground callback ran during the current GetPicture call (not
+            // saved in snapshots: a loaded run may call it once more).
+            bool backgroundCalled = false;
             bool streamEnded = false;
             bool decoderFailed = false;
             uint64_t cdStreamGeneration = 0u;
@@ -500,6 +593,11 @@ namespace ps2_stubs
             std::vector<uint8_t> videoSequenceSyncBuffer;
             std::vector<uint8_t> pssBuffer;
             std::vector<uint32_t> pssGuestAddrs;
+            uint64_t pssBufferStartPos = 0u; // stream position of pssBuffer[0]
+            MpegDemuxReplay demuxReplay;
+            // A demux call's synchronous stream callbacks are still running (see
+            // finishDemuxWithCallbacks). Not saved: a snapshot waits until the chain is over.
+            bool demuxRunInFlight = false;
             std::deque<MpegDecodedFrame> decodedFrames;
             std::unique_ptr<MpegFfmpegDecoder> decoder;
             uint8_t frameRateCode = 0u;
@@ -512,18 +610,31 @@ namespace ps2_stubs
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
+
+            // Decoder replay log (see MpegDecoderCall). replayAnchors index the calls that
+            // carried a sequence header (the last two are kept; the log starts at the first).
+            std::vector<MpegDecoderCall> replayLog;
+            std::vector<size_t> replayAnchors;
+            size_t replayBytes = 0u;
+            bool replayValid = true;
+            uint64_t framesProduced = 0u;
+            uint64_t framesProducedAtLogStart = 0u;
+            uint64_t anchorFramesProduced = 0u; // framesProduced at the newest anchor
+            int64_t lastProducedPts90k = -1;
+            uint64_t lastProducedFingerprint = 0u;
         };
 
-        struct MpegStreamCallbackEvent
+        void resetDecoderReplay(MpegPlaybackState &playback)
         {
-            uint32_t mpegAddr = 0u;
-            uint32_t streamType = 0u;
-            uint32_t dataAddr = 0u;
-            uint32_t len = 0u;
-            uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
-            uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
-            std::vector<MpegRegisteredCallback> callbacks;
-        };
+            playback.replayLog.clear();
+            playback.replayAnchors.clear();
+            playback.replayBytes = 0u;
+            playback.replayValid = true;
+            playback.framesProducedAtLogStart = playback.framesProduced;
+        }
+
+        void recordDecoderCall(MpegPlaybackState &playback, const uint8_t *data, size_t size, int64_t pts90k, int64_t dts90k, bool flush);
+        void noteProducedFrames(MpegPlaybackState &playback, size_t framesBefore);
 
         struct MpegStubState
         {
@@ -540,6 +651,12 @@ namespace ps2_stubs
             uint32_t getPictureWaitTraceCount = 0u;
             uint32_t pictureTraceCount = 0u;
             uint32_t isEndTraceCount = 0u;
+            // sceMpegGetPicture's no-data pull (see sceMpegGetPicture). Not saved in snapshots:
+            // a loaded run starts the progress count afresh.
+            uint32_t nodataTraceCount = 0u;
+            uint64_t nodataCallsTotal = 0u;
+            uint64_t nodataProgressMark = std::numeric_limits<uint64_t>::max();
+            uint32_t nodataCallsWithoutProgress = 0u;
             std::unordered_map<uint32_t, std::vector<MpegRegisteredCallback>> callbacksByMpeg;
             std::unordered_map<uint32_t, MpegPlaybackState> playbackByMpeg;
         };
@@ -777,23 +894,13 @@ namespace ps2_stubs
             return (value + 15u) & ~15u;
         }
 
-        uint32_t readStackArg(uint8_t *rdram, R5900Context *ctx, uint32_t offset)
-        {
-            if (!rdram || !ctx)
-            {
-                return 0u;
-            }
-            return FAST_READ32(getRegU32(ctx, 29) + offset);
-        }
-
+        // Argument 5 (0-based index 4) is in t0 under the EE ABI. The game's copies of
+        // sceMpegAddStrCallback (0x11a1f0) and sceMpegDemuxPssRing (0x119df0) use t0 directly;
+        // a 0 there is a real 0, not a reason to read the caller's stack.
         uint32_t readAbiArg4(uint8_t *rdram, R5900Context *ctx)
         {
-            const uint32_t regArg = getRegU32(ctx, 8);
-            if (regArg != 0u)
-            {
-                return regArg;
-            }
-            return readStackArg(rdram, ctx, 0x10u);
+            (void)rdram;
+            return ctx ? getRegU32(ctx, 8) : 0u;
         }
 
         MpegPlaybackState &getPlaybackState(uint32_t mpegAddr)
@@ -1004,13 +1111,85 @@ namespace ps2_stubs
             return result;
         }
 
+        void flushDecoder(MpegPlaybackState &playback)
+        {
+            if (!playback.decoder)
+                return;
+            recordDecoderCall(playback, nullptr, 0u, -1, -1, true);
+            const size_t before = playback.decodedFrames.size();
+            playback.decoder->flush(playback.decodedFrames);
+            noteProducedFrames(playback, before);
+        }
+
         void flushDecoderIfEnded(MpegPlaybackState &playback)
         {
             if (playback.streamEnded && playback.decoder)
             {
-                playback.decoder->flush(playback.decodedFrames);
+                flushDecoder(playback);
             }
         }
+
+        void recordDecoderCall(MpegPlaybackState &playback, const uint8_t *data, size_t size, int64_t pts90k, int64_t dts90k, bool flush)
+        {
+            // The log exists only for snapshots (a heap copy of every chunk, a header scan):
+            // nothing is recorded unless the run opted in (PS2SnapshotService::enabled).
+            if (!playback.replayValid || !PS2SnapshotService::enabled())
+                return;
+            if (!flush && findMpegSequenceHeader(data, size) != kStartCodeNotFound)
+            {
+                playback.replayAnchors.push_back(playback.replayLog.size());
+                if (playback.replayAnchors.size() > 2u)
+                {
+                    // Keep the log from the second-newest anchor on.
+                    const size_t drop = playback.replayAnchors[playback.replayAnchors.size() - 2u];
+                    size_t droppedBytes = 0u;
+                    for (size_t i = 0; i < drop; ++i)
+                        droppedBytes += playback.replayLog[i].data.size();
+                    playback.replayLog.erase(playback.replayLog.begin(), playback.replayLog.begin() + static_cast<std::ptrdiff_t>(drop));
+                    playback.replayBytes -= droppedBytes;
+                    const size_t last = playback.replayAnchors.back();
+                    playback.replayAnchors = {0u, last - drop};
+                    // Pictures produced before the new log start are no longer replayed.
+                    playback.framesProducedAtLogStart = playback.anchorFramesProduced;
+                }
+                playback.anchorFramesProduced = playback.framesProduced;
+            }
+            MpegDecoderCall call;
+            if (!flush && data && size != 0u)
+                call.data.assign(data, data + size);
+            call.pts90k = pts90k;
+            call.dts90k = dts90k;
+            call.flush = flush;
+            playback.replayBytes += call.data.size();
+            playback.replayLog.push_back(std::move(call));
+            if (playback.replayBytes > mpegReplayLimitBytes())
+            {
+                // A stream without repeated sequence headers: give up the exact restore
+                // (a restore then resynchronises at the next sequence header).
+                std::cerr << "[snapshot:mpeg] decoder replay log over " << (mpegReplayLimitBytes() >> 20)
+                          << " MB after " << playback.framesProduced << " pictures: dropped; a snapshot of this"
+                          << " playback restores pictures only from the next sequence header"
+                          << " (PS2X_MPEG_REPLAY_MB raises the limit)" << std::endl;
+                playback.replayLog.clear();
+                playback.replayAnchors.clear();
+                playback.replayBytes = 0u;
+                playback.replayValid = false;
+            }
+        }
+
+        void noteProducedFrames(MpegPlaybackState &playback, size_t framesBefore)
+        {
+            for (size_t i = framesBefore; i < playback.decodedFrames.size(); ++i)
+            {
+                const MpegDecodedFrame &frame = playback.decodedFrames[i];
+                ++playback.framesProduced;
+                playback.lastProducedPts90k = frame.pts90k;
+                playback.lastProducedFingerprint = mpegFrameFingerprint(frame);
+            }
+        }
+
+        // Video ES bytes handed to feedElementaryStream, all playbacks (tests: nothing is fed twice).
+        std::atomic<uint64_t> g_mpegVideoBytesFed{0u};
 
         void feedElementaryStream(MpegPlaybackState &playback, const uint8_t *data, size_t size, int64_t pts90k = -1, int64_t dts90k = -1)
         {
@@ -1018,6 +1197,7 @@ namespace ps2_stubs
             {
                 return;
             }
+            g_mpegVideoBytesFed.fetch_add(size, std::memory_order_relaxed);
 
             const uint32_t feedEsIdx = g_mpeg_stub_state.feedEsTraceCount++;
             if (feedEsIdx < 32u)
@@ -1095,9 +1275,14 @@ namespace ps2_stubs
             if (!playback.decoder)
             {
                 playback.decoder = std::make_unique<MpegFfmpegDecoder>();
+                resetDecoderReplay(playback);
             }
 
-            if (!playback.decoder->feed(data, size, playback.decodedFrames, pts90k, dts90k))
+            recordDecoderCall(playback, data, size, pts90k, dts90k, false);
+            const size_t framesBefore = playback.decodedFrames.size();
+            const bool fed = playback.decoder->feed(data, size, playback.decodedFrames, pts90k, dts90k);
+            noteProducedFrames(playback, framesBefore);
+            if (!fed)
             {
                 playback.decoder.reset();
                 playback.waitingForVideoSequenceHeader = true;
@@ -1121,6 +1306,7 @@ namespace ps2_stubs
             }
 
             buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(clamped));
+            playback.pssBufferStartPos += clamped;
             if (guestAddrs.size() >= clamped)
             {
                 guestAddrs.erase(guestAddrs.begin(), guestAddrs.begin() + static_cast<std::ptrdiff_t>(clamped));
@@ -1155,10 +1341,14 @@ namespace ps2_stubs
                                       uint32_t dataAddr,
                                       uint32_t len,
                                       std::vector<MpegStreamCallbackEvent> &callbackEvents,
+                                      uint64_t packetPos,
+                                      uint64_t payloadPos,
                                       int64_t pts90k = -1,
                                       int64_t dts90k = -1)
         {
             MpegStreamCallbackEvent event{};
+            event.packetPos = packetPos;
+            event.payloadPos = payloadPos;
             event.mpegAddr = mpegAddr;
             event.streamType = streamType;
             event.dataAddr = dataAddr;
@@ -1328,6 +1518,8 @@ namespace ps2_stubs
                                 playback.pssGuestAddrs[payloadStart],
                                 static_cast<uint32_t>(packetEnd - payloadStart),
                                 callbackEvents,
+                                playback.pssBufferStartPos,
+                                playback.pssBufferStartPos + payloadStart,
                                 pes.pts90k,
                                 pes.dts90k);
                         }
@@ -1351,6 +1543,8 @@ namespace ps2_stubs
                             playback.pssGuestAddrs[payloadStart],
                             static_cast<uint32_t>(packetEnd - payloadStart),
                             callbackEvents,
+                            playback.pssBufferStartPos,
+                            playback.pssBufferStartPos + payloadStart,
                             pes.pts90k,
                             pes.dts90k);
                         queueStreamCallbackEvent(
@@ -1359,6 +1553,8 @@ namespace ps2_stubs
                             playback.pssGuestAddrs[payloadStart],
                             static_cast<uint32_t>(packetEnd - payloadStart),
                             callbackEvents,
+                            playback.pssBufferStartPos,
+                            playback.pssBufferStartPos + payloadStart,
                             pes.pts90k,
                             pes.dts90k);
                     }
@@ -1438,9 +1634,13 @@ namespace ps2_stubs
                 return;
             }
 
+            // A fresh playback keeps counting stream positions where the old one stopped (the
+            // demux call that resets it computes its packets' offsets from them).
+            const uint64_t streamPos = playback.pssBufferStartPos + playback.pssBuffer.size();
             if (playback.sawInput && playback.cdStreamGeneration != g_mpeg_stub_state.cdStreamGeneration)
             {
                 playback = makeFreshPlaybackState();
+                playback.pssBufferStartPos = streamPos;
             }
 
             if (playback.streamEnded)
@@ -1452,6 +1652,7 @@ namespace ps2_stubs
                 }
 
                 playback = makeFreshPlaybackState();
+                playback.pssBufferStartPos = streamPos;
             }
 
             if (!playback.sawInput)
@@ -1480,8 +1681,21 @@ namespace ps2_stubs
             while (copied < size)
             {
                 const uint32_t curAddr = addr + static_cast<uint32_t>(copied);
-                const uint32_t offset = curAddr & PS2_RAM_MASK;
-                size_t chunk = std::min<size_t>(size - copied, PS2_RAM_SIZE - offset);
+                // Bound the chunk by the region the address resolves to: main RAM (the guest
+                // address wraps at its end, as before) or the 16 KB scratchpad, which ends
+                // there (the next address would resolve to main RAM: stop instead).
+                uint32_t offset = 0u;
+                bool scratch = false;
+                if (!ps2ResolveGuestPointer(curAddr, offset, scratch))
+                {
+                    break;
+                }
+                const size_t regionSize = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                if (offset >= regionSize)
+                {
+                    break;
+                }
+                const size_t chunk = std::min<size_t>(size - copied, regionSize - offset);
                 if (chunk == 0u)
                 {
                     break;
@@ -1501,60 +1715,222 @@ namespace ps2_stubs
                     curAddr,
                     callbackEvents);
                 copied += chunk;
+                if (scratch && offset + chunk >= PS2_SCRATCHPAD_SIZE)
+                {
+                    break; // the scratchpad ends here
+                }
             }
             return copied;
         }
 
-        size_t appendGuestRingBytes(uint32_t mpegAddr,
-                                    MpegPlaybackState &playback,
-                                    const uint8_t *rdram,
-                                    uint32_t dataAddr,
-                                    uint32_t byteCount,
-                                    uint32_t ringBaseAddr,
-                                    uint32_t ringSize,
-                                    std::vector<MpegStreamCallbackEvent> &callbackEvents)
+        // The input of one sceMpegDemuxPss/Ring call: `size` bytes from dataAddr; for
+        // sceMpegDemuxPssRing they wrap at the end of the ring [ringBase, ringBase + ringSize)
+        // (ringSize 0: no ring).
+        struct MpegDemuxInput
         {
-            if (byteCount == 0u)
-            {
-                return 0u;
-            }
+            uint32_t dataAddr = 0u;
+            uint32_t size = 0u;
+            uint32_t ringBase = 0u;
+            uint32_t ringSize = 0u;
+        };
 
-            const uint32_t base = ringBaseAddr & PS2_RAM_MASK;
-            const uint32_t data = dataAddr & PS2_RAM_MASK;
-            if (ringBaseAddr != 0u && ringSize != 0u && ringSize <= PS2_RAM_SIZE)
+        // Length of the input's first linear piece (at dataAddr); the rest is at ringBase.
+        uint32_t demuxInputFirstLen(const MpegDemuxInput &in)
+        {
+            if (in.ringBase != 0u && in.ringSize != 0u && in.ringSize <= PS2_RAM_SIZE)
             {
+                const uint32_t base = in.ringBase & PS2_RAM_MASK;
+                const uint32_t data = in.dataAddr & PS2_RAM_MASK;
                 const uint32_t ringOffset = (data - base) & PS2_RAM_MASK;
-                if (ringOffset < ringSize)
+                if (ringOffset < in.ringSize)
                 {
-                    const uint32_t first = std::min<uint32_t>(byteCount, ringSize - ringOffset);
-                    size_t copied = appendGuestBytes(
-                        mpegAddr,
-                        playback,
-                        rdram,
-                        dataAddr,
-                        first,
-                        callbackEvents);
-                    if (copied < first)
-                    {
-                        return copied;
-                    }
+                    return std::min<uint32_t>(in.size, in.ringSize - ringOffset);
+                }
+            }
+            return in.size;
+        }
 
-                    const uint32_t remaining = byteCount - first;
-                    if (remaining != 0u)
-                    {
-                        copied += appendGuestBytes(
-                            mpegAddr,
-                            playback,
-                            rdram,
-                            ringBaseAddr,
-                            remaining,
-                            callbackEvents);
-                    }
+        uint32_t demuxInputAddr(const MpegDemuxInput &in, uint32_t offset)
+        {
+            const uint32_t first = demuxInputFirstLen(in);
+            return offset < first ? in.dataAddr + offset : in.ringBase + (offset - first);
+        }
+
+        bool readDemuxInput(const uint8_t *rdram, const MpegDemuxInput &in, uint32_t offset, uint32_t len,
+                            std::vector<uint8_t> &out)
+        {
+            out.resize(len);
+            for (uint32_t i = 0; i < len; ++i)
+            {
+                const uint8_t *b = getConstMemPtr(rdram, demuxInputAddr(in, offset + i));
+                if (!b)
+                {
+                    return false;
+                }
+                out[i] = *b;
+            }
+            return true;
+        }
+
+        // Parses the input from `from` on (the bytes before it were parsed by an earlier call);
+        // returns how many bytes it took in.
+        size_t appendDemuxInput(uint32_t mpegAddr,
+                                MpegPlaybackState &playback,
+                                const uint8_t *rdram,
+                                const MpegDemuxInput &in,
+                                uint32_t from,
+                                std::vector<MpegStreamCallbackEvent> &callbackEvents)
+        {
+            const uint32_t first = demuxInputFirstLen(in);
+            size_t copied = 0u;
+            if (from < first)
+            {
+                const size_t want = first - from;
+                copied = appendGuestBytes(mpegAddr, playback, rdram, in.dataAddr + from, want, callbackEvents);
+                if (copied < want)
+                {
                     return copied;
                 }
             }
+            const uint32_t secondFrom = std::max(from, first);
+            if (in.size > secondFrom)
+            {
+                copied += appendGuestBytes(mpegAddr, playback, rdram, in.ringBase + (secondFrom - first),
+                                           in.size - secondFrom, callbackEvents);
+            }
+            return copied;
+        }
 
-            return appendGuestBytes(mpegAddr, playback, rdram, dataAddr, byteCount, callbackEvents);
+        // Drops the first `count` bytes of the replay region (delivered) and their events.
+        void advanceDemuxReplay(MpegDemuxReplay &replay, size_t count)
+        {
+            if (count >= replay.bytes.size())
+            {
+                replay = MpegDemuxReplay{};
+                return;
+            }
+            replay.bytes.erase(replay.bytes.begin(), replay.bytes.begin() + static_cast<std::ptrdiff_t>(count));
+            std::vector<MpegStreamCallbackEvent> kept;
+            for (MpegStreamCallbackEvent &event : replay.events)
+            {
+                if (event.packetOffset >= static_cast<int64_t>(count))
+                {
+                    event.packetOffset -= static_cast<int64_t>(count);
+                    event.payloadOffset -= static_cast<uint32_t>(count);
+                    kept.push_back(std::move(event));
+                }
+            }
+            replay.events = std::move(kept);
+        }
+
+        std::atomic<uint64_t> g_mpegDemuxReplayMismatches{0u};
+        std::atomic<uint64_t> g_mpegDemuxNested{0u};
+
+        // A demux of a playback whose previous demux call still runs its stream callbacks.
+        void noteDemuxWhileRunInFlight(uint32_t mpegAddr)
+        {
+            const uint64_t n = g_mpegDemuxNested.fetch_add(1u) + 1u;
+            if (n <= 8u || (n % 1024u) == 0u)
+            {
+                std::cerr << "[MPEG:demux:nested] mpeg=0x" << std::hex << mpegAddr << std::dec
+                          << " demux while its stream callbacks run: consumes nothing (count=" << n << ")" << std::endl;
+            }
+        }
+
+        struct MpegDemuxResult
+        {
+            size_t consumed = 0u; // input bytes the call reports consumed (unless a callback stops it)
+            size_t parsed = 0u;   // of those, the bytes the parser took in for the first time
+        };
+
+        void noteAdpcmParsed(uint32_t streamType);
+
+        // One demux call's work under g_mpeg_stub_mutex: delivers the events of a replay
+        // region the caller presents again (see MpegDemuxReplay), then parses the new bytes.
+        // Every event gets its offset in this call's input.
+        MpegDemuxResult demuxInputUnlocked(uint32_t mpegAddr,
+                                           MpegPlaybackState &playback,
+                                           const uint8_t *rdram,
+                                           const MpegDemuxInput &in,
+                                           std::vector<MpegStreamCallbackEvent> &callbackEvents)
+        {
+            MpegDemuxResult result;
+            uint32_t from = 0u;
+            MpegDemuxReplay &replay = playback.demuxReplay;
+            if (!replay.bytes.empty())
+            {
+                const size_t regionLen = replay.bytes.size();
+                const uint32_t shown = static_cast<uint32_t>(std::min<size_t>(in.size, regionLen));
+                bool same = playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
+                for (uint32_t i = 0; same && i < shown; ++i)
+                {
+                    const uint8_t *b = getConstMemPtr(rdram, demuxInputAddr(in, i));
+                    same = b != nullptr && *b == replay.bytes[i];
+                }
+                if (!same)
+                {
+                    // Not the bytes it was told were left: the caller moved on (a seek, a new
+                    // stream). What it gives is parsed as new data.
+                    const uint64_t n = g_mpegDemuxReplayMismatches.fetch_add(1u) + 1u;
+                    if (n <= 16u || (n % 1024u) == 0u)
+                    {
+                        std::cerr << "[MPEG:demux:replay] mpeg=0x" << std::hex << mpegAddr << std::dec
+                                  << " input does not continue the rolled-back region (" << regionLen
+                                  << " bytes): dropped (mismatches=" << n << ")" << std::endl;
+                    }
+                    replay = MpegDemuxReplay{};
+                }
+                else
+                {
+                    size_t stop = shown;
+                    for (const MpegStreamCallbackEvent &event : replay.events)
+                    {
+                        if (static_cast<size_t>(event.payloadOffset) + event.len > shown)
+                        {
+                            stop = static_cast<size_t>(event.packetOffset);
+                            break;
+                        }
+                        MpegStreamCallbackEvent delivered = event;
+                        delivered.dataAddr = demuxInputAddr(in, event.payloadOffset);
+                        callbackEvents.push_back(std::move(delivered));
+                    }
+                    if (stop < regionLen)
+                    {
+                        // Only part of the region presented: the rest waits for the next call.
+                        result.consumed = stop;
+                        advanceDemuxReplay(replay, stop);
+                        return result;
+                    }
+                    // All of it: the unfinished packet the parser carries at the region's end
+                    // now lives here.
+                    const size_t carried = std::min(playback.pssGuestAddrs.size(), regionLen);
+                    const size_t base = playback.pssGuestAddrs.size() - carried;
+                    for (size_t j = 0; j < carried; ++j)
+                    {
+                        playback.pssGuestAddrs[base + j] =
+                            demuxInputAddr(in, static_cast<uint32_t>(regionLen - carried + j));
+                    }
+                    replay = MpegDemuxReplay{};
+                    from = static_cast<uint32_t>(regionLen);
+                }
+            }
+
+            const uint64_t basePos = playback.pssBufferStartPos + playback.pssBuffer.size();
+            const size_t firstNew = callbackEvents.size();
+            result.parsed = appendDemuxInput(mpegAddr, playback, rdram, in, from, callbackEvents);
+            result.consumed = from + result.parsed;
+            for (size_t i = firstNew; i < callbackEvents.size(); ++i)
+            {
+                MpegStreamCallbackEvent &event = callbackEvents[i];
+                const int64_t packetOffset =
+                    static_cast<int64_t>(from) + static_cast<int64_t>(event.packetPos) - static_cast<int64_t>(basePos);
+                const int64_t payloadOffset =
+                    static_cast<int64_t>(from) + static_cast<int64_t>(event.payloadPos) - static_cast<int64_t>(basePos);
+                event.packetOffset = packetOffset >= 0 ? packetOffset : -1;
+                event.payloadOffset = payloadOffset >= 0 ? static_cast<uint32_t>(payloadOffset) : 0u;
+                noteAdpcmParsed(event.streamType);
+            }
+            return result;
         }
 
         bool writeMpegCallbackData(uint8_t *rdram, uint32_t addr, const MpegStreamCallbackEvent &event)
@@ -1579,26 +1955,157 @@ namespace ps2_stubs
             return true;
         }
 
-        void dispatchGuestStreamCallback(uint8_t *rdram,
-                                         R5900Context *callerCtx,
-                                         PS2Runtime *runtime,
-                                         const MpegStreamCallbackEvent &event,
-                                         const MpegRegisteredCallback &callback)
+        // PS2X_MPEG_STRCB_CHECK=1 (debug): after every stream callback, check that its payload
+        // bytes are still what they were when the demux produced the event, i.e. that the
+        // callback copied the right data; counts on stderr as [MPEG:strcb] every 4096 callbacks.
+        bool mpegStrCallbackCheckEnabled()
+        {
+            static const bool enabled = []
+            {
+                const char *v = std::getenv("PS2X_MPEG_STRCB_CHECK");
+                return v && v[0] == '1';
+            }();
+            return enabled;
+        }
+
+        uint64_t mpegGuestBytesHash(const uint8_t *rdram, uint32_t addr, uint32_t len)
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (uint32_t i = 0; i < len; ++i)
+            {
+                const uint8_t *b = getConstMemPtr(rdram, addr + i);
+                h = (h ^ (b ? *b : 0u)) * 1099511628211ull;
+            }
+            return h;
+        }
+
+        // GuestInvocation::tag of a queued stream callback (see takePendingInvocations use).
+        constexpr uint64_t kMpegStrCallbackInvocationTag = 0x4D50454753545243ull; // "MPEGSTRC"
+
+        struct MpegStrCallbackCheckCounts
+        {
+            std::atomic<uint64_t> syncOk{0u}, syncStale{0u}, queuedOk{0u}, queuedStale{0u};
+            std::atomic<uint64_t> returnedZero{0u}; // backpressure: libmpeg would stop the demux there
+            std::atomic<uint64_t> returnedZeroByType[3]{}; // M2V, PCM, ADPCM
+        };
+        MpegStrCallbackCheckCounts g_mpegStrCheck;
+
+        void noteStrCallbackCheck(bool sync, bool stale, uint32_t streamType, bool returnedZero)
+        {
+            auto &counter = sync ? (stale ? g_mpegStrCheck.syncStale : g_mpegStrCheck.syncOk)
+                                 : (stale ? g_mpegStrCheck.queuedStale : g_mpegStrCheck.queuedOk);
+            counter.fetch_add(1u, std::memory_order_relaxed);
+            if (returnedZero)
+            {
+                g_mpegStrCheck.returnedZero.fetch_add(1u, std::memory_order_relaxed);
+                if (streamType < 3u)
+                {
+                    g_mpegStrCheck.returnedZeroByType[streamType].fetch_add(1u, std::memory_order_relaxed);
+                }
+            }
+            const uint64_t total = g_mpegStrCheck.syncOk + g_mpegStrCheck.syncStale +
+                                   g_mpegStrCheck.queuedOk + g_mpegStrCheck.queuedStale;
+            static std::atomic<uint32_t> s_staleLogs{0u};
+            if (stale && s_staleLogs.fetch_add(1u) < 16u)
+            {
+                std::cerr << "[MPEG:strcb] stale payload: type=" << streamType << (sync ? " sync" : " queued") << std::endl;
+            }
+            if ((total % 4096u) == 0u)
+            {
+                std::cerr << "[MPEG:strcb] callbacks=" << total
+                          << " sync ok=" << g_mpegStrCheck.syncOk << " stale=" << g_mpegStrCheck.syncStale
+                          << " queued ok=" << g_mpegStrCheck.queuedOk << " stale=" << g_mpegStrCheck.queuedStale
+                          << " returned0=" << g_mpegStrCheck.returnedZero
+                          << " (video " << g_mpegStrCheck.returnedZeroByType[0]
+                          << " pcm " << g_mpegStrCheck.returnedZeroByType[1]
+                          << " adpcm " << g_mpegStrCheck.returnedZeroByType[2] << ")"
+                          << std::endl;
+            }
+        }
+
+        // PS2X_MPEG_STRCB_CHECK=1 also follows every ADPCM packet: parsed (first time the demux
+        // sees it), accepted by the game's callback (once per packet, with an order-sensitive
+        // hash of the accepted payloads), rolled back (callback returned 0, the demux stopped
+        // there and the packet is presented again) or dropped (returned 0, lost). Printed as
+        // [MPEG:adpcm] every 256 accepted packets.
+        enum class MpegAdpcmOutcome
+        {
+            Accepted,
+            RolledBack,
+            Dropped,
+        };
+
+        struct MpegAdpcmCounts
+        {
+            std::atomic<uint64_t> parsed{0u}, accepted{0u}, rolledBack{0u}, dropped{0u};
+            std::atomic<uint64_t> starved{0u}; // of the dropped: no rollback, the picture decode was waiting
+            std::atomic<uint64_t> acceptedHash{1469598103934665603ull};
+        };
+        MpegAdpcmCounts g_mpegAdpcm;
+
+        void noteAdpcmParsed(uint32_t streamType)
+        {
+            if (streamType == kMpegStrADPCM && mpegStrCallbackCheckEnabled())
+            {
+                g_mpegAdpcm.parsed.fetch_add(1u, std::memory_order_relaxed);
+            }
+        }
+
+        void noteAdpcmOutcome(const uint8_t *rdram, uint32_t streamType, uint32_t dataAddr, uint32_t len,
+                              MpegAdpcmOutcome outcome)
+        {
+            if (streamType != kMpegStrADPCM || !mpegStrCallbackCheckEnabled())
+            {
+                return;
+            }
+            if (outcome == MpegAdpcmOutcome::RolledBack)
+            {
+                g_mpegAdpcm.rolledBack.fetch_add(1u, std::memory_order_relaxed);
+                return;
+            }
+            if (outcome == MpegAdpcmOutcome::Dropped)
+            {
+                g_mpegAdpcm.dropped.fetch_add(1u, std::memory_order_relaxed);
+                return;
+            }
+            // Stream callbacks run on the EE executor thread only: no concurrent update.
+            const uint64_t payload = mpegGuestBytesHash(rdram, dataAddr, len);
+            const uint64_t hash = (g_mpegAdpcm.acceptedHash.load(std::memory_order_relaxed) ^ payload) * 1099511628211ull;
+            g_mpegAdpcm.acceptedHash.store(hash, std::memory_order_relaxed);
+            const uint64_t accepted = g_mpegAdpcm.accepted.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if ((accepted % 256u) == 0u)
+            {
+                std::cerr << "[MPEG:adpcm] parsed=" << g_mpegAdpcm.parsed << " accepted=" << accepted
+                          << " rolledback=" << g_mpegAdpcm.rolledBack << " dropped=" << g_mpegAdpcm.dropped
+                          << " (starved " << g_mpegAdpcm.starved << ")"
+                          << " hash=" << std::hex << hash << std::dec << std::endl;
+            }
+        }
+
+        // Builds the invocation of one stream callback: callback(mpeg, &cbdata, data), the
+        // sceMpegCbDataStr block in guest memory, freed when the callback returns.
+        bool makeGuestStreamCallbackInvocation(uint8_t *rdram,
+                                               R5900Context *callerCtx,
+                                               PS2Runtime *runtime,
+                                               const MpegStreamCallbackEvent &event,
+                                               const MpegRegisteredCallback &callback,
+                                               GuestInvocation &invocation,
+                                               bool sync = false)
         {
             if (!rdram || !callerCtx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
             {
-                return;
+                return false;
             }
 
             const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
             if (cbDataAddr == 0u)
             {
-                return;
+                return false;
             }
             if (!writeMpegCallbackData(rdram, cbDataAddr, event))
             {
                 runtime->guestFree(cbDataAddr);
-                return;
+                return false;
             }
 
             R5900Context callbackCtx = *callerCtx;
@@ -1610,14 +2117,49 @@ namespace ps2_stubs
             SET_GPR_U32(&callbackCtx, 31, 0u);
             callbackCtx.pc = callback.func;
 
-            GuestInvocation invocation{};
+            invocation = GuestInvocation{};
             invocation.kind = GuestInvocationKind::RpcCallback;
+            invocation.tag = kMpegStrCallbackInvocationTag;
             invocation.context = callbackCtx;
             invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
             {
                 runtime->guestFree(cbDataAddr);
             };
-            runtime->eeScheduler().queueInvocation(std::move(invocation));
+            if (mpegStrCallbackCheckEnabled())
+            {
+                const uint32_t dataAddr = event.dataAddr;
+                const uint32_t len = event.len;
+                const uint32_t type = event.streamType;
+                const uint64_t expected = mpegGuestBytesHash(rdram, dataAddr, len);
+                invocation.onComplete = [runtime, rdram, cbDataAddr, dataAddr, len, type, expected, sync](const R5900Context &completed, R5900Context &)
+                {
+                    noteStrCallbackCheck(sync, mpegGuestBytesHash(rdram, dataAddr, len) != expected, type,
+                                         getRegU32(&completed, 2) == 0u);
+                    if (!sync)
+                    {
+                        // Queued: its return value comes after the demux has returned.
+                        noteAdpcmOutcome(rdram, type, dataAddr, len,
+                                         getRegU32(&completed, 2) != 0u ? MpegAdpcmOutcome::Accepted
+                                                                        : MpegAdpcmOutcome::Dropped);
+                    }
+                    runtime->guestFree(cbDataAddr);
+                };
+            }
+            invocation.completeTag = {GuestInvocationCompleteKind::GuestFree, cbDataAddr};
+            return true;
+        }
+
+        void dispatchGuestStreamCallback(uint8_t *rdram,
+                                         R5900Context *callerCtx,
+                                         PS2Runtime *runtime,
+                                         const MpegStreamCallbackEvent &event,
+                                         const MpegRegisteredCallback &callback)
+        {
+            GuestInvocation invocation;
+            if (makeGuestStreamCallbackInvocation(rdram, callerCtx, runtime, event, callback, invocation))
+            {
+                runtime->eeScheduler().queueInvocation(std::move(invocation));
+            }
         }
 
         void dispatchStreamCallbacks(uint8_t *rdram,
@@ -1639,17 +2181,434 @@ namespace ps2_stubs
             }
         }
 
-        void dispatchStreamCallbacksUnlocked(uint8_t *rdram,
-                                             R5900Context *ctx,
-                                             PS2Runtime *runtime,
-                                             const std::vector<MpegStreamCallbackEvent> &events)
+
+        // libmpeg's callback types (sceMpegAddCallback).
+        constexpr uint32_t kMpegCbNodata = 1u;
+        constexpr uint32_t kMpegCbBackground = 4u;
+        // GuestInvocation::tag of a no-data callback run by sceMpegGetPicture.
+        constexpr uint64_t kMpegNodataInvocationTag = 0x4D50454743424E44ull; // "MPEGCBND"
+        // No-data callbacks that demux nothing new before GetPicture gives up and waits (a
+        // game's callback may only drain its own ES ring, 4 KB per call in SRWZ, before it reads).
+        constexpr uint32_t kMpegNodataMaxCallsWithoutProgress = 4096u;
+
+        bool mpegInsideNodataCallback(PS2Runtime *runtime)
         {
+            return runtime != nullptr && runtime->eeScheduler().currentThread() != nullptr &&
+                   runtime->eeScheduler().hasInvocation(GuestInvocationKind::HleCall, kMpegNodataInvocationTag);
+        }
+
+        // The current CD stream's program end has been demuxed for this playback. Inside a
+        // no-data callback, sceMpegDemuxPss/Ring then consume nothing (return 0): a callback
+        // like SRWZ's 0x18bb50 feeds until its video ES ring holds 4 KB, but that ring is
+        // filled by the video stream callbacks, which the runtime queues and runs only after
+        // the callback returns; past the end the runtime keeps "consuming" the disc data behind
+        // the movie, so the callback would read forever (mpon1: stuck at the movie's last
+        // picture). On hardware the IPU finds the sequence end in data it already has and
+        // _getpic never calls the callback there.
+        bool mpegPlaybackEndedUnlocked(const MpegPlaybackState &playback)
+        {
+            return playback.streamEnded && playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
+        }
+
+        // Where sceMpegDemuxPss/Ring run the stream callbacks (PS2X_MPEG_SYNC_STRCB):
+        // - Always (default, "1"): synchronously, before the demux call returns, as libmpeg's
+        //   demuxer calls them (_sceMpegDispatchMpegCallback 0x115df0), whenever a guest thread
+        //   is current; else queued.
+        // - InsideNodata ("nodata"): only inside the game's no-data/background callback (the
+        //   behaviour before the demux backpressure); queued elsewhere.
+        // - Never ("0"): always queued (they run at the next dispatch; A/B testing only).
+        enum class MpegStrCallbackMode : int
+        {
+            Never = 0,
+            InsideNodata = 1,
+            Always = 2,
+        };
+        std::atomic<int> g_mpegStrCallbackModeOverride{-1};
+        std::atomic<int> g_mpegDemuxRollbackOverride{-1};
+
+        MpegStrCallbackMode mpegStrCallbackMode()
+        {
+            const int forced = g_mpegStrCallbackModeOverride.load(std::memory_order_relaxed);
+            if (forced >= 0)
+            {
+                return static_cast<MpegStrCallbackMode>(forced);
+            }
+            static const MpegStrCallbackMode mode = []
+            {
+                const char *v = std::getenv("PS2X_MPEG_SYNC_STRCB");
+                if (v && std::strcmp(v, "0") == 0)
+                {
+                    return MpegStrCallbackMode::Never;
+                }
+                if (v && std::strcmp(v, "nodata") == 0)
+                {
+                    return MpegStrCallbackMode::InsideNodata;
+                }
+                return MpegStrCallbackMode::Always;
+            }();
+            return mode;
+        }
+
+        // PS2X_MPEG_DEMUX_BACKPRESSURE=0: a stream callback that returns 0 does not stop the
+        // demux (its packet is dropped, the behaviour before; A/B testing only).
+        bool mpegDemuxRollbackEnabled()
+        {
+            const int forced = g_mpegDemuxRollbackOverride.load(std::memory_order_relaxed);
+            if (forced >= 0)
+            {
+                return forced != 0;
+            }
+            static const bool enabled = []
+            {
+                const char *v = std::getenv("PS2X_MPEG_DEMUX_BACKPRESSURE");
+                return !(v && v[0] == '0' && v[1] == '\0');
+            }();
+            return enabled;
+        }
+
+        // The synchronous stream callbacks of one demux call, run one after another on the
+        // calling thread; each one's completion starts the next (one invocation at a time,
+        // so they all use the stack of the same invocation depth).
+        struct MpegDemuxCallbackRun
+        {
+            uint8_t *rdram = nullptr;
+            PS2Runtime *runtime = nullptr;
+            uint32_t mpegAddr = 0u;
+            MpegDemuxInput input;
+            size_t consumed = 0u;
+            bool rollbackAllowed = true;
+            std::vector<MpegStreamCallbackEvent> events;
+            std::vector<std::pair<size_t, size_t>> items; // (event, callback) in call order
+            size_t next = 0u;
+        };
+
+        // libmpeg's backpressure: the callback of events[eventIndex] returned 0. The demux
+        // reports the bytes before that packet as consumed; the rest of the input becomes the
+        // front of the playback's replay region (the caller presents it again). Returns false
+        // when the packet cannot be presented again (it began in an earlier call's input).
+        bool rollbackDemuxAt(MpegDemuxCallbackRun &run, size_t eventIndex, R5900Context &caller)
+        {
+            const MpegStreamCallbackEvent &stopped = run.events[eventIndex];
+            if (stopped.packetOffset < 0 || static_cast<size_t>(stopped.packetOffset) >= run.consumed)
+            {
+                return false;
+            }
+            const uint32_t keepFrom = static_cast<uint32_t>(stopped.packetOffset);
+            MpegDemuxReplay front;
+            if (!readDemuxInput(run.rdram, run.input, keepFrom, static_cast<uint32_t>(run.consumed) - keepFrom,
+                                front.bytes))
+            {
+                return false;
+            }
+            for (size_t i = eventIndex; i < run.events.size(); ++i)
+            {
+                MpegStreamCallbackEvent event = run.events[i];
+                if (event.packetOffset < static_cast<int64_t>(keepFrom))
+                {
+                    continue; // (a second callback of an earlier event cannot follow; defensive)
+                }
+                event.packetOffset -= keepFrom;
+                event.payloadOffset -= keepFrom;
+                front.events.push_back(std::move(event));
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                const auto it = g_mpeg_stub_state.playbackByMpeg.find(run.mpegAddr);
+                if (it == g_mpeg_stub_state.playbackByMpeg.end())
+                {
+                    return false;
+                }
+                MpegDemuxReplay &replay = it->second.demuxReplay;
+                const uint32_t shift = static_cast<uint32_t>(front.bytes.size());
+                for (MpegStreamCallbackEvent &event : replay.events)
+                {
+                    event.packetOffset += shift;
+                    event.payloadOffset += shift;
+                    front.events.push_back(std::move(event));
+                }
+                front.bytes.insert(front.bytes.end(), replay.bytes.begin(), replay.bytes.end());
+                replay = std::move(front);
+            }
+            setReturnS32(&caller, static_cast<int32_t>(keepFrom));
+            return true;
+        }
+
+        void invokeNextDemuxCallback(const std::shared_ptr<MpegDemuxCallbackRun> &run, const R5900Context &caller);
+
+        void setDemuxRunInFlight(uint32_t mpegAddr, bool inFlight)
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            const auto it = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
+            if (it != g_mpeg_stub_state.playbackByMpeg.end())
+            {
+                it->second.demuxRunInFlight = inFlight;
+            }
+        }
+
+        // Audio packets a stream callback refused that the demux could not roll back, so they
+        // are lost (always counted, logged first 8 then every 256th): GetPicture was waiting
+        // for a picture inside its no-data callback, or the packet began in an earlier call.
+        std::atomic<uint64_t> g_mpegDemuxLostStarved{0u};
+        std::atomic<uint64_t> g_mpegDemuxLostEarlier{0u};
+
+        void noteDemuxPacketLost(uint32_t mpegAddr, uint32_t streamType, bool starved)
+        {
+            const uint64_t starvedCount = starved ? g_mpegDemuxLostStarved.fetch_add(1u) + 1u : g_mpegDemuxLostStarved.load();
+            const uint64_t earlierCount = starved ? g_mpegDemuxLostEarlier.load() : g_mpegDemuxLostEarlier.fetch_add(1u) + 1u;
+            const uint64_t total = starvedCount + earlierCount;
+            if (total <= 8u || (total % 256u) == 0u)
+            {
+                std::cerr << "[MPEG:demux:lost] mpeg=0x" << std::hex << mpegAddr << std::dec << " type=" << streamType
+                          << " packet refused and not presented again ("
+                          << (starved ? "GetPicture waiting for a picture" : "packet began in an earlier call")
+                          << "): lost=" << total << " (starved " << starvedCount << ", earlier " << earlierCount << ")"
+                          << std::endl;
+            }
+        }
+
+        void onDemuxCallbackDone(const std::shared_ptr<MpegDemuxCallbackRun> &run, size_t item,
+                                 const R5900Context &completed, R5900Context &caller)
+        {
+            const size_t eventIndex = run->items[item].first;
+            const MpegStreamCallbackEvent &event = run->events[eventIndex];
+            const bool accepted = getRegU32(&completed, 2) != 0u;
+            MpegAdpcmOutcome outcome = MpegAdpcmOutcome::Accepted;
+            // A video callback's 0 does not stop the demux: the runtime decodes the video it
+            // demuxes itself, and the game's video ES ring is drained only by IPU DMA, which
+            // the runtime does not model, so it reports "full" most of the time; stopping
+            // there would stall the picture decode on a ring nothing reads.
+            if (!accepted && event.streamType != kMpegStrM2V && mpegDemuxRollbackEnabled() &&
+                run->rollbackAllowed && rollbackDemuxAt(*run, eventIndex, caller))
+            {
+                setDemuxRunInFlight(run->mpegAddr, false);
+                noteAdpcmOutcome(run->rdram, event.streamType, event.dataAddr, event.len, MpegAdpcmOutcome::RolledBack);
+                return;
+            }
+            if (!accepted)
+            {
+                outcome = MpegAdpcmOutcome::Dropped;
+                if (!run->rollbackAllowed && event.streamType == kMpegStrADPCM && mpegStrCallbackCheckEnabled())
+                {
+                    g_mpegAdpcm.starved.fetch_add(1u, std::memory_order_relaxed);
+                }
+                if (event.streamType != kMpegStrM2V && mpegDemuxRollbackEnabled())
+                {
+                    noteDemuxPacketLost(run->mpegAddr, event.streamType, !run->rollbackAllowed);
+                }
+            }
+            noteAdpcmOutcome(run->rdram, event.streamType, event.dataAddr, event.len, outcome);
+            run->next = item + 1u;
+            invokeNextDemuxCallback(run, caller);
+        }
+
+        // Starts the next callback of the run (never returns when there is one).
+        void invokeNextDemuxCallback(const std::shared_ptr<MpegDemuxCallbackRun> &run, const R5900Context &caller)
+        {
+            while (run->next < run->items.size())
+            {
+                const size_t item = run->next;
+                const MpegStreamCallbackEvent &event = run->events[run->items[item].first];
+                const MpegRegisteredCallback &callback = event.callbacks[run->items[item].second];
+                R5900Context templateCtx = caller;
+                GuestInvocation invocation;
+                if (!makeGuestStreamCallbackInvocation(run->rdram, &templateCtx, run->runtime, event, callback,
+                                                       invocation, true))
+                {
+                    ++run->next;
+                    continue;
+                }
+                invocation.kind = GuestInvocationKind::HleCall;
+                auto freeAndCheck = std::move(invocation.onComplete);
+                invocation.onComplete = [run, item, freeAndCheck](const R5900Context &completed, R5900Context &parent)
+                {
+                    freeAndCheck(completed, parent);
+                    onDemuxCallbackDone(run, item, completed, parent);
+                };
+                // The completion carries the run's state: a snapshot waits until it is over.
+                invocation.completeTag = {};
+                run->runtime->eeScheduler().invokeCurrent(std::move(invocation));
+            }
+            setDemuxRunInFlight(run->mpegAddr, false); // the last callback has returned
+        }
+
+        // The end of sceMpegDemuxPss/Ring: v0 = bytes consumed, then the stream callbacks.
+        // Synchronous callbacks (see MpegStrCallbackMode) see their payload in the caller's
+        // PSS buffer, which SRWZ's feeder (0x18bd70) refills as soon as the demux returns, and
+        // SRWZ's no-data callback (0x18bb50) loops until the video callback has put 4 KB into
+        // its ES ring. A synchronous callback that returns 0 stops the demux at its packet
+        // (rollbackDemuxAt). Queued callbacks run after the demux has returned: their return
+        // value comes too late, and a 0 there loses the packet (counted by
+        // PS2X_MPEG_STRCB_CHECK).
+        void finishDemuxWithCallbacks(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      PS2Runtime *runtime,
+                                      uint32_t mpegAddr,
+                                      const MpegDemuxInput &input,
+                                      std::vector<MpegStreamCallbackEvent> &&events,
+                                      size_t consumed,
+                                      bool inNodataCallback,
+                                      bool pictureStarved)
+        {
+            setReturnS32(ctx, static_cast<int32_t>(consumed));
             if (events.empty())
             {
                 return;
             }
+            const MpegStrCallbackMode mode = mpegStrCallbackMode();
+            const bool sync = runtime != nullptr && runtime->eeScheduler().currentThread() != nullptr &&
+                              (mode == MpegStrCallbackMode::Always ||
+                               (mode == MpegStrCallbackMode::InsideNodata && inNodataCallback));
+            if (!sync)
+            {
+                dispatchStreamCallbacks(rdram, ctx, runtime, events);
+                return;
+            }
+            auto run = std::make_shared<MpegDemuxCallbackRun>();
+            run->rdram = rdram;
+            run->runtime = runtime;
+            run->mpegAddr = mpegAddr;
+            run->input = input;
+            run->consumed = consumed;
+            // The game's sceMpegGetPicture is waiting inside its no-data callback for a picture
+            // the runtime has not decoded yet: no rollback then. The game drains its audio ring
+            // only from its player loop, after GetPicture returns; stopping at a full audio
+            // ring here would leave the decoder without video and GetPicture parked for good.
+            // (On hardware the audio drains in real time and the IPU needs less of the stream
+            // ahead than the host decoder, so the stall does not arise there.)
+            run->rollbackAllowed = !pictureStarved;
+            run->events = std::move(events);
+            for (size_t i = 0; i < run->events.size(); ++i)
+            {
+                for (size_t c = 0; c < run->events[i].callbacks.size(); ++c)
+                {
+                    run->items.emplace_back(i, c);
+                }
+            }
+            // The demux caller resumes at its return address with v0 set above (or lowered by
+            // a rollback) once the last callback returns. Until then a demux of the same
+            // playback (a callback that demuxes, or another thread while a callback blocks)
+            // consumes nothing: it would parse past the bytes this run may still roll back to.
+            setDemuxRunInFlight(mpegAddr, true);
+            invokeNextDemuxCallback(run, *ctx);
+        }
 
-            dispatchStreamCallbacks(rdram, ctx, runtime, events);
+        // PS2X_MPEG_BACKGROUND_CB=0: no sceMpegCbBackground call from sceMpegGetPicture.
+        bool mpegBackgroundCallEnabled()
+        {
+            static const bool enabled = []
+            {
+                const char *v = std::getenv("PS2X_MPEG_BACKGROUND_CB");
+                return !(v && v[0] == '0' && v[1] == 0);
+            }();
+            return enabled;
+        }
+
+        // PS2X_MPEG_NODATA_CB=0: sceMpegGetPicture parks as before instead of calling the
+        // game's no-data callback (A/B testing only).
+        bool mpegNodataPullEnabled()
+        {
+            static const bool enabled = []
+            {
+                const char *v = std::getenv("PS2X_MPEG_NODATA_CB");
+                return !(v && v[0] == '0' && v[1] == '\0');
+            }();
+            return enabled;
+        }
+
+        // The callback sceMpegAddCallback(mpeg, type, ...) installed last (libmpeg keeps one
+        // per type and slot; a later call replaces it).
+        bool findMpegCallbackUnlocked(uint32_t mpegAddr, uint32_t type, MpegRegisteredCallback &out)
+        {
+            const auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+            if (it == g_mpeg_stub_state.callbacksByMpeg.end())
+            {
+                return false;
+            }
+            for (auto cb = it->second.rbegin(); cb != it->second.rend(); ++cb)
+            {
+                if (!cb->stream && cb->type == type)
+                {
+                    out = *cb;
+                    return out.func != 0u;
+                }
+            }
+            return false;
+        }
+
+        std::function<void(const R5900Context &, R5900Context &)> makeNodataComplete(uint8_t *rdram,
+                                                                                     PS2Runtime *runtime,
+                                                                                     uint32_t cbDataAddr)
+        {
+            return [rdram, runtime, cbDataAddr](const R5900Context &, R5900Context &parent)
+            {
+                runtime->guestFree(cbDataAddr);
+                // The game's GetPicture call resumes: parent holds its arguments unchanged.
+                sceMpegGetPicture(rdram, &parent, runtime);
+            };
+        }
+
+        // Runs one of the game's libmpeg callbacks on the calling thread, as libmpeg does from
+        // inside sceMpegGetPicture: sceMpegCbNodata when the IPU input runs dry
+        // (_sceMpegDispatchMpegCbNodata), sceMpegCbBackground while it waits for the IPU:
+        // callback(mpeg, &{type}, data). Afterwards GetPicture runs again from the start.
+        // Returns false (nothing done) when it cannot be called.
+        bool invokeMpegNodataCallback(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      PS2Runtime *runtime,
+                                      uint32_t mpegAddr,
+                                      const MpegRegisteredCallback &callback,
+                                      uint32_t callbackType = kMpegCbNodata)
+        {
+            if (!rdram || !ctx || !runtime || !runtime->hasFunction(callback.func))
+            {
+                return false;
+            }
+            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+            if (cbDataAddr == 0u)
+            {
+                return false;
+            }
+            uint8_t *cbData = getMemPtr(rdram, cbDataAddr);
+            if (!cbData)
+            {
+                runtime->guestFree(cbDataAddr);
+                return false;
+            }
+            std::memset(cbData, 0, kMpegCallbackDataSize);
+            *reinterpret_cast<uint32_t *>(cbData) = callbackType;
+
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::HleCall;
+            invocation.tag = kMpegNodataInvocationTag;
+            invocation.context = *ctx;
+            SET_GPR_U32(&invocation.context, 4, mpegAddr);
+            SET_GPR_U32(&invocation.context, 5, cbDataAddr);
+            SET_GPR_U32(&invocation.context, 6, callback.data);
+            SET_GPR_U32(&invocation.context, 7, 0u);
+            SET_GPR_U32(&invocation.context, 29, 0u); // the invocation stack
+            SET_GPR_U32(&invocation.context, 31, 0u); // return to the scheduler
+            invocation.context.pc = callback.func;
+            invocation.onComplete = makeNodataComplete(rdram, runtime, cbDataAddr);
+            invocation.completeTag = {GuestInvocationCompleteKind::MpegNodataComplete, cbDataAddr};
+
+            // Stream callbacks queued by earlier demux calls outside a callback have not run
+            // yet: run them first, so the game's rings get their packets in stream order
+            // before the callback demuxes more. They run one after another before the
+            // callback starts, so they share its stack.
+            std::vector<GuestInvocation> sequence = runtime->eeScheduler().takePendingInvocations(
+                GuestInvocationKind::RpcCallback, kMpegStrCallbackInvocationTag);
+            if (sequence.empty())
+            {
+                runtime->eeScheduler().invokeCurrent(std::move(invocation));
+            }
+            const uint32_t sharedSp = runtime->eeScheduler().invocationStackTop();
+            SET_GPR_U32(&invocation.context, 29, sharedSp);
+            for (GuestInvocation &pending : sequence)
+            {
+                SET_GPR_U32(&pending.context, 29, sharedSp);
+            }
+            sequence.push_back(std::move(invocation));
+            runtime->eeScheduler().invokeCurrentSequence(std::move(sequence));
         }
 
         void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height)
@@ -1757,6 +2716,10 @@ namespace ps2_stubs
             g_mpeg_stub_state.getPictureWaitTraceCount = 0u;
             g_mpeg_stub_state.pictureTraceCount = 0u;
             g_mpeg_stub_state.isEndTraceCount = 0u;
+            g_mpeg_stub_state.nodataTraceCount = 0u;
+            g_mpeg_stub_state.nodataCallsTotal = 0u;
+            g_mpeg_stub_state.nodataProgressMark = std::numeric_limits<uint64_t>::max();
+            g_mpeg_stub_state.nodataCallsWithoutProgress = 0u;
             g_mpeg_stub_state.callbacksByMpeg.clear();
             g_mpeg_stub_state.playbackByMpeg.clear();
         }
@@ -1766,6 +2729,28 @@ namespace ps2_stubs
     {
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         resetMpegStubStateUnlocked();
+    }
+
+    void setMpegStreamCallbackModeForTesting(int mode)
+    {
+        g_mpegStrCallbackModeOverride.store(mode, std::memory_order_relaxed);
+    }
+
+    void setMpegDemuxRollbackForTesting(int enabled)
+    {
+        g_mpegDemuxRollbackOverride.store(enabled, std::memory_order_relaxed);
+    }
+
+    uint64_t mpegVideoBytesFedForTesting()
+    {
+        return g_mpegVideoBytesFed.load(std::memory_order_relaxed);
+    }
+
+    size_t mpegDemuxReplayBytesForTesting(uint32_t mpegAddr)
+    {
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        const auto it = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
+        return it == g_mpeg_stub_state.playbackByMpeg.end() ? 0u : it->second.demuxReplay.bytes.size();
     }
 
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr)
@@ -1860,7 +2845,7 @@ namespace ps2_stubs
             const size_t framesBefore = playback.decodedFrames.size();
             if (playback.decoder)
             {
-                playback.decoder->flush(playback.decodedFrames);
+                flushDecoder(playback);
             }
             wakePictureWaiter = playback.decodedFrames.size() != framesBefore ||
                                 playback.streamEnded ||
@@ -1929,7 +2914,24 @@ namespace ps2_stubs
         setReturnU32(ctx, handle);
     }
 
-    void sceMpegAddStrCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // sceMpegAddStrCallback(sceMpeg *mp, sceMpegStrType type, int id, sceMpegCallback func,
+    //                       void *data): the fifth argument is in t0 (game's copy 0x11a1f0).
+    PS2_STUB_TYPED(int32_t, sceMpegAddStrCallback, ps2_abi::gptr mpegAddr, uint32_t streamType, uint32_t streamId,
+                   ps2_abi::gptr callbackFunc, ps2_abi::gptr callbackData)
+    {
+        (void)rdram;
+        (void)ctx;
+        (void)runtime;
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        g_mpeg_stub_state.initialized = true;
+        (void)getPlaybackState(mpegAddr);
+        const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
+        g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
+            MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
+        return 0;
+    }
+
+    void sceMpegAddStrCallback_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
@@ -1946,6 +2948,8 @@ namespace ps2_stubs
             MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
         setReturnU32(ctx, 0u);
     }
+
+    PS2_STUB_DISPATCH(sceMpegAddStrCallback)
 
     void sceMpegClearRefBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -2067,6 +3071,13 @@ namespace ps2_stubs
         (void)rdram;
 
         const uint32_t mpegAddr = getRegU32(ctx, 4);
+        if (mpegStrCallbackCheckEnabled())
+        {
+            std::cerr << "[MPEG:adpcm] at sceMpegDelete: parsed=" << g_mpegAdpcm.parsed
+                      << " accepted=" << g_mpegAdpcm.accepted << " rolledback=" << g_mpegAdpcm.rolledBack
+                      << " dropped=" << g_mpegAdpcm.dropped << " (starved " << g_mpegAdpcm.starved << ") hash="
+                      << std::hex << g_mpegAdpcm.acceptedHash << std::dec << std::endl;
+        }
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
@@ -2081,6 +3092,7 @@ namespace ps2_stubs
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
+        const MpegDemuxInput input{dataAddr, byteCount, 0u, 0u};
 
         std::vector<MpegStreamCallbackEvent> callbackEvents;
         std::vector<uint32_t> completedMpegIds;
@@ -2090,15 +3102,22 @@ namespace ps2_stubs
         uint32_t traceIdx = 0u;
         bool eofChanged = false;
         bool backpressured = false;
+        const bool inNodataCallback = mpegInsideNodataCallback(runtime);
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
             decodedBefore = playback.decodedFrames.size();
-            backpressured = mpegDemuxBackpressured(playback);
+            if (playback.demuxRunInFlight)
+            {
+                noteDemuxWhileRunInFlight(mpegAddr);
+            }
+            backpressured = playback.demuxRunInFlight || mpegDemuxBackpressured(playback) ||
+                            (inNodataCallback && mpegPlaybackEndedUnlocked(playback));
             if (!backpressured)
             {
-                consumed = appendGuestBytes(mpegAddr, playback, rdram, dataAddr, byteCount, callbackEvents);
-                recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
+                const MpegDemuxResult result = demuxInputUnlocked(mpegAddr, playback, rdram, input, callbackEvents);
+                consumed = result.consumed;
+                recordCdStreamBytesDemuxedUnlocked(result.parsed, completedMpegIds, eofChanged);
             }
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxPssTraceCount++;
@@ -2141,11 +3160,15 @@ namespace ps2_stubs
             });
         }
 
-        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
-        setReturnS32(ctx, static_cast<int32_t>(consumed));
+        finishDemuxWithCallbacks(rdram, ctx, runtime, mpegAddr, input, std::move(callbackEvents), consumed,
+                                 inNodataCallback, inNodataCallback && decodedCount == 0u);
     }
 
-    void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // sceMpegDemuxPssRing after decoding, shared by the typed and the legacy form; returns v0 (the
+    // stream callbacks it dispatches run before the return value is written, in both forms).
+    static int32_t mpegDemuxPssRingBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t mpegAddr,
+                                        uint32_t dataAddr, uint32_t availableBytes, uint32_t ringBaseAddr,
+                                        uint32_t ringSize)
     {
         static std::atomic<uint32_t> s_demuxRingEntryCount{0u};
         const uint32_t entryIdx = s_demuxRingEntryCount.fetch_add(1u, std::memory_order_relaxed);
@@ -2159,12 +3182,7 @@ namespace ps2_stubs
             });
         }
 
-        const uint32_t mpegAddr = getRegU32(ctx, 4);
-        const uint32_t dataAddr = getRegU32(ctx, 5);
-        const uint32_t availableBytes = getRegU32(ctx, 6);
-        const uint32_t ringBaseAddr = getRegU32(ctx, 7);
-        const uint32_t ringSize = readAbiArg4(rdram, ctx);
-
+        const MpegDemuxInput input{dataAddr, availableBytes, ringBaseAddr, ringSize};
         std::vector<MpegStreamCallbackEvent> callbackEvents;
         std::vector<uint32_t> completedMpegIds;
         size_t consumed = 0u;
@@ -2173,23 +3191,22 @@ namespace ps2_stubs
         uint32_t traceIdx = 0u;
         bool eofChanged = false;
         bool backpressured = false;
+        const bool inNodataCallback = mpegInsideNodataCallback(runtime);
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
             decodedBefore = playback.decodedFrames.size();
-            backpressured = mpegDemuxBackpressured(playback);
+            if (playback.demuxRunInFlight)
+            {
+                noteDemuxWhileRunInFlight(mpegAddr);
+            }
+            backpressured = playback.demuxRunInFlight || mpegDemuxBackpressured(playback) ||
+                            (inNodataCallback && mpegPlaybackEndedUnlocked(playback));
             if (!backpressured)
             {
-                consumed = appendGuestRingBytes(
-                    mpegAddr,
-                    playback,
-                    rdram,
-                    dataAddr,
-                    availableBytes,
-                    ringBaseAddr,
-                    ringSize,
-                    callbackEvents);
-                recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
+                const MpegDemuxResult result = demuxInputUnlocked(mpegAddr, playback, rdram, input, callbackEvents);
+                consumed = result.consumed;
+                recordCdStreamBytesDemuxedUnlocked(result.parsed, completedMpegIds, eofChanged);
             }
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
@@ -2205,8 +3222,7 @@ namespace ps2_stubs
                               << " avail=" << availableBytes << std::endl;
                 });
             }
-            setReturnS32(ctx, 0);
-            return;
+            return 0;
         }
         const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
         if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
@@ -2235,9 +3251,32 @@ namespace ps2_stubs
             });
         }
 
-        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
-        setReturnS32(ctx, static_cast<int32_t>(consumed));
+        finishDemuxWithCallbacks(rdram, ctx, runtime, mpegAddr, input, std::move(callbackEvents), consumed,
+                                 inNodataCallback, inNodataCallback && decodedCount == 0u);
+        return static_cast<int32_t>(consumed);
     }
+
+    // sceMpegDemuxPssRing(sceMpeg *mp, u_char *data, int avail, u_char *ring, int ringSize): the
+    // ring size is the fifth argument, in t0 (game's copy 0x119df0).
+    PS2_STUB_TYPED(int32_t, sceMpegDemuxPssRing, ps2_abi::gptr mpegAddr, ps2_abi::gptr dataAddr, uint32_t availableBytes,
+                   ps2_abi::gptr ringBaseAddr, uint32_t ringSize)
+    {
+        return mpegDemuxPssRingBody(rdram, ctx, runtime, mpegAddr, dataAddr, availableBytes, ringBaseAddr, ringSize);
+    }
+
+    void sceMpegDemuxPssRing_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t mpegAddr = getRegU32(ctx, 4);
+        const uint32_t dataAddr = getRegU32(ctx, 5);
+        const uint32_t availableBytes = getRegU32(ctx, 6);
+        const uint32_t ringBaseAddr = getRegU32(ctx, 7);
+        const uint32_t ringSize = readAbiArg4(rdram, ctx);
+
+        setReturnS32(ctx, mpegDemuxPssRingBody(rdram, ctx, runtime, mpegAddr, dataAddr, availableBytes, ringBaseAddr,
+                                               ringSize));
+    }
+
+    PS2_STUB_DISPATCH(sceMpegDemuxPssRing)
 
     void sceMpegDispCenterOffX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -2288,15 +3327,78 @@ namespace ps2_stubs
         uint32_t height = kStubMovieHeight;
         uint32_t frameCount = 0u;
         bool haveFrame = false;
+        bool sequenceEnded = false;
         MpegDecodedFrame frame;
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            // libmpeg calls sceMpegCbBackground while it waits for the IPU, i.e. during every
+            // picture's decode; games feed the demuxer from it (SRWZ's 0x18bcd0 feeds for a
+            // picture-size-dependent number of timer-0 ticks, the hardware's main feed). Once
+            // per GetPicture call here, before anything else.
+            MpegRegisteredCallback background{};
+            if (!playback.backgroundCalled && playback.sawInput && !playback.streamEnded &&
+                !playback.decoderFailed && mpegBackgroundCallEnabled() &&
+                findMpegCallbackUnlocked(mpegAddr, kMpegCbBackground, background))
+            {
+                playback.backgroundCalled = true;
+                lock.unlock();
+                if (invokeMpegNodataCallback(rdram, ctx, runtime, mpegAddr, background, kMpegCbBackground))
+                {
+                    return; // not reached: invokeCurrent transfers to the dispatcher
+                }
+                lock.lock();
+            }
             if (playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !playback.streamEnded &&
                 !playback.decoderFailed)
             {
+                // libmpeg never parks here: _getpic decodes from the data already given to
+                // the IPU and, when that runs dry, calls the game's sceMpegCbNodata callback
+                // from inside GetPicture to get more (SRWZ's 0x18bb50 reads the CD stream and
+                // demuxes, blocking, until there is data). Parking instead deadlocks a player
+                // whose only feeder is the loop GetPicture was called from (SRWZ feeds while
+                // timer 0 < 500 after GetPicture; under host load that budget is gone by the
+                // time it gets there and the queue runs dry).
+                MpegRegisteredCallback nodata{};
+                if (mpegNodataPullEnabled() &&
+                    findMpegCallbackUnlocked(mpegAddr, kMpegCbNodata, nodata))
+                {
+                    MpegStubState &s = g_mpeg_stub_state;
+                    if (s.cdStreamBytesDemuxed != s.nodataProgressMark)
+                    {
+                        s.nodataProgressMark = s.cdStreamBytesDemuxed;
+                        s.nodataCallsWithoutProgress = 0u;
+                    }
+                    if (s.nodataCallsWithoutProgress < kMpegNodataMaxCallsWithoutProgress)
+                    {
+                        ++s.nodataCallsWithoutProgress;
+                        ++s.nodataCallsTotal;
+                        if (s.nodataTraceCount < 32u || (s.nodataCallsTotal % 1024u) == 0u)
+                        {
+                            ++s.nodataTraceCount;
+                            std::cerr << "[MPEG:GetPicture:nodata] call=" << s.nodataCallsTotal
+                                      << " mpeg=0x" << std::hex << mpegAddr
+                                      << " cb=0x" << nodata.func << std::dec
+                                      << " served=" << playback.picturesServed
+                                      << " demuxed=" << s.cdStreamBytesDemuxed << std::endl;
+                        }
+                        lock.unlock();
+                        if (invokeMpegNodataCallback(rdram, ctx, runtime, mpegAddr, nodata))
+                        {
+                            return; // not reached: invokeCurrent transfers to the dispatcher
+                        }
+                        lock.lock();
+                    }
+                    else if (s.nodataCallsWithoutProgress == kMpegNodataMaxCallsWithoutProgress)
+                    {
+                        ++s.nodataCallsWithoutProgress;
+                        std::cerr << "[MPEG:GetPicture:nodata] " << kMpegNodataMaxCallsWithoutProgress
+                                  << " no-data callbacks demuxed nothing: waiting for a demux instead, mpeg=0x"
+                                  << std::hex << mpegAddr << std::dec << std::endl;
+                    }
+                }
                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                 {
                     PS2_IF_AGRESSIVE_LOGS({
@@ -2319,7 +3421,8 @@ namespace ps2_stubs
                             return;
                         }
                         sceMpegGetPicture(rdram, &resumeContext, runtime);
-                    });
+                    },
+                    EeResumeTag{EeResumeKind::MpegGetPicture, {}});
             }
 
             if (!playback.decodedFrames.empty())
@@ -2355,7 +3458,8 @@ namespace ps2_stubs
                                 return;
                             }
                             sceMpegGetPicture(rdram, &resumeContext, runtime);
-                        });
+                        },
+                        EeResumeTag{EeResumeKind::MpegGetPicture, {}});
                 }
 
                 frame = std::move(playback.decodedFrames.front());
@@ -2366,6 +3470,25 @@ namespace ps2_stubs
                 height = playback.height;
                 frameCount = playback.picturesServed;
                 playback.picturesServed += 1u;
+                // PS2X_MPEG_HASH=N: log an FNV-1a hash of every Nth served picture (and its
+                // VBlank tick), to check that two runs show the same pictures whatever the timing.
+                static const uint32_t s_hashEvery = []
+                {
+                    const char *v = std::getenv("PS2X_MPEG_HASH");
+                    return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+                }();
+                if (s_hashEvery != 0u && (frameCount % s_hashEvery) == 0u)
+                {
+                    uint64_t h = 1469598103934665603ull;
+                    for (const uint8_t b : frame.rgba)
+                    {
+                        h = (h ^ b) * 1099511628211ull;
+                    }
+                    std::cout << "[MPEG:hash] picture=" << frameCount << " tick="
+                              << (runtime ? runtime->eeScheduler().currentVSyncTick() : 0u)
+                              << " size=" << frame.width << "x" << frame.height << " fnv=" << std::hex << h
+                              << std::dec << std::endl;
+                }
                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
                 haveFrame = true;
@@ -2386,7 +3509,22 @@ namespace ps2_stubs
                 width = playback.width;
                 height = playback.height;
                 frameCount = playback.picturesServed;
+                // libmpeg's _getpic (0x115358 in SRWZ) clears sys->isEnd on entry and sets it
+                // when the decoder reaches the sequence end instead of a picture; games read
+                // it inline (SRWZ's sceMpegIsEnd at 0x115d18 is `return *mpeg->sys`) to leave
+                // their playback loop. Here: the stream's end has been demuxed (program end
+                // code or CD EOF; the decoder is flushed then), every decoded picture has been
+                // served and the last one has had its display time.
+                const uint64_t currentTickQ32 = runtime != nullptr
+                                                    ? (runtime->eeScheduler().currentVSyncTick() << 32u)
+                                                    : std::numeric_limits<uint64_t>::max();
+                const uint64_t presentationEnd = playback.presentationEndTickQ32;
+                const bool presentationComplete =
+                    presentationEnd == std::numeric_limits<uint64_t>::max() || currentTickQ32 >= presentationEnd;
+                sequenceEnded = playback.streamEnded && playback.sawInput && presentationComplete;
             }
+            // This call returns to the game now (every wait above transferred instead).
+            playback.backgroundCalled = false;
         }
 
         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
@@ -2396,13 +3534,14 @@ namespace ps2_stubs
         if (uint8_t *base = getMemPtr(rdram, mpegAddr))
         {
             const uint32_t iVar1 = *reinterpret_cast<uint32_t *>(base + 0x40);
-            if (uint8_t *inner = getMemPtr(rdram, iVar1))
+            if (iVar1 != 0u) // sys not set up (no sceMpegCreate yet): leave guest memory alone
             {
-                *reinterpret_cast<uint32_t *>(inner + 0xb0) = 1;
-                *reinterpret_cast<uint32_t *>(inner + 0xd8) = (getRegU32(ctx, 5) & 0x0FFFFFFFu) | 0x20000000u;
-                *reinterpret_cast<uint32_t *>(inner + 0xe4) = getRegU32(ctx, 6);
-                *reinterpret_cast<uint32_t *>(inner + 0xdc) = 0;
-                *reinterpret_cast<uint32_t *>(inner + 0xe0) = 0;
+                mpegGuestWrite32(rdram, iVar1 + 0x00u, sequenceEnded ? 1u : 0u); // sys->isEnd
+                mpegGuestWrite32(rdram, iVar1 + 0xb0u, 1u);
+                mpegGuestWrite32(rdram, iVar1 + 0xd8u, (getRegU32(ctx, 5) & 0x0FFFFFFFu) | 0x20000000u);
+                mpegGuestWrite32(rdram, iVar1 + 0xe4u, getRegU32(ctx, 6));
+                mpegGuestWrite32(rdram, iVar1 + 0xdcu, 0u);
+                mpegGuestWrite32(rdram, iVar1 + 0xe0u, 0u);
             }
         }
 
@@ -2569,5 +3708,317 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         getPlaybackState(mpegAddr).imageBufferAddr = imageBufferAddr;
         setReturnS32(ctx, 0);
+    }
+}
+
+namespace ps2_stubs::snapshot
+{
+    namespace
+    {
+        void saveFrame(ps2x::StateWriter &w, const MpegDecodedFrame &frame)
+        {
+            w.i32(frame.width);
+            w.i32(frame.height);
+            w.i32(frame.repeatPict);
+            w.i64(frame.pts90k);
+            w.podVector(frame.rgba);
+        }
+
+        void loadFrame(ps2x::StateReader &r, MpegDecodedFrame &frame)
+        {
+            frame.width = r.i32();
+            frame.height = r.i32();
+            frame.repeatPict = r.i32();
+            frame.pts90k = r.i64();
+            r.podVector(frame.rgba);
+        }
+
+        void savePlayback(ps2x::StateWriter &w, const MpegPlaybackState &p)
+        {
+            w.u32(p.picturesServed);
+            w.u32(p.width);
+            w.u32(p.height);
+            w.u32(p.decodeMode);
+            w.u32(p.imageBufferAddr);
+            w.boolean(p.sawInput);
+            w.boolean(p.sawSequenceEnd);
+            w.boolean(p.streamEnded);
+            w.boolean(p.decoderFailed);
+            w.u64(p.cdStreamGeneration);
+            w.boolean(p.waitingForVideoSequenceHeader);
+            w.podVector(p.videoSequenceSyncBuffer);
+            w.podVector(p.pssBuffer);
+            w.podVector(p.pssGuestAddrs);
+            w.u64(p.pssBufferStartPos);
+            w.podVector(p.demuxReplay.bytes);
+            w.size(p.demuxReplay.events.size());
+            for (const MpegStreamCallbackEvent &event : p.demuxReplay.events)
+            {
+                w.u32(event.mpegAddr);
+                w.u32(event.streamType);
+                w.u32(event.dataAddr);
+                w.u32(event.len);
+                w.u64(event.pts);
+                w.u64(event.dts);
+                w.podVector(event.callbacks);
+                w.u64(event.packetPos);
+                w.u64(event.payloadPos);
+                w.i64(event.packetOffset);
+                w.u32(event.payloadOffset);
+            }
+            w.size(p.decodedFrames.size());
+            for (const MpegDecodedFrame &frame : p.decodedFrames)
+                saveFrame(w, frame);
+            w.boolean(p.decoder != nullptr);
+            w.u8(p.frameRateCode);
+            w.u8(p.frameRateExtensionN);
+            w.u8(p.frameRateExtensionD);
+            w.boolean(p.hasFrameRateExtension);
+            w.podVector(p.videoTimingScanBuffer);
+            w.u64(p.pictureIntervalQ32);
+            w.u64(p.nextPictureTickQ32);
+            w.u64(p.presentationEndTickQ32);
+            w.i64(p.firstPresentedPts90k);
+            w.u64(p.ptsPresentationBaseTickQ32);
+
+            w.size(p.replayLog.size());
+            for (const MpegDecoderCall &call : p.replayLog)
+            {
+                w.podVector(call.data);
+                w.i64(call.pts90k);
+                w.i64(call.dts90k);
+                w.boolean(call.flush);
+            }
+            w.podSequence(p.replayAnchors);
+            w.size(p.replayBytes);
+            w.boolean(p.replayValid);
+            w.u64(p.framesProduced);
+            w.u64(p.framesProducedAtLogStart);
+            w.u64(p.anchorFramesProduced);
+            w.i64(p.lastProducedPts90k);
+            w.u64(p.lastProducedFingerprint);
+        }
+
+        // Feeds the replay log to a fresh decoder; returns a one-line report.
+        std::string replayDecoder(MpegPlaybackState &p)
+        {
+            p.decoder = std::make_unique<MpegFfmpegDecoder>();
+            if (!p.replayValid)
+            {
+                p.decoder.reset();
+                p.waitingForVideoSequenceHeader = true;
+                p.videoSequenceSyncBuffer.clear();
+                return "replay log had been dropped (stream without repeated sequence headers): "
+                       "decoding resumes at the next sequence header";
+            }
+            if (p.replayLog.empty())
+            {
+                return "decoder restarted (nothing fed yet)";
+            }
+            std::deque<MpegDecodedFrame> replayed;
+            uint64_t replayedCount = 0u;
+            for (const MpegDecoderCall &call : p.replayLog)
+            {
+                const size_t before = replayed.size();
+                if (call.flush)
+                {
+                    p.decoder->flush(replayed);
+                }
+                else if (!p.decoder->feed(call.data.data(), call.data.size(), replayed, call.pts90k, call.dts90k))
+                {
+                    p.decoder.reset();
+                    p.waitingForVideoSequenceHeader = true;
+                    p.videoSequenceSyncBuffer.clear();
+                    return "decoder replay failed: decoding resumes at the next sequence header";
+                }
+                replayedCount += replayed.size() - before;
+                // Only the newest picture is compared: bound the memory.
+                while (replayed.size() > 1u)
+                    replayed.pop_front();
+            }
+            const uint64_t originalCount = p.framesProduced - p.framesProducedAtLogStart;
+            std::ostringstream out;
+            out << "decoder replayed " << p.replayLog.size() << " calls (" << p.replayBytes << " bytes): "
+                << replayedCount << " pictures, the original decoder produced " << originalCount;
+            if (originalCount == 0u)
+            {
+                out << "; no picture produced yet";
+            }
+            else if (!replayed.empty() &&
+                     replayed.back().pts90k == p.lastProducedPts90k &&
+                     mpegFrameFingerprint(replayed.back()) == p.lastProducedFingerprint)
+            {
+                out << "; last picture matches";
+            }
+            else
+            {
+                out << "; WARNING: last picture differs (pts " << (replayed.empty() ? -2 : replayed.back().pts90k)
+                    << " vs " << p.lastProducedPts90k << ")";
+            }
+            return out.str();
+        }
+
+        void loadPlayback(ps2x::StateReader &r, MpegPlaybackState &p, uint32_t mpegAddr)
+        {
+            p = MpegPlaybackState{};
+            p.picturesServed = r.u32();
+            p.width = r.u32();
+            p.height = r.u32();
+            p.decodeMode = r.u32();
+            p.imageBufferAddr = r.u32();
+            p.sawInput = r.boolean();
+            p.sawSequenceEnd = r.boolean();
+            p.streamEnded = r.boolean();
+            p.decoderFailed = r.boolean();
+            p.cdStreamGeneration = r.u64();
+            p.waitingForVideoSequenceHeader = r.boolean();
+            r.podVector(p.videoSequenceSyncBuffer);
+            r.podVector(p.pssBuffer);
+            r.podVector(p.pssGuestAddrs);
+            p.pssBufferStartPos = r.u64();
+            r.podVector(p.demuxReplay.bytes);
+            p.demuxReplay.events.resize(r.size());
+            for (MpegStreamCallbackEvent &event : p.demuxReplay.events)
+            {
+                event.mpegAddr = r.u32();
+                event.streamType = r.u32();
+                event.dataAddr = r.u32();
+                event.len = r.u32();
+                event.pts = r.u64();
+                event.dts = r.u64();
+                r.podVector(event.callbacks);
+                event.packetPos = r.u64();
+                event.payloadPos = r.u64();
+                event.packetOffset = r.i64();
+                event.payloadOffset = r.u32();
+            }
+            const size_t frames = r.size();
+            for (size_t i = 0; i < frames; ++i)
+            {
+                MpegDecodedFrame frame;
+                loadFrame(r, frame);
+                p.decodedFrames.push_back(std::move(frame));
+            }
+            const bool hadDecoder = r.boolean();
+            p.frameRateCode = r.u8();
+            p.frameRateExtensionN = r.u8();
+            p.frameRateExtensionD = r.u8();
+            p.hasFrameRateExtension = r.boolean();
+            r.podVector(p.videoTimingScanBuffer);
+            p.pictureIntervalQ32 = r.u64();
+            p.nextPictureTickQ32 = r.u64();
+            p.presentationEndTickQ32 = r.u64();
+            p.firstPresentedPts90k = r.i64();
+            p.ptsPresentationBaseTickQ32 = r.u64();
+
+            const size_t calls = r.size();
+            p.replayLog.resize(calls);
+            for (MpegDecoderCall &call : p.replayLog)
+            {
+                r.podVector(call.data);
+                call.pts90k = r.i64();
+                call.dts90k = r.i64();
+                call.flush = r.boolean();
+            }
+            r.podSequence(p.replayAnchors);
+            p.replayBytes = static_cast<size_t>(r.u64());
+            p.replayValid = r.boolean();
+            p.framesProduced = r.u64();
+            p.framesProducedAtLogStart = r.u64();
+            p.anchorFramesProduced = r.u64();
+            p.lastProducedPts90k = r.i64();
+            p.lastProducedFingerprint = r.u64();
+
+            if (hadDecoder)
+            {
+                // The replay logs through the decoder's own channel: build the report first.
+                const std::string report = replayDecoder(p);
+                std::cerr << "[snapshot:mpeg] mpeg=0x" << std::hex << mpegAddr << std::dec << " " << report << std::endl;
+            }
+        }
+    }
+
+    void saveMpeg(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        const MpegStubState &s = g_mpeg_stub_state;
+        w.boolean(s.initialized);
+        w.u32(s.nextCallbackHandle);
+        w.u64(s.cdStreamGeneration);
+        w.u64(s.cdStreamBytesProduced);
+        w.u64(s.cdStreamBytesDemuxed);
+        w.boolean(s.cdStreamEofPending);
+        w.boolean(s.currentCdStreamEofSeen);
+        w.sortedMap(s.callbacksByMpeg, [&w](const std::vector<MpegRegisteredCallback> &callbacks)
+                    { w.podVector(callbacks); });
+        w.sortedMap(s.playbackByMpeg, [&w](const MpegPlaybackState &playback)
+                    { savePlayback(w, playback); });
+    }
+
+    void loadMpeg(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        resetMpegStubStateUnlocked();
+        MpegStubState &s = g_mpeg_stub_state;
+        s.initialized = r.boolean();
+        s.nextCallbackHandle = r.u32();
+        s.cdStreamGeneration = r.u64();
+        s.cdStreamBytesProduced = r.u64();
+        s.cdStreamBytesDemuxed = r.u64();
+        s.cdStreamEofPending = r.boolean();
+        s.currentCdStreamEofSeen = r.boolean();
+        r.sortedMap(s.callbacksByMpeg, [&r](std::vector<MpegRegisteredCallback> &callbacks)
+                    { r.podVector(callbacks); });
+        const size_t count = r.size();
+        for (size_t i = 0; i < count; ++i)
+        {
+            const uint32_t mpegAddr = r.u32();
+            loadPlayback(r, s.playbackByMpeg[mpegAddr], mpegAddr);
+        }
+    }
+
+    std::function<void(R5900Context &)> makeMpegGetPictureResume(PS2Runtime &runtime)
+    {
+        PS2Runtime *rt = &runtime;
+        uint8_t *rdram = runtime.memory().getRDRAM();
+        return [rdram, rt](R5900Context &resumeContext)
+        {
+            if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+            {
+                return;
+            }
+            sceMpegGetPicture(rdram, &resumeContext, rt);
+        };
+    }
+
+    std::function<void(const R5900Context &, R5900Context &)> makeMpegNodataComplete(PS2Runtime &runtime, uint32_t cbDataAddr)
+    {
+        return makeNodataComplete(runtime.memory().getRDRAM(), &runtime, cbDataAddr);
+    }
+
+    bool mpegReplayHealthy(std::string *why, bool activeOnly)
+    {
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        for (const auto &[addr, playback] : g_mpeg_stub_state.playbackByMpeg)
+        {
+            if (!playback.decoder || playback.replayValid)
+                continue;
+            if (activeOnly && playback.streamEnded)
+                continue;
+            if (why)
+            {
+                std::ostringstream out;
+                out << "MPEG playback 0x" << std::hex << addr << std::dec
+                    << (playback.streamEnded ? " (ended)" : " (still playing)")
+                    << " has its decoder replay log dropped (over " << (mpegReplayLimitBytes() >> 20)
+                    << " MB): a restore could not decode its pictures; PS2X_MPEG_REPLAY_MB raises the limit";
+                *why = out.str();
+            }
+            return false;
+        }
+        return true;
     }
 }

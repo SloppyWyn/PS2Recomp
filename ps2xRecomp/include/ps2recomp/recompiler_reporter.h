@@ -42,6 +42,8 @@ namespace ps2recomp
             size_t functionsSkipped = 0;
             size_t decodeFailures = 0;
             size_t additionalEntryPoints = 0;
+            size_t absorbedEntryFragments = 0; // resume_into_owner: nested entry_ labels not emitted as fragments
+            size_t absorbedEntryOwners = 0;    // ... and the functions they were folded into
             size_t generatedFunctions = 0;
             size_t unhandledInstructions = 0;
             size_t indirectFallbackPromotions = 0;
@@ -64,6 +66,7 @@ namespace ps2recomp
         void recordFunctionSkipped();
         void recordDecodeFailure();
         void recordAdditionalEntryPoints(size_t count);
+        void recordAbsorbedEntryFragments(size_t fragments, size_t owners);
         void recordGeneratedFunctions(size_t count);
         void recordCorrectnessCriticalGuestFallback();
         void recordCorrectnessCriticalFailure();

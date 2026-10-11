@@ -7,6 +7,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "ps2x/state_stream.h"
+#include "iop_spu2.h"
 
 namespace ps2x::iop::detail
 {
@@ -22,7 +24,10 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // One pool for module images and heap/sysmem allocations, as on the IOP (sysmem hands out
+        // both): modules used to sit in a fixed arena below 0x120000, which left most of it unused
+        // and the heap too small for games that allocate large sound banks (SRWZ: 0x90000).
+        static constexpr uint32_t HeapBase = 0x00010000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
@@ -31,15 +36,20 @@ namespace ps2x::iop::detail
             uint32_t size = 0;
         };
 
-        struct DmaStart
-        {
-            int irq = 0;
-            uint64_t delayCycles = 0;
-        };
-
         IopMemory();
 
         void reset();
+
+        // The SPU2 model behind 0x1F900000-0x1F9007FF and DMA channels 4/7 (iop_spu2.h). It
+        // follows the IOP cycle counter bound here (a pointer that stays valid for the
+        // emulator's lifetime).
+        void bindClock(const uint64_t *clock) noexcept;
+        [[nodiscard]] Spu2 &spu2() noexcept { return m_spu2; }
+        [[nodiscard]] const Spu2 &spu2() const noexcept { return m_spu2; }
+
+        // Snapshots (docs/SNAPSHOT-DESIGN.md).
+        void saveState(ps2x::StateWriter &w) const;
+        void loadState(ps2x::StateReader &r);
 
         [[nodiscard]] uint8_t read8(uint32_t address) const;
         [[nodiscard]] uint16_t read16(uint32_t address) const;
@@ -59,6 +69,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool freeAllocation(uint32_t address);
         [[nodiscard]] uint32_t maxFreeMemory() const;
         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
+        // True when an allocation starts in [begin, end).
+        [[nodiscard]] bool hasAllocationIn(uint32_t begin, uint32_t end) const;
 
         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
         [[nodiscard]] uint32_t interruptMask() const noexcept { return m_interruptMask; }
@@ -67,7 +79,6 @@ namespace ps2x::iop::detail
         void setInterruptMask(uint32_t value) noexcept { m_interruptMask = value; }
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
-        [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
@@ -75,6 +86,7 @@ namespace ps2x::iop::detail
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
+        [[nodiscard]] static bool isSpu2Register(uint32_t phys) noexcept { return phys >= Spu2Base && phys < Spu2Base + Spu2::RegisterBytes; }
         void markOwned(uint32_t address, size_t size);
 
         std::vector<uint8_t> m_ram;
@@ -86,6 +98,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
-        std::optional<DmaStart> m_dmaStart;
+        mutable Spu2 m_spu2; // register reads catch the model up to the clock
     };
 }

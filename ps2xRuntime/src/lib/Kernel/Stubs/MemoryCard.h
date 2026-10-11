@@ -52,12 +52,14 @@ namespace ps2_stubs
     void sceMcMkdir(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMcOpen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMcRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void sceMcReadFast(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMcRename(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMcSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMcSetFileInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMcSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMcUnformat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMcWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void sceMcWriteFast(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void mcCallMessageTypeSe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void mcCheckReadStartConfigFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void mcCheckReadStartSaveFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

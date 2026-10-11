@@ -109,6 +109,26 @@ namespace ps2x::iop
 
         virtual int32_t memoryCard(const MemoryCardRequest &request) = 0;
 
+        // The host's CD file registry, shared with the EE's libcdvd stubs so that both CPUs
+        // name sectors in one LSN space: a file's LSN and size by its cdrom0: path, and
+        // sector reads of such LSNs (the host decides whether they come from an extracted
+        // file or the disc image). Defaults: not available; the IOP then falls back to its
+        // own virtual ISO and the raw image.
+        virtual bool cdSearchFile(std::string_view guestPath, uint32_t &lsn, uint32_t &sizeBytes)
+        {
+            (void)guestPath;
+            lsn = 0u;
+            sizeBytes = 0u;
+            return false;
+        }
+        virtual bool cdReadSectors(uint32_t lsn, uint32_t sectors, void *destination)
+        {
+            (void)lsn;
+            (void)sectors;
+            (void)destination;
+            return false;
+        }
+
         virtual bool hasGuestFunction(uint32_t address) const = 0;
         virtual bool invokeGuestFunction(uint64_t callToken,
                                          uint32_t address,

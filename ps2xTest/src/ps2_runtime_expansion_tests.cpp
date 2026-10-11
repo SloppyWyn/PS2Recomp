@@ -12,15 +12,21 @@
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "ps2_runtime_macros.h"
 #include "Stubs/MPEG.h"
+#include "ps2_snapshot_hooks.h"
+#include "ps2x/state_stream.h"
 #include "Stubs/CD.h"
 #include "Stubs/Audio.h"
 #include "Stubs/GS.h"
 #include "Stubs/VU.h"
 
+#include <algorithm>
 #include <atomic>
+#include <initializer_list>
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -173,6 +179,146 @@ namespace
         gGuestJumpTargetCount.fetch_add(1u, std::memory_order_relaxed);
     }
 
+    // Checkpoint unwinds through a call whose callee is unwinding with ctx->pc at its own entry.
+    // The guest functions below are written like generated code: resumable at the pcs they are
+    // registered for, registers and stack in the context and guest RAM only.
+    constexpr uint32_t kUnwindCallerPc = 0x00127000u;
+    constexpr uint32_t kUnwindCallerReturnPc = 0x00127008u;
+    constexpr uint32_t kUnwindCalleePc = 0x00127100u;
+    constexpr uint32_t kUnwindCalleeCallPc = 0x00127110u;
+    constexpr uint32_t kUnwindCalleeReturnPc = 0x00127118u;
+    constexpr uint32_t kUnwindPollCallerPc = 0x00127200u;
+    constexpr uint32_t kUnwindPollCallerReturnPc = 0x00127208u;
+    constexpr uint32_t kUnwindPollCalleePc = 0x00127300u;
+    constexpr uint32_t kUnwindStackTop = 0x00180000u;
+    constexpr uint32_t kUnwindCallerS0 = 0x00001111u;
+    std::atomic<uint32_t> gUnwindCalleeEntries{0u};
+    std::atomic<uint32_t> gUnwindCallerS0{0u};
+    std::atomic<uint32_t> gUnwindCallerV0{0u};
+    std::atomic<uint32_t> gUnwindCallerDone{0u};
+    std::atomic<uint32_t> gUnwindPollIterations{0u};
+
+    uint32_t unwindRead32(const uint8_t *rdram, uint32_t address)
+    {
+        uint32_t value = 0u;
+        std::memcpy(&value, rdram + address, sizeof(value));
+        return value;
+    }
+
+    void unwindWrite32(uint8_t *rdram, uint32_t address, uint32_t value)
+    {
+        std::memcpy(rdram + address, &value, sizeof(value));
+    }
+
+    // A checkpoint becomes due at once (an event with no waiter to wake: nothing else happens).
+    void unwindMakeCheckpointDue(PS2Runtime *runtime)
+    {
+        runtime->eeScheduler().postEvent(EeEvent{EeEventType::ExternalWake, 0xFFFFu, 0u});
+    }
+
+    // The caller: s0 is callee-saved, so whatever the callee does it must get 0x1111 back.
+    void testUnwindCaller(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t entryPc,
+                          uint32_t returnPc, uint32_t calleePc)
+    {
+        if (ctx->pc == entryPc)
+        {
+            setRegU32(*ctx, 16, kUnwindCallerS0);
+            setRegU32(*ctx, 2, 0u);
+            setRegU32(*ctx, 4, 0u); // a0: recursion depth for the recursive callee
+            setRegU32(*ctx, 31, returnPc);
+            if (!runtime->dispatchGuestBranch(rdram, ctx, calleePc, entryPc, returnPc,
+                                              PS2Runtime::GuestBranchKind::IndirectCall, "test-jalr"))
+            {
+                return;
+            }
+        }
+        else if (ctx->pc != returnPc)
+        {
+            return;
+        }
+        gUnwindCallerS0.store(::getRegU32(ctx, 16), std::memory_order_release);
+        gUnwindCallerV0.store(::getRegU32(ctx, 2), std::memory_order_release);
+        gUnwindCallerDone.fetch_add(1u, std::memory_order_acq_rel);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void testUnwindRecursiveCaller(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        testUnwindCaller(rdram, ctx, runtime, kUnwindCallerPc, kUnwindCallerReturnPc, kUnwindCalleePc);
+    }
+
+    // The shape of SRWZ's sprite interpreter (FUN_0036b330 -> handler FUN_00366500 -> FUN_0036b330):
+    // a function that saves ra/s0, uses s0 itself and calls its own address again. The
+    // checkpoint fires at that nested call, so the nested call unwinds with ctx->pc = its target,
+    // which is also the outer call's target.
+    void testUnwindRecursiveCallee(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == kUnwindCalleePc)
+        {
+            gUnwindCalleeEntries.fetch_add(1u, std::memory_order_acq_rel);
+            const uint32_t sp = ::getRegU32(ctx, 29) - 16u;
+            setRegU32(*ctx, 29, sp);
+            unwindWrite32(rdram, sp + 0u, ::getRegU32(ctx, 31));
+            unwindWrite32(rdram, sp + 8u, ::getRegU32(ctx, 16));
+            const uint32_t depth = ::getRegU32(ctx, 4);
+            setRegU32(*ctx, 16, 0x2222u + depth); // the callee's own use of s0
+            if (depth == 0u)
+            {
+                unwindMakeCheckpointDue(runtime);
+                setRegU32(*ctx, 4, 1u);
+                setRegU32(*ctx, 31, kUnwindCalleeReturnPc);
+                if (!runtime->dispatchGuestBranch(rdram, ctx, kUnwindCalleePc, kUnwindCalleeCallPc,
+                                                  kUnwindCalleeReturnPc,
+                                                  PS2Runtime::GuestBranchKind::DirectCall, "test-jal-self"))
+                {
+                    return;
+                }
+            }
+        }
+        else if (ctx->pc != kUnwindCalleeReturnPc)
+        {
+            return;
+        }
+        // Epilogue (also where the outer level resumes after the nested call).
+        const uint32_t sp = ::getRegU32(ctx, 29);
+        setRegU32(*ctx, 16, unwindRead32(rdram, sp + 8u));
+        setRegU32(*ctx, 31, unwindRead32(rdram, sp + 0u));
+        setRegU32(*ctx, 29, sp + 16u);
+        setRegU32(*ctx, 2, 0x600Du);
+        ctx->pc = ::getRegU32(ctx, 31);
+    }
+
+    void testUnwindPollCaller(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        testUnwindCaller(rdram, ctx, runtime, kUnwindPollCallerPc, kUnwindPollCallerReturnPc, kUnwindPollCalleePc);
+    }
+
+    // A polling loop whose head is the function's first instruction (`loop: lw; beqz loop`):
+    // the back-edge checkpoint leaves ctx->pc at the entry.
+    void testUnwindPollCallee(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc != kUnwindPollCalleePc)
+        {
+            return;
+        }
+        for (;;)
+        {
+            if (gUnwindPollIterations.fetch_add(1u, std::memory_order_acq_rel) + 1u >= 2u)
+            {
+                setRegU32(*ctx, 2, 0x5EADu); // the condition it waited for
+                ctx->pc = ::getRegU32(ctx, 31);
+                return;
+            }
+            unwindMakeCheckpointDue(runtime);
+            ctx->pc = kUnwindPollCalleePc;
+            if (runtime->eeCheckpointDue())
+            {
+                return;
+            }
+        }
+    }
+
     std::atomic<uint32_t> gMpegStreamCallbackCount{0u};
     std::atomic<uint32_t> gMpegStreamCallbackMpeg{0u};
     std::atomic<uint32_t> gMpegStreamCallbackType{0u};
@@ -280,6 +426,524 @@ namespace
             gMpegNoDuplicateStage.load(std::memory_order_acquire),
             std::memory_order_release);
         gMpegNoDuplicateStage.store(2u, std::memory_order_release);
+        ps2_stubs::notifyMpegCdStreamEof(runtime);
+        ctx->pc = 0u;
+    }
+
+    // sceMpegGetPicture with an empty queue calls the game's no-data callback (libmpeg's
+    // sceMpegCbNodata) on the calling thread instead of parking.
+    constexpr uint32_t kMpegNodataMainPc = 0x00125060u;
+    constexpr uint32_t kMpegNodataResumePc = 0x00125070u;
+    constexpr uint32_t kMpegNodataCallbackPc = 0x00125080u;
+    constexpr uint32_t kMpegNodataProducerPc = 0x00125090u;
+    constexpr uint32_t kMpegNodataHandle = 0x00127000u;
+    constexpr uint32_t kMpegNodataImage = 0x00132000u;
+    constexpr uint32_t kMpegNodataUserData = 0x0BADF00Du;
+    std::atomic<uint32_t> gMpegNodataHits{0u};
+    std::atomic<uint32_t> gMpegNodataSeenMpeg{0u};
+    std::atomic<uint32_t> gMpegNodataSeenType{0u};
+    std::atomic<uint32_t> gMpegNodataSeenData{0u};
+    std::atomic<bool> gMpegNodataSupplies{true};
+    std::atomic<int32_t> gMpegNodataResult{-999};
+    std::atomic<uint32_t> gMpegNodataStage{0u};
+
+    void testMpegNodataMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gMpegNodataStage.store(1u, std::memory_order_release);
+        setRegU32(*ctx, 4, kMpegNodataHandle);
+        setRegU32(*ctx, 5, kMpegNodataImage);
+        ctx->pc = kMpegNodataResumePc;
+        ps2_stubs::sceMpegGetPicture(rdram, ctx, runtime);
+    }
+
+    void testMpegNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        gMpegNodataHits.fetch_add(1u, std::memory_order_acq_rel);
+        gMpegNodataSeenMpeg.store(::getRegU32(ctx, 4), std::memory_order_release);
+        gMpegNodataSeenType.store(Ps2FastRead32(rdram, ::getRegU32(ctx, 5)), std::memory_order_release);
+        gMpegNodataSeenData.store(::getRegU32(ctx, 6), std::memory_order_release);
+        if (gMpegNodataSupplies.load(std::memory_order_acquire))
+        {
+            ps2_stubs::enqueueMpegDecodedFrameForTesting(kMpegNodataHandle);
+        }
+        setRegU32(*ctx, 2, 1u);
+        ctx->pc = 0u;
+    }
+
+    // A no-data callback that demuxes the program end code, then tries to demux more.
+    constexpr uint32_t kMpegNodataPssAddr = 0x00133000u;
+    std::atomic<int32_t> gMpegNodataEndDemux{-999};
+    std::atomic<int32_t> gMpegNodataAfterEndDemux{-999};
+
+    void testMpegNodataEndCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gMpegNodataHits.fetch_add(1u, std::memory_order_acq_rel);
+        const uint8_t programEnd[16] = {0x00u, 0x00u, 0x01u, 0xB9u};
+        std::memcpy(rdram + kMpegNodataPssAddr, programEnd, sizeof(programEnd));
+        R5900Context demux = *ctx;
+        setRegU32(demux, 4, kMpegNodataHandle);
+        setRegU32(demux, 5, kMpegNodataPssAddr);
+        setRegU32(demux, 6, 4u);
+        ps2_stubs::sceMpegDemuxPss(rdram, &demux, runtime);
+        gMpegNodataEndDemux.store(static_cast<int32_t>(::getRegU32(&demux, 2)), std::memory_order_release);
+        setRegU32(demux, 5, kMpegNodataPssAddr + 4u);
+        setRegU32(demux, 6, 12u);
+        ps2_stubs::sceMpegDemuxPss(rdram, &demux, runtime);
+        gMpegNodataAfterEndDemux.store(static_cast<int32_t>(::getRegU32(&demux, 2)), std::memory_order_release);
+        setRegU32(*ctx, 2, 1u);
+        ctx->pc = 0u;
+    }
+
+    // A no-data callback that demuxes one video packet: the stream callback must run before
+    // the demux call returns to the no-data callback (libmpeg calls it from inside the demux).
+    constexpr uint32_t kMpegNodataStrCallbackPc = 0x001250A0u;
+    constexpr uint32_t kMpegNodataDemuxContPc = 0x001250B0u;
+    constexpr uint32_t kMpegNodataStrUserData = 0x5EED0001u;
+    std::atomic<uint32_t> gMpegNodataOrder{0u};
+    std::atomic<uint32_t> gMpegNodataStrOrder{0u};
+    std::atomic<uint32_t> gMpegNodataStrLen{0u};
+    std::atomic<uint32_t> gMpegNodataStrData{0u};
+    std::atomic<uint32_t> gMpegNodataContOrder{0u};
+    std::atomic<int32_t> gMpegNodataDemuxResult{-999};
+    std::atomic<uint32_t> gMpegNodataPacketSize{0u};
+
+    void testMpegNodataStrCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        gMpegNodataStrOrder.store(gMpegNodataOrder.fetch_add(1u) + 1u, std::memory_order_release);
+        gMpegNodataStrLen.store(Ps2FastRead32(rdram, ::getRegU32(ctx, 5) + 0x0Cu), std::memory_order_release);
+        gMpegNodataStrData.store(::getRegU32(ctx, 6), std::memory_order_release);
+        setRegU32(*ctx, 2, 1u);
+        ctx->pc = 0u;
+    }
+
+    void testMpegNodataDemuxCont(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        gMpegNodataContOrder.store(gMpegNodataOrder.fetch_add(1u) + 1u, std::memory_order_release);
+        gMpegNodataDemuxResult.store(static_cast<int32_t>(::getRegU32(ctx, 2)), std::memory_order_release);
+        ps2_stubs::enqueueMpegDecodedFrameForTesting(kMpegNodataHandle);
+        setRegU32(*ctx, 2, 1u);
+        ctx->pc = 0u; // return from the no-data callback
+    }
+
+    void testMpegNodataDemuxCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gMpegNodataHits.fetch_add(1u, std::memory_order_acq_rel);
+        runtime->registerFunction(kMpegNodataStrCallbackPc, testMpegNodataStrCallback);
+        runtime->registerFunction(kMpegNodataDemuxContPc, testMpegNodataDemuxCont);
+
+        R5900Context addCtx = *ctx;
+        setRegU32(addCtx, 4, kMpegNodataHandle);
+        setRegU32(addCtx, 5, 0u); // sceMpegStrM2V
+        setRegU32(addCtx, 6, 0u);
+        setRegU32(addCtx, 7, kMpegNodataStrCallbackPc);
+        setRegU32(addCtx, 8, kMpegNodataStrUserData);
+        ps2_stubs::sceMpegAddStrCallback(rdram, &addCtx, runtime);
+
+        const uint8_t payload[8] = {0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};
+        const uint16_t packetLen = static_cast<uint16_t>(sizeof(payload) + 3u);
+        const uint8_t header[9] = {0x00u, 0x00u, 0x01u, 0xE0u,
+                                   static_cast<uint8_t>(packetLen >> 8u), static_cast<uint8_t>(packetLen & 0xFFu),
+                                   0x80u, 0x00u, 0x00u};
+        std::memcpy(rdram + kMpegNodataPssAddr, header, sizeof(header));
+        std::memcpy(rdram + kMpegNodataPssAddr + sizeof(header), payload, sizeof(payload));
+        // A trailing pack start code lets the demuxer see where the packet ends.
+        const uint8_t pack[4] = {0x00u, 0x00u, 0x01u, 0xBAu};
+        std::memcpy(rdram + kMpegNodataPssAddr + sizeof(header) + sizeof(payload), pack, sizeof(pack));
+        const uint32_t size = static_cast<uint32_t>(sizeof(header) + sizeof(payload) + sizeof(pack));
+        gMpegNodataPacketSize.store(size, std::memory_order_release);
+
+        setRegU32(*ctx, 4, kMpegNodataHandle);
+        setRegU32(*ctx, 5, kMpegNodataPssAddr);
+        setRegU32(*ctx, 6, size);
+        setRegU32(*ctx, 31, kMpegNodataDemuxContPc);
+        ctx->pc = kMpegNodataDemuxContPc; // as a stub wrapper does: return to ra
+        ps2_stubs::sceMpegDemuxPss(rdram, ctx, runtime);
+    }
+
+    // sceMpegCbBackground: called once per GetPicture call, before a no-data callback.
+    constexpr uint32_t kMpegBgMainPc = 0x001250C0u;
+    constexpr uint32_t kMpegBgCallbackPc = 0x001250D0u;
+    constexpr uint32_t kMpegBgNodataPc = 0x001250E0u;
+    std::atomic<uint32_t> gMpegBgOrder{0u};
+    std::atomic<uint32_t> gMpegBgHits{0u};
+    std::atomic<uint32_t> gMpegBgFirstOrder{0u};
+    std::atomic<uint32_t> gMpegBgType{0u};
+    std::atomic<uint32_t> gMpegBgNodataHits{0u};
+    std::atomic<uint32_t> gMpegBgNodataOrder{0u};
+
+    void testMpegBgCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        const uint32_t order = gMpegBgOrder.fetch_add(1u) + 1u;
+        if (gMpegBgHits.fetch_add(1u) == 0u)
+        {
+            gMpegBgFirstOrder.store(order);
+        }
+        gMpegBgType.store(Ps2FastRead32(rdram, ::getRegU32(ctx, 5)));
+        setRegU32(*ctx, 2, 1u);
+        ctx->pc = 0u;
+    }
+
+    void testMpegBgNodata(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        gMpegBgNodataOrder.store(gMpegBgOrder.fetch_add(1u) + 1u);
+        gMpegBgNodataHits.fetch_add(1u);
+        ps2_stubs::enqueueMpegDecodedFrameForTesting(kMpegNodataHandle);
+        setRegU32(*ctx, 2, 1u);
+        ctx->pc = 0u;
+    }
+
+    void testMpegBgMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (gMpegNodataStage.exchange(1u) == 0u)
+        {
+            // One video packet: the playback has seen input, no picture yet.
+            const uint8_t packet[] = {0x00u, 0x00u, 0x01u, 0xE0u, 0x00u, 0x0Bu, 0x80u, 0x00u, 0x00u,
+                                      0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u,
+                                      0x00u, 0x00u, 0x01u, 0xBAu};
+            std::memcpy(rdram + kMpegNodataPssAddr, packet, sizeof(packet));
+            R5900Context demux = *ctx;
+            setRegU32(demux, 4, kMpegNodataHandle);
+            setRegU32(demux, 5, kMpegNodataPssAddr);
+            setRegU32(demux, 6, static_cast<uint32_t>(sizeof(packet)));
+            ps2_stubs::sceMpegDemuxPss(rdram, &demux, runtime);
+        }
+        setRegU32(*ctx, 4, kMpegNodataHandle);
+        setRegU32(*ctx, 5, kMpegNodataImage);
+        ctx->pc = kMpegNodataResumePc;
+        ps2_stubs::sceMpegGetPicture(rdram, ctx, runtime);
+    }
+
+    // 64 video packets (66 KB) demuxed in one call inside the no-data callback: 64 synchronous
+    // stream callbacks, all on one shared stack.
+    constexpr uint32_t kMpegManyPackets = 64u;
+    constexpr uint32_t kMpegManyPayload = 1024u;
+    constexpr uint32_t kMpegManyPssAddr = 0x00140000u;
+    std::atomic<uint32_t> gMpegManyHits{0u};
+    std::atomic<uint32_t> gMpegManyMinSp{0xFFFFFFFFu};
+    std::atomic<uint32_t> gMpegManyMaxSp{0u};
+
+    void testMpegManyStrCallback(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        gMpegManyHits.fetch_add(1u);
+        const uint32_t sp = ::getRegU32(ctx, 29);
+        uint32_t cur = gMpegManyMinSp.load();
+        while (sp < cur && !gMpegManyMinSp.compare_exchange_weak(cur, sp)) {}
+        cur = gMpegManyMaxSp.load();
+        while (sp > cur && !gMpegManyMaxSp.compare_exchange_weak(cur, sp)) {}
+        setRegU32(*ctx, 2, 1u);
+        ctx->pc = 0u;
+    }
+
+    void testMpegManyDemuxCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gMpegNodataHits.fetch_add(1u, std::memory_order_acq_rel);
+        runtime->registerFunction(kMpegNodataStrCallbackPc, testMpegManyStrCallback);
+        runtime->registerFunction(kMpegNodataDemuxContPc, testMpegNodataDemuxCont);
+
+        R5900Context addCtx = *ctx;
+        setRegU32(addCtx, 4, kMpegNodataHandle);
+        setRegU32(addCtx, 5, 0u); // sceMpegStrM2V
+        setRegU32(addCtx, 6, 0u);
+        setRegU32(addCtx, 7, kMpegNodataStrCallbackPc);
+        setRegU32(addCtx, 8, kMpegNodataStrUserData);
+        ps2_stubs::sceMpegAddStrCallback(rdram, &addCtx, runtime);
+
+        uint32_t at = kMpegManyPssAddr;
+        for (uint32_t i = 0; i < kMpegManyPackets; ++i)
+        {
+            const uint16_t packetLen = static_cast<uint16_t>(kMpegManyPayload + 3u);
+            const uint8_t header[9] = {0x00u, 0x00u, 0x01u, 0xE0u,
+                                       static_cast<uint8_t>(packetLen >> 8u), static_cast<uint8_t>(packetLen & 0xFFu),
+                                       0x80u, 0x00u, 0x00u};
+            std::memcpy(rdram + at, header, sizeof(header));
+            std::memset(rdram + at + sizeof(header), 0x11, kMpegManyPayload);
+            at += sizeof(header) + kMpegManyPayload;
+        }
+        const uint8_t pack[4] = {0x00u, 0x00u, 0x01u, 0xBAu};
+        std::memcpy(rdram + at, pack, sizeof(pack));
+        at += sizeof(pack);
+
+        setRegU32(*ctx, 4, kMpegNodataHandle);
+        setRegU32(*ctx, 5, kMpegManyPssAddr);
+        setRegU32(*ctx, 6, at - kMpegManyPssAddr);
+        setRegU32(*ctx, 31, kMpegNodataDemuxContPc);
+        ctx->pc = kMpegNodataDemuxContPc;
+        ps2_stubs::sceMpegDemuxPss(rdram, ctx, runtime);
+    }
+
+    // A stream callback queued by a demux outside any callback runs before the no-data callback.
+    constexpr uint32_t kMpegFlushMainPc = 0x001250F0u;
+    constexpr uint32_t kMpegFlushStrPc = 0x00125100u - 0x8u;
+    std::atomic<uint32_t> gMpegFlushStrOrder{0u};
+
+    void testMpegFlushStr(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        gMpegFlushStrOrder.store(gMpegBgOrder.fetch_add(1u) + 1u);
+        setRegU32(*ctx, 2, 1u);
+        ctx->pc = 0u;
+    }
+
+    void testMpegFlushMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        R5900Context addCtx = *ctx;
+        setRegU32(addCtx, 4, kMpegNodataHandle);
+        setRegU32(addCtx, 5, 0u);
+        setRegU32(addCtx, 6, 0u);
+        setRegU32(addCtx, 7, kMpegFlushStrPc);
+        setRegU32(addCtx, 8, 0u);
+        ps2_stubs::sceMpegAddStrCallback(rdram, &addCtx, runtime);
+
+        const uint8_t packet[] = {0x00u, 0x00u, 0x01u, 0xE0u, 0x00u, 0x0Bu, 0x80u, 0x00u, 0x00u,
+                                  0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u,
+                                  0x00u, 0x00u, 0x01u, 0xBAu};
+        std::memcpy(rdram + kMpegNodataPssAddr, packet, sizeof(packet));
+        R5900Context demux = *ctx;
+        setRegU32(demux, 4, kMpegNodataHandle);
+        setRegU32(demux, 5, kMpegNodataPssAddr);
+        setRegU32(demux, 6, static_cast<uint32_t>(sizeof(packet)));
+        ps2_stubs::sceMpegDemuxPss(rdram, &demux, runtime); // queues the stream callback
+
+        gMpegNodataStage.store(1u);
+        setRegU32(*ctx, 4, kMpegNodataHandle);
+        setRegU32(*ctx, 5, kMpegNodataImage);
+        ctx->pc = kMpegNodataResumePc;
+        ps2_stubs::sceMpegGetPicture(rdram, ctx, runtime);
+    }
+
+    // sceMpegDemuxPssRing over data at the scratchpad's end: reads stop at its end.
+    constexpr uint32_t kMpegSprMainPc = 0x00125110u;
+    std::atomic<int32_t> gMpegSprConsumed{-999};
+
+    void testMpegSprMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        R5900Context demux = *ctx;
+        setRegU32(demux, 4, kMpegNodataHandle);
+        setRegU32(demux, 5, 0x70003F00u); // 0x100 bytes before the scratchpad's end
+        setRegU32(demux, 6, 0x1000u);     // avail runs 0xF00 bytes past it
+        setRegU32(demux, 7, 0u);          // no ring
+        setRegU32(demux, 8, 0u);
+        ps2_stubs::sceMpegDemuxPssRing(rdram, &demux, runtime);
+        gMpegSprConsumed.store(static_cast<int32_t>(::getRegU32(&demux, 2)));
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    // libmpeg's backpressure in sceMpegDemuxPss/Ring: a stream callback that returns 0 stops
+    // the demux at its packet, and the caller (a feeder like SRWZ's 0x18bd70) presents the rest
+    // again. Stream: V1 A1 V2 A2 (17 bytes each) and a 4-byte pack start.
+    constexpr uint32_t kMpegBpMainPc = 0x00125120u;
+    constexpr uint32_t kMpegBpContPc = 0x00125130u;
+    constexpr uint32_t kMpegBpVideoPc = 0x00125140u;
+    constexpr uint32_t kMpegBpAudioPc = 0x00125150u;
+    constexpr uint32_t kMpegBpPssAddr = 0x00150000u;
+    constexpr uint32_t kMpegBpCopyAddr = 0x00158000u;
+    constexpr uint32_t kMpegBpRingBase = 0x00160000u;
+    constexpr uint32_t kMpegBpRingSize = 0x1000u;
+    constexpr uint32_t kMpegBpRingStart = kMpegBpRingSize - 30u; // the stream wraps after 30 bytes
+    constexpr uint32_t kMpegBpStreamSize = 72u;
+
+    struct MpegBpScript
+    {
+        uint32_t audioRefusals = 0u; // the A1 callback returns 0 this many times
+        uint32_t videoResult = 1u;
+        bool moveOnRetry = false;    // a retry presents what is left from another address
+        uint32_t shortRetry = 0u;    // the first retry presents only this many bytes
+        bool garbageRetry = false;   // the first retry presents a program end instead
+        bool ring = false;           // sceMpegDemuxPssRing, data wrapping at the ring's end
+        bool resumeOnly = false;     // main skips the setup (state restored from a snapshot)
+        bool nestedDemux = false;    // the A1 callback demuxes the same playback itself
+        uint32_t maxCalls = 8u;
+
+        uint32_t done = 0u;
+        uint32_t lastSize = 0u;
+        uint32_t retries = 0u;
+        bool ended = false;
+        std::vector<std::string> calls;
+        std::vector<uint32_t> addrs;
+        std::vector<int32_t> results;
+        std::vector<int32_t> nestedResults;
+    };
+    MpegBpScript gBp;
+
+    uint32_t mpegBpStreamAddr(uint32_t offset)
+    {
+        return gBp.ring ? kMpegBpRingBase + (kMpegBpRingStart + offset) % kMpegBpRingSize : kMpegBpPssAddr + offset;
+    }
+
+    void testMpegBpVideo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        const uint32_t data = Ps2FastRead32(rdram, ::getRegU32(ctx, 5) + 0x08u);
+        gBp.calls.push_back(rdram[data + 3u] == 0xB3u ? "V1" : "V2");
+        gBp.addrs.push_back(data);
+        setRegU32(*ctx, 2, gBp.videoResult);
+        ctx->pc = 0u;
+    }
+
+    void testMpegBpAudio(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t data = Ps2FastRead32(rdram, ::getRegU32(ctx, 5) + 0x08u);
+        const bool first = rdram[data] == 0xA1u;
+        gBp.calls.push_back(first ? "A1" : "A2");
+        gBp.addrs.push_back(data);
+        if (first && gBp.nestedDemux)
+        {
+            // Re-entrant: demux the rest of the stream from inside the stream callback.
+            R5900Context nested = *ctx;
+            setRegU32(nested, 4, kMpegNodataHandle);
+            setRegU32(nested, 5, kMpegBpPssAddr + 34u);
+            setRegU32(nested, 6, kMpegBpStreamSize - 34u);
+            ps2_stubs::sceMpegDemuxPss(rdram, &nested, runtime);
+            gBp.nestedResults.push_back(static_cast<int32_t>(::getRegU32(&nested, 2)));
+        }
+        uint32_t result = 1u;
+        if (first && gBp.audioRefusals > 0u)
+        {
+            --gBp.audioRefusals;
+            result = 0u;
+        }
+        setRegU32(*ctx, 2, result);
+        ctx->pc = 0u;
+    }
+
+    // Presents what is left of the stream, as the feeder does after a short demux.
+    void testMpegBpDemux(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t left = kMpegBpStreamSize - gBp.done;
+        uint32_t addr = mpegBpStreamAddr(gBp.done);
+        uint32_t size = left;
+        const bool retry = !gBp.results.empty() && gBp.results.back() < static_cast<int32_t>(gBp.lastSize);
+        if (retry)
+        {
+            const bool firstRetry = gBp.retries++ == 0u;
+            if (gBp.garbageRetry && firstRetry)
+            {
+                const uint8_t programEnd[4] = {0x00u, 0x00u, 0x01u, 0xB9u};
+                std::memcpy(rdram + kMpegBpCopyAddr, programEnd, sizeof(programEnd));
+                addr = kMpegBpCopyAddr;
+                size = 4u;
+                gBp.ended = true;
+            }
+            else
+            {
+                if (gBp.moveOnRetry)
+                {
+                    for (uint32_t i = 0; i < left; ++i)
+                    {
+                        rdram[kMpegBpCopyAddr + i] = rdram[mpegBpStreamAddr(gBp.done + i)];
+                    }
+                    addr = kMpegBpCopyAddr;
+                }
+                if (gBp.shortRetry != 0u && firstRetry)
+                {
+                    size = gBp.shortRetry;
+                }
+            }
+        }
+        gBp.lastSize = size;
+        setRegU32(*ctx, 4, kMpegNodataHandle);
+        setRegU32(*ctx, 5, addr);
+        setRegU32(*ctx, 6, size);
+        setRegU32(*ctx, 31, kMpegBpContPc);
+        ctx->pc = kMpegBpContPc; // as a stub wrapper does: return to ra
+        if (gBp.ring && addr != kMpegBpCopyAddr)
+        {
+            setRegU32(*ctx, 7, kMpegBpRingBase);
+            setRegU32(*ctx, 8, kMpegBpRingSize);
+            ps2_stubs::sceMpegDemuxPssRing(rdram, ctx, runtime);
+        }
+        else
+        {
+            ps2_stubs::sceMpegDemuxPss(rdram, ctx, runtime);
+        }
+    }
+
+    void testMpegBpCont(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const int32_t consumed = static_cast<int32_t>(::getRegU32(ctx, 2));
+        gBp.results.push_back(consumed);
+        if (!gBp.ended)
+        {
+            gBp.done += static_cast<uint32_t>(std::max(consumed, 0));
+        }
+        if (gBp.ended || gBp.done >= kMpegBpStreamSize || gBp.results.size() >= gBp.maxCalls)
+        {
+            ctx->pc = 0u;
+            runtime->requestStop();
+            return;
+        }
+        testMpegBpDemux(rdram, ctx, runtime);
+    }
+
+    void setupMpegBp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        {
+            for (const auto &[type, pc] : {std::pair<uint32_t, uint32_t>{0u, kMpegBpVideoPc},
+                                           std::pair<uint32_t, uint32_t>{2u, kMpegBpAudioPc}})
+            {
+                R5900Context addCtx = *ctx;
+                setRegU32(addCtx, 4, kMpegNodataHandle);
+                setRegU32(addCtx, 5, type);
+                setRegU32(addCtx, 6, 0u);
+                setRegU32(addCtx, 7, pc);
+                setRegU32(addCtx, 8, 0u);
+                ps2_stubs::sceMpegAddStrCallback(rdram, &addCtx, runtime);
+            }
+            std::vector<uint8_t> stream;
+            const auto packet = [&stream](uint8_t streamId, std::initializer_list<uint8_t> payload)
+            {
+                const uint8_t header[9] = {0x00u, 0x00u, 0x01u, streamId, 0x00u,
+                                           static_cast<uint8_t>(payload.size() + 3u), 0x80u, 0x00u, 0x00u};
+                stream.insert(stream.end(), header, header + sizeof(header));
+                stream.insert(stream.end(), payload.begin(), payload.end());
+            };
+            packet(0xE0u, {0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u});
+            packet(0xBDu, {0xA1u, 0xA1u, 0xA1u, 0xA1u, 0x11u, 0x12u, 0x13u, 0x14u});
+            packet(0xE0u, {0x00u, 0x00u, 0x01u, 0x00u, 0x00u, 0x0Fu, 0xFFu, 0xF8u});
+            packet(0xBDu, {0xA2u, 0xA2u, 0xA2u, 0xA2u, 0x21u, 0x22u, 0x23u, 0x24u});
+            stream.insert(stream.end(), {0x00u, 0x00u, 0x01u, 0xBAu});
+            for (uint32_t i = 0; i < stream.size(); ++i)
+            {
+                rdram[mpegBpStreamAddr(i)] = stream[i];
+            }
+        }
+    }
+
+    void testMpegBpMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (!gBp.resumeOnly)
+        {
+            setupMpegBp(rdram, ctx, runtime);
+        }
+        testMpegBpDemux(rdram, ctx, runtime);
+    }
+
+    // A no-data callback (GetPicture has no picture) whose demux meets a full audio ring.
+    void testMpegBpStarvedNodata(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gMpegNodataHits.fetch_add(1u, std::memory_order_acq_rel);
+        runtime->registerFunction(kMpegBpVideoPc, testMpegBpVideo);
+        runtime->registerFunction(kMpegBpAudioPc, testMpegBpAudio);
+        runtime->registerFunction(kMpegNodataDemuxContPc, testMpegNodataDemuxCont);
+        setupMpegBp(rdram, ctx, runtime);
+        setRegU32(*ctx, 4, kMpegNodataHandle);
+        setRegU32(*ctx, 5, kMpegBpPssAddr);
+        setRegU32(*ctx, 6, kMpegBpStreamSize);
+        setRegU32(*ctx, 31, kMpegNodataDemuxContPc);
+        ctx->pc = kMpegNodataDemuxContPc;
+        ps2_stubs::sceMpegDemuxPss(rdram, ctx, runtime);
+    }
+
+    void testMpegNodataResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gMpegNodataStage.store(3u, std::memory_order_release);
+        gMpegNodataResult.store(static_cast<int32_t>(::getRegU32(ctx, 2)), std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void testMpegNodataProducer(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gMpegNodataStage.store(2u, std::memory_order_release);
         ps2_stubs::notifyMpegCdStreamEof(runtime);
         ctx->pc = 0u;
     }
@@ -455,6 +1119,71 @@ void register_ps2_runtime_expansion_tests()
                      "callee transfer PC should be preserved");
         });
 
+        auto runUnwindScenario = [](uint32_t mainPc)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            runtime.registerFunction(kUnwindCallerPc, testUnwindRecursiveCaller);
+            runtime.registerFunction(kUnwindCallerReturnPc, testUnwindRecursiveCaller);
+            runtime.registerFunction(kUnwindCalleePc, testUnwindRecursiveCallee);
+            runtime.registerFunction(kUnwindCalleeReturnPc, testUnwindRecursiveCallee);
+            runtime.registerFunction(kUnwindPollCallerPc, testUnwindPollCaller);
+            runtime.registerFunction(kUnwindPollCallerReturnPc, testUnwindPollCaller);
+            runtime.registerFunction(kUnwindPollCalleePc, testUnwindPollCallee);
+            gUnwindCalleeEntries.store(0u);
+            gUnwindCallerS0.store(0u);
+            gUnwindCallerV0.store(0u);
+            gUnwindCallerDone.store(0u);
+            gUnwindPollIterations.store(0u);
+
+            R5900Context mainContext{};
+            mainContext.pc = mainPc;
+            setRegU32(mainContext, 29, kUnwindStackTop);
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            ee.run();
+        };
+
+        tc.Run("checkpoint at a nested call to the callee's own address resumes there, not in the caller", [runUnwindScenario](TestCase &t)
+        {
+            runUnwindScenario(kUnwindCallerPc);
+            t.Equals(gUnwindCallerDone.load(), 1u, "the caller should reach its return point once");
+            t.Equals(gUnwindCalleeEntries.load(), 2u,
+                     "the nested call that the checkpoint interrupted should still run");
+            t.Equals(gUnwindCallerS0.load(), kUnwindCallerS0,
+                     "the caller should get its callee-saved s0 back, not the callee's");
+            t.Equals(gUnwindCallerV0.load(), 0x600Du,
+                     "the caller should see the callee's return value, not the jalr target");
+        });
+
+        tc.Run("checkpoint on a loop back to the callee's first instruction does not end the call", [runUnwindScenario](TestCase &t)
+        {
+            runUnwindScenario(kUnwindPollCallerPc);
+            t.Equals(gUnwindCallerDone.load(), 1u, "the caller should reach its return point once");
+            t.Equals(gUnwindPollIterations.load(), 2u,
+                     "the polling loop should run until its condition holds");
+            t.Equals(gUnwindCallerV0.load(), 0x5EADu,
+                     "the caller should continue only after the loop returned");
+        });
+
+        tc.Run("dispatchGuestBranch still converts an unchanged callee PC when no checkpoint is unwinding", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context mainContext{};
+            runtime.eeScheduler().reset(rdram.data(), mainContext);
+            runtime.registerFunction(0x3000u, &testGuestBranchImplicitReturnHandler);
+            t.IsFalse(runtime.eeScheduler().unwindingToDispatcher(), "a fresh scheduler is not unwinding");
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+            const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+                rdram.data(), &ctx, 0x3000u, 0x2000u, 0x2008u,
+                PS2Runtime::GuestBranchKind::IndirectCall, "test-jalr");
+            t.IsTrue(returnedToFallthrough, "a callee that returns without touching pc continues the caller");
+            t.Equals(ctx.pc, 0x2008u, "pc should be the call's fallthrough");
+        });
+
         tc.Run("dispatchGuestBranch rejects missing exact targets", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -479,6 +1208,30 @@ void register_ps2_runtime_expansion_tests()
                      "missing exact target should request runtime stop");
             t.Equals(ctx.pc, 0x3210u,
                      "missing target should remain visible in ctx->pc for diagnostics");
+        });
+
+        tc.Run("missing-target log line keeps its fields and adds thread and guest names", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+            ctx.r[31] = _mm_set_epi32(0, 0, 0, 0x2468);
+
+            std::ostringstream captured;
+            std::streambuf *old = std::cerr.rdbuf(captured.rdbuf());
+            runtime.dispatchGuestBranch(nullptr, &ctx, 0x3210u, 0x2000u, 0x2008u,
+                                        PS2Runtime::GuestBranchKind::IndirectCall, "test-missing-log");
+            std::cerr.rdbuf(old);
+
+            const std::string line = captured.str();
+            for (const char *field : {"[guest-branch:missing-target] kind=", " op=test-missing-log",
+                                      " source=0x2000 ", " target=0x3210 ", " ra=0x2468 ", " sp=0x",
+                                      " policy=", " thread=", " sourceName=0x2000 ", " raName=0x2468 ", " trace="})
+            {
+                t.IsTrue(line.find(field) != std::string::npos, std::string("missing-target line lacks '") + field + "': " + line);
+            }
         });
 
         tc.Run("ContinueToTarget unwinds a missing call without skipping it", [](TestCase &t)
@@ -811,6 +1564,457 @@ void register_ps2_runtime_expansion_tests()
                      "only the injected decoder frame should be counted as served");
         });
 
+        auto runMpegNodata = [](PS2Runtime &runtime, std::vector<uint8_t> &rdram, bool supplies,
+                                PS2Runtime::RecompiledFunction callback = testMpegNodataCallback)
+        {
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            runtime.registerFunction(kMpegNodataMainPc, testMpegNodataMain);
+            runtime.registerFunction(kMpegNodataResumePc, testMpegNodataResume);
+            runtime.registerFunction(kMpegNodataCallbackPc, callback);
+            runtime.registerFunction(kMpegNodataProducerPc, testMpegNodataProducer);
+            gMpegNodataHits.store(0u, std::memory_order_release);
+            gMpegNodataSeenMpeg.store(0u, std::memory_order_release);
+            gMpegNodataSeenType.store(0u, std::memory_order_release);
+            gMpegNodataSeenData.store(0u, std::memory_order_release);
+            gMpegNodataSupplies.store(supplies, std::memory_order_release);
+            gMpegNodataResult.store(-999, std::memory_order_release);
+            gMpegNodataStage.store(0u, std::memory_order_release);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegNodataHandle);
+            setRegU32(addCtx, 5, 1u); // sceMpegCbNodata
+            setRegU32(addCtx, 6, kMpegNodataCallbackPc);
+            setRegU32(addCtx, 7, kMpegNodataUserData);
+            ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx, &runtime);
+
+            R5900Context mainContext{};
+            mainContext.pc = kMpegNodataMainPc;
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            const int producerId = ee.createThread(EeThreadCreateParams{
+                0u, kMpegNodataProducerPc, 0u, 0u, 0u, 10, 0u});
+            ee.startThread(producerId, 0u, mainContext, false);
+            ee.run();
+        };
+
+        tc.Run("sceMpegGetPicture with no decoded picture calls the no-data callback instead of parking", [runMpegNodata](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            runMpegNodata(runtime, rdram, true);
+
+            t.Equals(gMpegNodataHits.load(std::memory_order_acquire), 1u,
+                     "GetPicture should call the no-data callback once");
+            t.Equals(gMpegNodataSeenMpeg.load(std::memory_order_acquire), kMpegNodataHandle,
+                     "the callback gets the mpeg handle in a0");
+            t.Equals(gMpegNodataSeenType.load(std::memory_order_acquire), 1u,
+                     "the callback data in a1 says sceMpegCbNodata");
+            t.Equals(gMpegNodataSeenData.load(std::memory_order_acquire), kMpegNodataUserData,
+                     "the callback gets its registered data in a2");
+            t.Equals(gMpegNodataStage.load(std::memory_order_acquire), 3u,
+                     "GetPicture should return to its caller without the producer's EOF");
+            t.Equals(gMpegNodataResult.load(std::memory_order_acquire), 0,
+                     "GetPicture should return 0 after the callback supplied a picture");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegNodataHandle + 0x08u), 0u,
+                     "the supplied picture is the first one served");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegNodataHandle + 0x00u), 16u,
+                     "GetPicture should publish the supplied picture's width");
+        });
+
+        tc.Run("sceMpegGetPicture stops calling a no-data callback that never makes progress", [runMpegNodata](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            runMpegNodata(runtime, rdram, false);
+
+            t.Equals(gMpegNodataHits.load(std::memory_order_acquire), 4096u,
+                     "GetPicture should give up after 4096 callbacks that demux nothing");
+            t.Equals(gMpegNodataStage.load(std::memory_order_acquire), 3u,
+                     "the producer's EOF should then resume the waiting GetPicture");
+            t.Equals(gMpegNodataResult.load(std::memory_order_acquire), 0,
+                     "EOF completion should resume GetPicture with success");
+        });
+
+        tc.Run("inside the no-data callback, demux consumes nothing once the program end is demuxed", [runMpegNodata](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            gMpegNodataEndDemux.store(-999, std::memory_order_release);
+            gMpegNodataAfterEndDemux.store(-999, std::memory_order_release);
+            runMpegNodata(runtime, rdram, false, testMpegNodataEndCallback);
+
+            t.Equals(gMpegNodataHits.load(std::memory_order_acquire), 1u,
+                     "GetPicture should call the no-data callback once, then see the end");
+            t.Equals(gMpegNodataEndDemux.load(std::memory_order_acquire), 4,
+                     "the program end code itself is consumed");
+            t.Equals(gMpegNodataAfterEndDemux.load(std::memory_order_acquire), 0,
+                     "data after the program end is not consumed inside the callback");
+            t.Equals(gMpegNodataStage.load(std::memory_order_acquire), 3u,
+                     "GetPicture should return to its caller after the end");
+        });
+
+        tc.Run("inside the no-data callback, demux runs the stream callbacks before it returns", [runMpegNodata](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            gMpegNodataOrder.store(0u);
+            gMpegNodataStrOrder.store(0u);
+            gMpegNodataStrLen.store(0u);
+            gMpegNodataStrData.store(0u);
+            gMpegNodataContOrder.store(0u);
+            gMpegNodataDemuxResult.store(-999);
+            runMpegNodata(runtime, rdram, false, testMpegNodataDemuxCallback);
+
+            t.Equals(gMpegNodataHits.load(std::memory_order_acquire), 1u,
+                     "GetPicture should call the no-data callback once");
+            t.Equals(gMpegNodataStrOrder.load(std::memory_order_acquire), 1u,
+                     "the video stream callback runs first");
+            t.Equals(gMpegNodataContOrder.load(std::memory_order_acquire), 2u,
+                     "the demux call returns to the no-data callback after the stream callback");
+            t.Equals(gMpegNodataStrLen.load(std::memory_order_acquire), 8u,
+                     "the stream callback gets the video payload length");
+            t.Equals(gMpegNodataStrData.load(std::memory_order_acquire), kMpegNodataStrUserData,
+                     "the stream callback gets its registered data");
+            t.IsTrue(gMpegNodataDemuxResult.load(std::memory_order_acquire) > 0,
+                     "the demux call returns the bytes consumed in v0");
+            t.Equals(gMpegNodataStage.load(std::memory_order_acquire), 3u,
+                     "GetPicture should return to its caller");
+        });
+
+        tc.Run("sceMpegGetPicture calls the background callback once per call, before the no-data callback", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            runtime.registerFunction(kMpegBgMainPc, testMpegBgMain);
+            runtime.registerFunction(kMpegNodataResumePc, testMpegNodataResume);
+            runtime.registerFunction(kMpegBgCallbackPc, testMpegBgCallback);
+            runtime.registerFunction(kMpegBgNodataPc, testMpegBgNodata);
+            gMpegBgOrder.store(0u);
+            gMpegBgHits.store(0u);
+            gMpegBgFirstOrder.store(0u);
+            gMpegBgType.store(0u);
+            gMpegBgNodataHits.store(0u);
+            gMpegBgNodataOrder.store(0u);
+            gMpegNodataStage.store(0u);
+            gMpegNodataResult.store(-999);
+
+            for (const auto &[type, pc] : {std::pair<uint32_t, uint32_t>{4u, kMpegBgCallbackPc},
+                                           std::pair<uint32_t, uint32_t>{1u, kMpegBgNodataPc}})
+            {
+                R5900Context addCtx{};
+                setRegU32(addCtx, 4, kMpegNodataHandle);
+                setRegU32(addCtx, 5, type);
+                setRegU32(addCtx, 6, pc);
+                setRegU32(addCtx, 7, 0u);
+                ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx, &runtime);
+            }
+
+            R5900Context mainContext{};
+            mainContext.pc = kMpegBgMainPc;
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            ee.run();
+
+            t.Equals(gMpegBgHits.load(), 1u, "the background callback runs once in the GetPicture call");
+            t.Equals(gMpegBgType.load(), 4u, "its callback data says sceMpegCbBackground");
+            t.Equals(gMpegBgFirstOrder.load(), 1u, "it runs before the no-data callback");
+            t.Equals(gMpegBgNodataHits.load(), 1u, "the no-data callback then supplies the picture");
+            t.Equals(gMpegBgNodataOrder.load(), 2u, "the no-data callback runs second");
+            t.Equals(gMpegNodataStage.load(), 3u, "GetPicture returns to its caller");
+            t.Equals(gMpegNodataResult.load(), 0, "GetPicture returns 0");
+        });
+
+        tc.Run("inside the no-data callback, many stream callbacks from one demux share one stack", [runMpegNodata](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            gMpegManyHits.store(0u);
+            gMpegManyMinSp.store(0xFFFFFFFFu);
+            gMpegManyMaxSp.store(0u);
+            gMpegNodataOrder.store(0u);
+            gMpegNodataContOrder.store(0u);
+            gMpegNodataDemuxResult.store(-999);
+            runMpegNodata(runtime, rdram, false, testMpegManyDemuxCallback);
+
+            t.Equals(gMpegManyHits.load(), kMpegManyPackets, "every video packet gets its stream callback");
+            t.Equals(gMpegManyMinSp.load(), gMpegManyMaxSp.load(), "all stream callbacks run on the same stack");
+            t.IsTrue(gMpegManyMinSp.load() >= 0x00090000u && gMpegManyMinSp.load() <= 0x00100000u,
+                     "the shared stack is an invocation stack, not the top-of-RAM fallback");
+            t.Equals(gMpegNodataDemuxResult.load(),
+                     static_cast<int32_t>(kMpegManyPackets * (9u + kMpegManyPayload) + 4u),
+                     "the demux returns all bytes consumed");
+            t.Equals(gMpegNodataStage.load(std::memory_order_acquire), 3u,
+                     "GetPicture should return to its caller");
+        });
+
+        tc.Run("stream callbacks still queued from an earlier demux run before the no-data callback", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            // Queued callbacks: the stream callbacks of a demux outside a callback (mode 1).
+            ps2_stubs::setMpegStreamCallbackModeForTesting(1);
+            runtime.registerFunction(kMpegFlushMainPc, testMpegFlushMain);
+            runtime.registerFunction(kMpegFlushStrPc, testMpegFlushStr);
+            runtime.registerFunction(kMpegNodataResumePc, testMpegNodataResume);
+            runtime.registerFunction(kMpegBgNodataPc, testMpegBgNodata);
+            gMpegBgOrder.store(0u);
+            gMpegFlushStrOrder.store(0u);
+            gMpegBgNodataHits.store(0u);
+            gMpegBgNodataOrder.store(0u);
+            gMpegNodataStage.store(0u);
+            gMpegNodataResult.store(-999);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegNodataHandle);
+            setRegU32(addCtx, 5, 1u); // sceMpegCbNodata
+            setRegU32(addCtx, 6, kMpegBgNodataPc);
+            setRegU32(addCtx, 7, 0u);
+            ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx, &runtime);
+
+            R5900Context mainContext{};
+            mainContext.pc = kMpegFlushMainPc;
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            ee.run();
+
+            ps2_stubs::setMpegStreamCallbackModeForTesting(-1);
+            t.Equals(gMpegFlushStrOrder.load(), 1u, "the queued stream callback runs first");
+            t.Equals(gMpegBgNodataOrder.load(), 2u, "the no-data callback runs after it");
+            t.Equals(gMpegNodataStage.load(), 3u, "GetPicture returns to its caller");
+        });
+
+        tc.Run("sceMpegDemuxPssRing stops at the end of the scratchpad", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            // 32 KB host buffer: an over-read lands in the second half instead of crashing.
+            std::vector<uint8_t> scratch(2u * PS2_SCRATCHPAD_SIZE, 0u);
+            uint8_t *previous = ps2GetScratchpadHostPtr();
+            ps2SetScratchpadHostPtr(scratch.data());
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            runtime.registerFunction(kMpegSprMainPc, testMpegSprMain);
+            gMpegSprConsumed.store(-999);
+
+            R5900Context mainContext{};
+            mainContext.pc = kMpegSprMainPc;
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            ee.run();
+            ps2SetScratchpadHostPtr(previous);
+
+            t.Equals(gMpegSprConsumed.load(), 0x100,
+                     "only the 0x100 bytes left in the scratchpad are demuxed");
+        });
+
+        // libmpeg's demux backpressure (sceMpegDemuxPss/Ring with synchronous stream callbacks).
+        const auto runMpegBp = [](PS2Runtime &runtime, std::vector<uint8_t> &rdram, const MpegBpScript &script,
+                                  bool resetState = true)
+        {
+            if (resetState)
+            {
+                ps2_stubs::resetMpegStubState();
+                ps2_stubs::notifyMpegCdStreamStart();
+            }
+            ps2_stubs::setMpegStreamCallbackModeForTesting(2);
+            gBp = script;
+            runtime.registerFunction(kMpegBpMainPc, testMpegBpMain);
+            runtime.registerFunction(kMpegBpContPc, testMpegBpCont);
+            runtime.registerFunction(kMpegBpVideoPc, testMpegBpVideo);
+            runtime.registerFunction(kMpegBpAudioPc, testMpegBpAudio);
+            R5900Context mainContext{};
+            mainContext.pc = kMpegBpMainPc;
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            ee.run();
+            ps2_stubs::setMpegStreamCallbackModeForTesting(-1);
+        };
+        using Calls = std::vector<std::string>;
+
+        tc.Run("demux: an audio callback returning 0 stops the demux at its packet; the retry delivers it once", [runMpegBp](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            MpegBpScript script;
+            script.audioRefusals = 1u;
+            const uint64_t fedBefore = ps2_stubs::mpegVideoBytesFedForTesting();
+            runMpegBp(runtime, rdram, script);
+
+            t.IsTrue(gBp.calls == Calls{"V1", "A1", "A1", "V2", "A2"},
+                     "V1, A1 refused (the demux stops), then A1 again, V2, A2");
+            t.IsTrue(gBp.results == std::vector<int32_t>{17, 55},
+                     "the first demux reports only the 17 bytes before A1; the retry the 55 left");
+            t.Equals(ps2_stubs::mpegVideoBytesFedForTesting() - fedBefore, 16ull,
+                     "each video payload goes to the decoder once (V2 was parsed by the first call)");
+            t.Equals(gBp.addrs[2], kMpegBpPssAddr + 17u + 9u, "the retried A1 payload is in the retry's input");
+            t.Equals(static_cast<uint32_t>(ps2_stubs::mpegDemuxReplayBytesForTesting(kMpegNodataHandle)), 0u,
+                     "nothing is left to present again");
+        });
+
+        tc.Run("demux: a packet refused twice is presented until it is accepted", [runMpegBp](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            MpegBpScript script;
+            script.audioRefusals = 2u;
+            const uint64_t fedBefore = ps2_stubs::mpegVideoBytesFedForTesting();
+            runMpegBp(runtime, rdram, script);
+
+            t.IsTrue(gBp.calls == Calls{"V1", "A1", "A1", "A1", "V2", "A2"}, "A1 three times, the rest once");
+            t.IsTrue(gBp.results == std::vector<int32_t>{17, 0, 55}, "17, then 0 (A1 is first), then 55");
+            t.Equals(ps2_stubs::mpegVideoBytesFedForTesting() - fedBefore, 16ull, "video fed once");
+        });
+
+        tc.Run("demux: the rolled-back bytes may come back from another address", [runMpegBp](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            MpegBpScript script;
+            script.audioRefusals = 1u;
+            script.moveOnRetry = true;
+            runMpegBp(runtime, rdram, script);
+
+            t.IsTrue(gBp.calls == Calls{"V1", "A1", "A1", "V2", "A2"}, "same order as in place");
+            t.Equals(gBp.addrs[2], kMpegBpCopyAddr + 9u, "A1's payload address follows the new input");
+            t.Equals(gBp.addrs[3], kMpegBpCopyAddr + 17u + 9u, "V2's too");
+            t.Equals(gBp.addrs[4], kMpegBpCopyAddr + 34u + 9u, "A2's too");
+        });
+
+        tc.Run("demux: a retry too short for the refused packet consumes nothing", [runMpegBp](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            MpegBpScript script;
+            script.audioRefusals = 1u;
+            script.shortRetry = 10u; // A1 is 17 bytes
+            runMpegBp(runtime, rdram, script);
+
+            t.IsTrue(gBp.calls == Calls{"V1", "A1", "A1", "V2", "A2"}, "no callback for the short retry");
+            t.IsTrue(gBp.results == std::vector<int32_t>{17, 0, 55}, "17, 0, then the 55 left");
+        });
+
+        tc.Run("demux: other bytes than the rolled-back ones drop the replay and parse as new", [runMpegBp](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            MpegBpScript script;
+            script.audioRefusals = 1u;
+            script.garbageRetry = true;
+            runMpegBp(runtime, rdram, script);
+
+            t.IsTrue(gBp.calls == Calls{"V1", "A1"}, "nothing from the dropped region is delivered");
+            t.IsTrue(gBp.results == std::vector<int32_t>{17, 4}, "the program end is consumed as new data");
+            t.Equals(static_cast<uint32_t>(ps2_stubs::mpegDemuxReplayBytesForTesting(kMpegNodataHandle)), 0u,
+                     "the replay region is gone");
+        });
+
+        tc.Run("demux: a video callback returning 0 does not stop the demux", [runMpegBp](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            MpegBpScript script;
+            script.videoResult = 0u;
+            runMpegBp(runtime, rdram, script);
+
+            t.IsTrue(gBp.calls == Calls{"V1", "A1", "V2", "A2"}, "every packet once");
+            t.IsTrue(gBp.results == std::vector<int32_t>{72}, "all 72 bytes consumed");
+        });
+
+        tc.Run("demux: PS2X_MPEG_DEMUX_BACKPRESSURE=0 drops the refused packet as before", [runMpegBp](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            MpegBpScript script;
+            script.audioRefusals = 1u;
+            ps2_stubs::setMpegDemuxRollbackForTesting(0);
+            runMpegBp(runtime, rdram, script);
+            ps2_stubs::setMpegDemuxRollbackForTesting(-1);
+
+            t.IsTrue(gBp.calls == Calls{"V1", "A1", "V2", "A2"}, "A1 is not presented again");
+            t.IsTrue(gBp.results == std::vector<int32_t>{72}, "all 72 bytes consumed");
+        });
+
+        tc.Run("demux: no rollback while GetPicture waits in its no-data callback for an undecoded picture", [runMpegNodata](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            gBp = MpegBpScript{};
+            gBp.audioRefusals = 1u;
+            gMpegNodataOrder.store(0u);
+            gMpegNodataContOrder.store(0u);
+            gMpegNodataDemuxResult.store(-999);
+            runMpegNodata(runtime, rdram, false, testMpegBpStarvedNodata);
+
+            t.IsTrue(gBp.calls == Calls{"V1", "A1", "V2", "A2"}, "the refused A1 is dropped, the video goes on");
+            t.Equals(gMpegNodataDemuxResult.load(), static_cast<int32_t>(kMpegBpStreamSize), "all bytes consumed");
+            t.Equals(gMpegNodataStage.load(std::memory_order_acquire), 3u, "GetPicture returns to its caller");
+        });
+
+        tc.Run("demux: a demux of the same playback from inside its stream callback consumes nothing", [runMpegBp](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            MpegBpScript script;
+            script.nestedDemux = true;
+            const uint64_t fedBefore = ps2_stubs::mpegVideoBytesFedForTesting();
+            runMpegBp(runtime, rdram, script);
+
+            t.IsTrue(gBp.nestedResults == std::vector<int32_t>{0}, "the nested demux returns 0");
+            t.IsTrue(gBp.calls == Calls{"V1", "A1", "V2", "A2"}, "the outer run delivers every packet once");
+            t.IsTrue(gBp.results == std::vector<int32_t>{72}, "the outer demux consumes all 72 bytes");
+            t.Equals(ps2_stubs::mpegVideoBytesFedForTesting() - fedBefore, 16ull, "video fed once");
+        });
+
+        tc.Run("demux ring: a rollback across the ring's end re-presents the packet from the ring", [runMpegBp](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            MpegBpScript script;
+            script.audioRefusals = 1u;
+            script.ring = true;
+            const uint64_t fedBefore = ps2_stubs::mpegVideoBytesFedForTesting();
+            runMpegBp(runtime, rdram, script);
+
+            t.IsTrue(gBp.calls == Calls{"V1", "A1", "A1", "V2", "A2"}, "same order as without a ring");
+            t.IsTrue(gBp.results == std::vector<int32_t>{17, 55}, "17, then 55");
+            t.Equals(gBp.addrs[2], kMpegBpRingBase + kMpegBpRingSize - 4u, "A1's payload, before the wrap");
+            t.Equals(gBp.addrs[3], kMpegBpRingBase + 13u, "V2's payload, after the wrap");
+            t.Equals(ps2_stubs::mpegVideoBytesFedForTesting() - fedBefore, 16ull, "video fed once");
+        });
+
+        tc.Run("demux: a snapshot keeps the rolled-back region", [runMpegBp](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            MpegBpScript script;
+            script.audioRefusals = 1u;
+            script.maxCalls = 1u; // stop after the rollback
+            const uint64_t fedBefore = ps2_stubs::mpegVideoBytesFedForTesting();
+            runMpegBp(runtime, rdram, script);
+            t.IsTrue(gBp.results == std::vector<int32_t>{17}, "rolled back to A1");
+
+            ps2x::StateWriter w;
+            ps2_stubs::snapshot::saveMpeg(w);
+            ps2_stubs::resetMpegStubState();
+            ps2x::StateReader r(w.data().data(), w.data().size());
+            ps2_stubs::snapshot::loadMpeg(r, runtime);
+            t.Equals(static_cast<uint32_t>(ps2_stubs::mpegDemuxReplayBytesForTesting(kMpegNodataHandle)), 55u,
+                     "the 55 unreported bytes are restored");
+
+            MpegBpScript resume;
+            resume.resumeOnly = true;
+            resume.done = 17u;
+            runMpegBp(runtime, rdram, resume, false);
+            t.IsTrue(gBp.calls == Calls{"A1", "V2", "A2"}, "after the load, A1 V2 A2 come from the restored region");
+            t.IsTrue(gBp.results == std::vector<int32_t>{55}, "and the 55 bytes are consumed");
+            t.Equals(ps2_stubs::mpegVideoBytesFedForTesting() - fedBefore, 16ull, "video fed once");
+        });
+
         tc.Run("sceSdRemote isolates voice transfers from block streaming state", [](TestCase &t)
         {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
@@ -869,6 +2073,105 @@ void register_ps2_runtime_expansion_tests()
             ps2_stubs::sceSdRemote(rdram.data(), &blockStatusCtx, nullptr);
             t.Equals(getRegU32(&blockStatusCtx, 2), 0x00012F40u,
                      "voice transfer should not replace or advance the block-streaming ring");
+        });
+
+        tc.Run("sceSdRemote block-transfer status follows the guest clock at 48 kHz stereo 16-bit", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kBase = 0x00012340u;
+            constexpr uint32_t kSize = 0x00008000u;
+            ps2_stubs::resetAudioStubState();
+            const auto remote = [&](uint32_t cmd, uint32_t a2, uint32_t a3, uint32_t t0, uint32_t t1, uint32_t t2)
+            {
+                R5900Context ctx{};
+                setRegU32(ctx, 29, 0x00100000u);
+                setRegU32(ctx, 4, 1u);
+                setRegU32(ctx, 5, cmd);
+                setRegU32(ctx, 6, a2);
+                setRegU32(ctx, 7, a3);
+                setRegU32(ctx, 8, t0);
+                setRegU32(ctx, 9, t1);
+                setRegU32(ctx, 10, t2);
+                ps2_stubs::sceSdRemote(rdram.data(), &ctx, &runtime);
+                return getRegU32(&ctx, 2);
+            };
+            EeScheduler &ee = runtime.eeScheduler();
+            remote(0x80E0u, 1u, 0x13u, kBase, kSize, kBase + 0x400u); // loop, starts 0x400 in
+            ee.accountCycles(294912000u / 10u);                          // 0.1 s: 19,200 bytes
+            t.Equals(remote(0x8100u, 1u, 0u, 0u, 0u, 0u), (1u << 24u) | (kBase + 0x400u + 18u * 0x400u),
+                     "18 whole 1 KB blocks after 0.1 s (past half the loop: bank 1)");
+            t.Equals(remote(0x8100u, 1u, 0u, 0u, 0u, 0u), (1u << 24u) | (kBase + 0x400u + 18u * 0x400u),
+                     "no time, no movement (the old model moved 1 KB per poll)");
+            ee.accountCycles(294912000u / 10u * 9u);                     // 1 s in all: 187.5 blocks
+            t.Equals(remote(0x8100u, 1u, 0u, 0u, 0u, 0u), (1u << 24u) | (kBase + (188u * 0x400u) % kSize),
+                     "187 blocks after 1 s (the fraction carries), second half of the loop");
+        });
+
+        // sceSdRemote with a runtime: (cmd, a2 = core, a3 = mode, t0..t2).
+        const auto sdRemote = [](PS2Runtime &runtime, std::vector<uint8_t> &rdram, uint32_t cmd, uint32_t a2,
+                                 uint32_t a3, uint32_t t0, uint32_t t1, uint32_t t2)
+        {
+            R5900Context ctx{};
+            setRegU32(ctx, 29, 0x00100000u);
+            setRegU32(ctx, 4, 1u);
+            setRegU32(ctx, 5, cmd);
+            setRegU32(ctx, 6, a2);
+            setRegU32(ctx, 7, a3);
+            setRegU32(ctx, 8, t0);
+            setRegU32(ctx, 9, t1);
+            setRegU32(ctx, 10, t2);
+            ps2_stubs::sceSdRemote(rdram.data(), &ctx, &runtime);
+            return getRegU32(&ctx, 2);
+        };
+
+        tc.Run("sceSdRemote one-shot block transfer ends at its buffer's end", [sdRemote](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetAudioStubState();
+            EeScheduler &ee = runtime.eeScheduler();
+            sdRemote(runtime, rdram, 0x80E0u, 0u, 0x00u, 0x20000u, 0x2000u, 0u); // write, one-shot, 8 KB
+            ee.accountCycles(294912000u / 100u);                                // 10 ms: 1 block
+            t.Equals(sdRemote(runtime, rdram, 0x8100u, 0u, 0u, 0u, 0u, 0u), 0x20400u, "one block in");
+            ee.accountCycles(294912000u / 10u);                                 // 100 ms: past 8 KB
+            t.Equals(sdRemote(runtime, rdram, 0x8100u, 0u, 0u, 0u, 0u, 0u), 0u,
+                     "a finished one-shot reports no transfer in progress");
+            ee.accountCycles(294912000u / 10u);
+            t.Equals(sdRemote(runtime, rdram, 0x8100u, 0u, 0u, 0u, 0u, 0u), 0u, "and does not wrap around");
+        });
+
+        tc.Run("sceSdRemote block read (capture) keeps one block per poll", [sdRemote](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetAudioStubState();
+            EeScheduler &ee = runtime.eeScheduler();
+            sdRemote(runtime, rdram, 0x80E0u, 0u, 0x11u, 0x20000u, 0x4000u, 0u); // read, loop
+            ee.accountCycles(294912000u / 10u);
+            t.Equals(sdRemote(runtime, rdram, 0x8100u, 0u, 0u, 0u, 0u, 0u), 0x20400u,
+                     "the playback clock does not apply to reads");
+        });
+
+        tc.Run("sceSdRemote block-transfer clock survives a snapshot", [sdRemote](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetAudioStubState();
+            EeScheduler &ee = runtime.eeScheduler();
+            sdRemote(runtime, rdram, 0x80E0u, 1u, 0x10u, 0x20000u, 0x10000u, 0u); // write, loop, 64 KB
+            ee.accountCycles(294912000u / 1000u * 15u);                          // 15 ms: 2.8 blocks
+            t.Equals(sdRemote(runtime, rdram, 0x8100u, 1u, 0u, 0u, 0u, 0u), 0x20800u, "2 blocks, 0.8 carried");
+
+            ps2x::StateWriter w;
+            ps2_stubs::snapshot::saveAudio(w);
+            ps2_stubs::resetAudioStubState();
+            ps2x::StateReader r(w.data().data(), w.data().size());
+            ps2_stubs::snapshot::loadAudio(r, runtime);
+
+            ee.accountCycles(294912000u / 1000u * 2u);                           // 2 ms more: 0.375
+            t.Equals(sdRemote(runtime, rdram, 0x8100u, 1u, 0u, 0u, 0u, 0u), 0x20C00u,
+                     "the position, the clock and the carried fraction are restored");
         });
 
         tc.Run("sceSdRemote keeps block cursors and loop banks isolated per core", [](TestCase &t)
@@ -992,6 +2295,294 @@ void register_ps2_runtime_expansion_tests()
                      "sprintf should read the third variadic integer from t0 and honor %02d");
             t.Equals(getRegS32(ctx, 2), static_cast<int32_t>(rendered.size()),
                      "sprintf should return the rendered length");
+        });
+
+        tc.Run("sceSdRemote reads args 5-7 from t0-t2 even when they are 0", [](TestCase &t)
+        {
+            // The game's sceSdRemote (0x127688) copies a2..t3 into its RPC buffer and reads nothing
+            // from the caller's stack: a 0 in t0-t2 is a real 0, and the O32 home slots at
+            // sp+0x10.. (caller locals) must not replace it.
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kStackAddr = 0x00100000u;
+            auto writeU32 = [&](uint32_t addr, uint32_t value)
+            {
+                std::memcpy(rdram.data() + addr, &value, sizeof(value));
+            };
+            writeU32(kStackAddr + 0x10u, 0x00055000u);
+            writeU32(kStackAddr + 0x14u, 0x00006000u);
+            writeU32(kStackAddr + 0x18u, 0x00010800u);
+
+            R5900Context initCtx{};
+            ps2_stubs::sceSdRemoteInit(rdram.data(), &initCtx, nullptr);
+
+            auto remote = [&](uint32_t command, uint32_t core, uint32_t mode,
+                              uint32_t arg4, uint32_t arg5, uint32_t arg6)
+            {
+                R5900Context ctx{};
+                setRegU32(ctx, 29, kStackAddr);
+                setRegU32(ctx, 4, 1u);
+                setRegU32(ctx, 5, command);
+                setRegU32(ctx, 6, core);
+                setRegU32(ctx, 7, mode);
+                setRegU32(ctx, 8, arg4);
+                setRegU32(ctx, 9, arg5);
+                setRegU32(ctx, 10, arg6);
+                ps2_stubs::sceSdRemote(rdram.data(), &ctx, nullptr);
+                return getRegU32(&ctx, 2);
+            };
+
+            // VoiceTrans (DMA mode) returns its size argument (t2): 0 here, not the 0x10800 decoy.
+            t.Equals(remote(0x80D0u, 0u, 0u, 0x00022000u, 0x00004000u, 0u), 0u,
+                     "VoiceTrans size should be the 0 in t2, not the stack decoy");
+
+            // BlockTrans with pause address 0 (t2) starts at the buffer base, so the first status
+            // poll is base + one transfer unit (0x400), as in the per-core test above.
+            t.Equals(remote(0x80E0u, 0u, 0x10u, 0x00010000u, 0x00001000u, 0u), 0u,
+                     "BlockTrans start should succeed");
+            t.Equals(remote(0x8100u, 0u, 0u, 0u, 0u, 0u), 0x00010400u,
+                     "BlockTrans pause address should be the 0 in t2, not the 0x10800 stack decoy");
+        });
+
+        tc.Run("sceMpegAddStrCallback and sceMpegDemuxPssRing take arg 5 from t0 only", [](TestCase &t)
+        {
+            // Game copies: sceMpegAddStrCallback (0x11a1f0) stores param_5 (t0) beside the callback;
+            // sceMpegDemuxPssRing (0x119df0) uses param_5 (t0) as the ring size. A 0 there is a real
+            // 0; sp+0x10 holds a caller local (decoys below).
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kVideoPacketAddr = 0x00128000u;
+            constexpr uint32_t kStackAddr = 0x00100000u;
+            auto writeU32 = [&](uint32_t addr, uint32_t value)
+            {
+                std::memcpy(rdram.data() + addr, &value, sizeof(value));
+            };
+
+            runtime.registerFunction(kCallbackEntry, &testRecordMpegStreamCallback);
+            runtime.registerFunction(kMpegCallbackStopPc, &testStopAfterMpegCallback);
+
+            writeU32(kStackAddr + 0x10u, 0xBAADF00Du);
+            R5900Context addCtx{};
+            setRegU32(addCtx, 29, kStackAddr);
+            setRegU32(addCtx, 4, kMpegAddr);
+            setRegU32(addCtx, 5, 0u); // video
+            setRegU32(addCtx, 6, 0u);
+            setRegU32(addCtx, 7, kCallbackEntry);
+            setRegU32(addCtx, 8, 0u); // data (t0) = 0, as the game's 0x18b260 passes it
+            ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
+
+            const std::vector<uint8_t> payload = {
+                0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};
+            const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
+            std::vector<uint8_t> packet = {
+                0x00u, 0x00u, 0x01u, 0xE0u,
+                static_cast<uint8_t>(packetLen >> 8u),
+                static_cast<uint8_t>(packetLen & 0xFFu),
+                0x80u, 0x00u, 0x00u};
+            packet.insert(packet.end(), payload.begin(), payload.end());
+            std::memcpy(rdram.data() + kVideoPacketAddr, packet.data(), packet.size());
+            const uint32_t packetSize = static_cast<uint32_t>(packet.size());
+
+            // Ring size 0 (t0) means no wrap; a decoy ring size of 4 would wrap after 4 bytes.
+            writeU32(kStackAddr + 0x10u, 4u);
+            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+            gMpegStreamCallbackUserData.store(0xFFFFFFFFu, std::memory_order_release);
+            R5900Context idleContext{};
+            idleContext.pc = kMpegCallbackStopPc;
+            runtime.eeScheduler().reset(rdram.data(), idleContext);
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 29, kStackAddr);
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kVideoPacketAddr);
+            setRegU32(demuxCtx, 6, packetSize);
+            setRegU32(demuxCtx, 7, kVideoPacketAddr);
+            setRegU32(demuxCtx, 8, 0u); // ring size (t0) = 0
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
+            runtime.eeScheduler().run();
+
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                     "the video stream callback should be invoked once");
+            t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), 0u,
+                     "callback data should be the 0 passed in t0, not the sp+0x10 decoy");
+            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire), kVideoPacketAddr + 9u,
+                     "an unwrapped demux should point the callback at the PES payload");
+            t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire),
+                     static_cast<uint32_t>(payload.size()),
+                     "an unwrapped demux should report the whole PES payload");
+            ps2_stubs::resetMpegStubState();
+        });
+
+        tc.Run("sprintf walks varargs past t3 in 8-byte stack slots from sp+0", [](TestCase &t)
+        {
+            // The game's sprintf (0x1a07a8) and printf (0x19f0c8) spill a1..t3 as 8-byte slots
+            // directly below the incoming stack arguments, so va_arg continues at the caller's
+            // sp+0, sp+8, ... in 8-byte steps.
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kDestAddr = 0x00002000u;
+            constexpr uint32_t kFormatAddr = 0x00002100u;
+            constexpr uint32_t kStackAddr = 0x00003000u;
+            constexpr char kFormat[] = "%d %d %d %d %d %d %d %d";
+            auto writeU32 = [&](uint32_t addr, uint32_t value)
+            {
+                std::memcpy(rdram.data() + addr, &value, sizeof(value));
+            };
+
+            std::memcpy(rdram.data() + kFormatAddr, kFormat, sizeof(kFormat));
+            writeU32(kStackAddr + 0x00u, 7u);   // 7th vararg (9th argument)
+            writeU32(kStackAddr + 0x04u, 900u); // upper half of slot 0: decoy for 4-byte steps
+            writeU32(kStackAddr + 0x08u, 8u);   // 8th vararg
+            writeU32(kStackAddr + 0x10u, 901u); // O32 home slot: decoy
+            writeU32(kStackAddr + 0x14u, 902u);
+            setRegU32(ctx, 29, kStackAddr);
+            setRegU32(ctx, 4, kDestAddr);
+            setRegU32(ctx, 5, kFormatAddr);
+            for (int reg = 6; reg <= 11; ++reg)
+            {
+                setRegU32(ctx, reg, static_cast<uint32_t>(reg - 5)); // 1..6 in a2..t3
+            }
+
+            ps2_stubs::sprintf(rdram.data(), &ctx, &runtime);
+
+            const std::string rendered(reinterpret_cast<const char *>(rdram.data() + kDestAddr));
+            t.Equals(rendered, std::string("1 2 3 4 5 6 7 8"),
+                     "sprintf should take varargs 7-8 from the 8-byte slots at sp+0 and sp+8");
+        });
+
+        tc.Run("sprintf takes a 64-bit vararg from one register", [](TestCase &t)
+        {
+            // EE registers are 64-bit: a long long vararg is one register (or one 8-byte slot),
+            // as the game's sprintf (0x1a07a8) spills each of a2..t3 with one 8-byte store.
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kDestAddr = 0x00002000u;
+            constexpr uint32_t kFormatAddr = 0x00002100u;
+            constexpr uint32_t kStackAddr = 0x00003000u;
+            constexpr char kFormat[] = "%llx %d %llx";
+            std::memcpy(rdram.data() + kFormatAddr, kFormat, sizeof(kFormat));
+
+            setRegU32(ctx, 29, kStackAddr);
+            setRegU32(ctx, 4, kDestAddr);
+            setRegU32(ctx, 5, kFormatAddr);
+            ctx.r[6] = _mm_set_epi64x(0, static_cast<int64_t>(0x123456789ABCDEF0ull)); // a2
+            setRegU32(ctx, 7, 42u);                                                       // a3
+            ctx.r[8] = _mm_set_epi64x(0, static_cast<int64_t>(0x0000000500000006ull)); // t0
+
+            ps2_stubs::sprintf(rdram.data(), &ctx, &runtime);
+
+            const std::string rendered(reinterpret_cast<const char *>(rdram.data() + kDestAddr));
+            t.Equals(rendered, std::string("123456789abcdef0 42 500000006"),
+                     "each 64-bit vararg should take exactly one 64-bit register");
+        });
+
+        tc.Run("vsprintf walks a guest va_list in 8-byte slots for every type", [](TestCase &t)
+        {
+            // The game's vfprintf (0x1a19b0) takes ap as a u64*: every conversion reads *ap and
+            // steps 8 bytes. %d/%c/%s/%p/%hd use the low word of the slot; %ld, %lld, %qx and
+            // %f (soft-float double) use the whole slot, with no alignment step. The upper
+            // halves of the 32-bit slots hold decoys that a 4-byte walk would print.
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kDestAddr = 0x00002000u;
+            constexpr uint32_t kFormatAddr = 0x00002100u;
+            constexpr uint32_t kStringAddr = 0x00002200u;
+            constexpr uint32_t kVaAddr = 0x00003004u; // 4 mod 8: the walk must not realign
+            constexpr char kFormat[] = "%d|%s|%c|%p|%lld|%ld|%.2f|%hd|%qx|%u";
+            constexpr char kString[] = "abc";
+            auto writeU64 = [&](uint32_t addr, uint64_t value)
+            {
+                std::memcpy(rdram.data() + addr, &value, sizeof(value));
+            };
+            auto decoy = [](uint32_t low)
+            {
+                return static_cast<uint64_t>(low) | (0x00000909ull << 32);
+            };
+
+            std::memcpy(rdram.data() + kFormatAddr, kFormat, sizeof(kFormat));
+            std::memcpy(rdram.data() + kStringAddr, kString, sizeof(kString));
+            double half = 2.5;
+            uint64_t halfBits = 0;
+            std::memcpy(&halfBits, &half, sizeof(halfBits));
+            writeU64(kVaAddr + 0x00u, static_cast<uint64_t>(static_cast<int64_t>(-7))); // %d
+            writeU64(kVaAddr + 0x08u, decoy(kStringAddr));                              // %s
+            writeU64(kVaAddr + 0x10u, decoy('Z'));                                      // %c
+            writeU64(kVaAddr + 0x18u, decoy(0x1234u));                                  // %p
+            writeU64(kVaAddr + 0x20u, 0x0000000500000006ull);                           // %lld
+            writeU64(kVaAddr + 0x28u, static_cast<uint64_t>(static_cast<int64_t>(-3))); // %ld
+            writeU64(kVaAddr + 0x30u, halfBits);                                        // %f
+            writeU64(kVaAddr + 0x38u, decoy(0xFFFEu));                                  // %hd
+            writeU64(kVaAddr + 0x40u, 0x123456789ABCDEF0ull);                           // %qx
+            writeU64(kVaAddr + 0x48u, decoy(77u));                                      // %u
+
+            setRegU32(ctx, 4, kDestAddr);
+            setRegU32(ctx, 5, kFormatAddr);
+            setRegU32(ctx, 6, kVaAddr);
+            ps2_stubs::vsprintf(rdram.data(), &ctx, &runtime);
+
+            const std::string rendered(reinterpret_cast<const char *>(rdram.data() + kDestAddr));
+            const std::string pointer = [&]()
+            {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "%p", reinterpret_cast<void *>(static_cast<uintptr_t>(0x1234u)));
+                return std::string(buf);
+            }();
+            t.Equals(rendered, "-7|abc|Z|" + pointer + "|21474836486|-3|2.50|-2|123456789abcdef0|77",
+                     "each va_arg should take exactly one 8-byte slot");
+        });
+
+        tc.Run("sceeFontPrintfAt formats t0-t3 then the caller's stack slots, leaving the caller's frame alone", [](TestCase &t)
+        {
+            // sceeFontPrintfAt(buf, x, y, fmt, ...): varargs 1-4 in t0-t3, 5+ in 8-byte slots from
+            // the caller's sp+0. The caller's locals above (sp+0x10.., the O32 home slots) must be
+            // neither read nor written.
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kFormatAddr = 0x00002100u;
+            constexpr uint32_t kStackAddr = 0x00010000u;
+            constexpr char kFormat[] = "%d %d %d %d %d %d";
+            std::memcpy(rdram.data() + kFormatAddr, kFormat, sizeof(kFormat));
+            for (uint32_t i = 0; i < 0x40u; i += 4u)
+            {
+                const uint32_t word = 0xA0000000u | i;
+                std::memcpy(rdram.data() + kStackAddr + i, &word, sizeof(word));
+            }
+            const uint32_t five = 5u;
+            const uint32_t six = 6u;
+            std::memcpy(rdram.data() + kStackAddr + 0x00u, &five, sizeof(five));
+            std::memcpy(rdram.data() + kStackAddr + 0x08u, &six, sizeof(six));
+            const std::vector<uint8_t> callerBefore(rdram.begin() + kStackAddr, rdram.begin() + kStackAddr + 0x40u);
+
+            setRegU32(ctx, 29, kStackAddr);
+            setRegU32(ctx, 31, 0x00100008u);
+            setRegU32(ctx, 4, 0u); // no packet buffer: only the formatting runs
+            setRegU32(ctx, 5, 10u);
+            setRegU32(ctx, 6, 20u);
+            setRegU32(ctx, 7, kFormatAddr);
+            for (int reg = 8; reg <= 11; ++reg)
+            {
+                setRegU32(ctx, reg, static_cast<uint32_t>(reg - 7)); // 1..4 in t0..t3
+            }
+
+            ps2_stubs::sceeFontPrintfAt(rdram.data(), &ctx, &runtime);
+
+            const uint32_t textAddr = kStackAddr - 0x900u + 0x20u;
+            const std::string rendered(reinterpret_cast<const char *>(rdram.data() + textAddr));
+            t.Equals(rendered, std::string("1 2 3 4 5 6"),
+                     "varargs should come from t0-t3, then sp+0 and sp+8");
+            const std::vector<uint8_t> callerAfter(rdram.begin() + kStackAddr, rdram.begin() + kStackAddr + 0x40u);
+            t.IsTrue(callerAfter == callerBefore, "the caller's stack sp+0..0x3f should be unchanged");
+            t.Equals(::getRegU32(&ctx, 29), kStackAddr, "sp should be restored");
         });
 
         tc.Run("multiply-add matrix writes rd only when R5900 requires it", [](TestCase &t)
@@ -1295,9 +2886,10 @@ void register_ps2_runtime_expansion_tests()
             // With XYOFFSET=(1,1), vertex at (2,2) draws to pixel (1,1).
             const uint64_t xyz = (32ull) | (32ull << 16) | (0ull << 32);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + (16ull | (16ull << 16))); // one-pixel sprite: a GS sprite covers [x0, x1) x [y0, y1)
 
             const uint32_t insideOff = frameOffsetBytes(1u, 1u, 1u);
+            gs.sync();
             t.Equals(vram[insideOff + 0u], static_cast<uint8_t>(200u), "inside draw should write R");
             t.Equals(vram[insideOff + 1u], static_cast<uint8_t>(20u), "inside draw should write G");
             t.Equals(vram[insideOff + 2u], static_cast<uint8_t>(50u), "inside draw should write B");
@@ -1309,9 +2901,10 @@ void register_ps2_runtime_expansion_tests()
             const uint64_t scissorOutside = (3ull) | (4ull << 16) | (3ull << 32) | (4ull << 48);
             gs.writeRegister(GS_REG_SCISSOR_1, scissorOutside);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + (16ull | (16ull << 16))); // one-pixel sprite: a GS sprite covers [x0, x1) x [y0, y1)
 
             bool anyWrite = false;
+            gs.sync();
             for (size_t i = 0; i < 1024u; ++i)
             {
                 if (vram[i] != 0u)
@@ -1342,6 +2935,7 @@ void register_ps2_runtime_expansion_tests()
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
 
             const uint32_t pxOff = frameOffsetBytes(1u, 1u, 1u);
+            gs.sync();
             vram[pxOff + 0u] = 40u;
             vram[pxOff + 1u] = 40u;
             vram[pxOff + 2u] = 40u;
@@ -1358,9 +2952,10 @@ void register_ps2_runtime_expansion_tests()
 
             const uint64_t xyz = (16ull) | (16ull << 16) | (0ull << 32); // pixel (1,1)
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + (16ull | (16ull << 16))); // one-pixel sprite: a GS sprite covers [x0, x1) x [y0, y1)
 
             // ((200 - 40) * 64 >> 7) + 40 = 120
+            gs.sync();
             t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(120u), "alpha blend should update R with FIX factor");
             t.Equals(vram[pxOff + 1u], static_cast<uint8_t>(120u), "alpha blend should update G with FIX factor");
             t.Equals(vram[pxOff + 2u], static_cast<uint8_t>(120u), "alpha blend should update B with FIX factor");

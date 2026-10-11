@@ -25,9 +25,12 @@ namespace ps2recomp
     class ControlFlowAnalyzer
     {
     public:
+        // linkBranchResume (resume_into_owner): the return address of a branch-and-link
+        // (bltzal/bgezal and the likely forms) is a resume point too, like a jal's.
         ControlFlowAnalyzer(const std::vector<Section> &sections,
                             const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
-                            RecompilerReporter *reporter);
+                            RecompilerReporter *reporter,
+                            bool linkBranchResume = false);
 
         ControlFlowAnalysisResult analyze(const Function &function,
                                           const std::vector<Instruction> &instructions,
@@ -37,6 +40,7 @@ namespace ps2recomp
         const std::vector<Section> &m_sections;
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &m_configJumpTableTargetsByAddress;
         RecompilerReporter *m_reporter = nullptr;
+        bool m_linkBranchResume = false;
     };
 }
 

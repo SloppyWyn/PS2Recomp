@@ -521,7 +521,48 @@ namespace ps2_stubs
         setReturnU32(ctx, resultAddr);
     }
 
-    void printf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int printf(const char *format, ...)
+    PS2_STUB_TYPED(int32_t, printf, ps2_abi::gptr format_addr, ps2_abi::VarArgs args)
+    {
+        const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
+        int ret = -1;
+
+        if (format_addr != 0)
+        {
+            std::string rendered = formatPs2StringWithVarArgs(rdram, runtime, formatOwned.c_str(), args);
+            if (rendered.size() > 2048)
+            {
+                rendered.resize(2048);
+            }
+            PS2_IF_AGRESSIVE_LOGS({
+                const std::string logLine = sanitizeForLog(rendered);
+                uint32_t count = 0;
+                {
+                    std::lock_guard<std::mutex> lock(g_printfLogMutex);
+                    count = ++g_printfLogCount;
+                }
+                if (count <= kMaxPrintfLogs)
+                {
+                    RUNTIME_LOG("PS2 printf: " << logLine);
+                    RUNTIME_LOG(std::flush);
+                }
+                else if (count == kMaxPrintfLogs + 1)
+                {
+                    std::cerr << "PS2 printf logging suppressed after " << kMaxPrintfLogs << " lines" << std::endl;
+                }
+            });
+            ret = static_cast<int>(rendered.size());
+        }
+        else
+        {
+            std::cerr << "printf error: Invalid format string address provided: 0x" << std::hex << format_addr << std::dec << std::endl;
+        }
+
+        // returns the number of characters written, or negative on error.
+        return ret;
+    }
+
+    void printf_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t format_addr = getRegU32(ctx, 4); // $a0
         const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
@@ -562,7 +603,68 @@ namespace ps2_stubs
         setReturnS32(ctx, ret);
     }
 
-    void sprintf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(printf)
+
+    // int sprintf(char *str, const char *format, ...)
+    PS2_STUB_TYPED(int32_t, sprintf, ps2_abi::gptr str_addr, ps2_abi::gptr format_addr, ps2_abi::VarArgs args)
+    {
+        constexpr size_t kSafeSprintfBytes = 256u; // Keep guest stack temporaries from being overwritten.
+
+        const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
+        int ret = -1;
+
+        if (format_addr != 0)
+        {
+            const uint32_t watchBase = ps2PathWatchPhysAddr();
+            const uint32_t watchEnd = watchBase + PS2_PATH_WATCH_BYTES;
+            const uint32_t dest = str_addr & PS2_RAM_MASK;
+            const bool touchesWatch = dest < watchEnd && dest >= watchBase;
+            static uint32_t watchSprintfLogCount = 0;
+            if (touchesWatch && watchSprintfLogCount < 64u)
+            {
+                const uint32_t arg0 = args.peekU32(0);
+                const uint32_t arg1 = args.peekU32(1);
+                RUNTIME_LOG("[watch:sprintf] dest=0x" << std::hex << str_addr
+                                                      << " fmt@0x" << format_addr
+                                                      << " arg0=0x" << arg0
+                                                      << " arg1=0x" << arg1
+                                                      << " fmt=\"" << sanitizeForLog(readPs2CStringBounded(rdram, runtime, format_addr, 64)) << "\""
+                                                      << " s0=\"" << sanitizeForLog(readPs2CStringBounded(rdram, runtime, arg0, 64)) << "\""
+                                                      << " s1=\"" << sanitizeForLog(readPs2CStringBounded(rdram, runtime, arg1, 64)) << "\""
+                                                      << std::dec << std::endl);
+                ++watchSprintfLogCount;
+            }
+
+            std::string rendered = formatPs2StringWithVarArgs(rdram, runtime, formatOwned.c_str(), args);
+            if (rendered.size() >= kSafeSprintfBytes)
+            {
+                rendered.resize(kSafeSprintfBytes - 1);
+            }
+            const size_t writeLen = rendered.size() + 1u;
+            if (writeGuestBytes(rdram, runtime, str_addr, reinterpret_cast<const uint8_t *>(rendered.c_str()), writeLen))
+            {
+                ps2TraceGuestRangeWrite(rdram, str_addr, static_cast<uint32_t>(writeLen), "sprintf", ctx);
+                ret = static_cast<int>(rendered.size());
+            }
+            else
+            {
+                std::cerr << "sprintf error: Failed to write destination buffer at 0x"
+                          << std::hex << str_addr << std::dec << std::endl;
+            }
+        }
+        else
+        {
+            std::cerr << "sprintf error: Invalid format address provided."
+                      << " Dest: 0x" << std::hex << str_addr
+                      << ", Format: 0x" << format_addr << std::dec
+                      << std::endl;
+        }
+
+        // returns the number of characters written (excluding null), or negative on error.
+        return ret;
+    }
+
+    void sprintf_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t str_addr = getRegU32(ctx, 4);     // $a0
         uint32_t format_addr = getRegU32(ctx, 5);  // $a1
@@ -622,7 +724,53 @@ namespace ps2_stubs
         setReturnS32(ctx, ret);
     }
 
-    void snprintf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sprintf)
+
+    // int snprintf(char *str, size_t size, const char *format, ...)
+    PS2_STUB_TYPED(int32_t, snprintf, ps2_abi::gptr str_addr, uint32_t size, ps2_abi::gptr format_addr, ps2_abi::VarArgs args)
+    {
+        const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
+        int ret = -1;
+
+        if (format_addr != 0)
+        {
+            std::string rendered = formatPs2StringWithVarArgs(rdram, runtime, formatOwned.c_str(), args);
+            ret = static_cast<int>(rendered.size());
+
+            if (size > 0)
+            {
+                const size_t copyLen = std::min<size_t>(size - 1, rendered.size());
+                std::vector<uint8_t> output(copyLen + 1u, 0u);
+                if (copyLen > 0u)
+                {
+                    std::memcpy(output.data(), rendered.data(), copyLen);
+                }
+                if (writeGuestBytes(rdram, runtime, str_addr, output.data(), output.size()))
+                {
+                    ps2TraceGuestRangeWrite(rdram, str_addr, static_cast<uint32_t>(output.size()), "snprintf", ctx);
+                }
+                else
+                {
+                    std::cerr << "snprintf error: Failed to write destination buffer at 0x"
+                              << std::hex << str_addr << std::dec << std::endl;
+                    ret = -1;
+                }
+            }
+        }
+        else
+        {
+            std::cerr << "snprintf error: Invalid address provided or size is zero."
+                      << " Dest: 0x" << std::hex << str_addr
+                      << ", Format: 0x" << format_addr << std::dec
+                      << ", Size: " << size << std::endl;
+        }
+
+        // returns the number of characters that *would* have been written
+        // if size was large enough (excluding null), or negative on error.
+        return ret;
+    }
+
+    void snprintf_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t str_addr = getRegU32(ctx, 4);    // $a0
         size_t size = getRegU32(ctx, 5);          // $a1
@@ -668,6 +816,8 @@ namespace ps2_stubs
         setReturnS32(ctx, ret);
     }
 
+    PS2_STUB_DISPATCH(snprintf)
+
     void puts(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t strAddr = getRegU32(ctx, 4); // $a0
@@ -708,6 +858,7 @@ namespace ps2_stubs
                 std::lock_guard<std::mutex> lock(g_file_mutex);
                 file_handle = generate_file_handle();
                 g_file_map[file_handle] = fp;
+                g_file_info[file_handle] = StubFileInfo{hostPath, hostMode};
                 RUNTIME_LOG("  -> handle=0x" << std::hex << file_handle << std::dec);
             }
             else
@@ -740,6 +891,7 @@ namespace ps2_stubs
                 FILE *fp = it->second;
                 ret = ::fclose(fp);
                 g_file_map.erase(it);
+                g_file_info.erase(file_handle);
             }
             else
             {
@@ -808,7 +960,31 @@ namespace ps2_stubs
         setReturnU32(ctx, (uint32_t)items_written);
     }
 
-    void fprintf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int fprintf(FILE *stream, const char *format, ...): the stream is a runtime file handle
+    PS2_STUB_TYPED(int32_t, fprintf, uint32_t file_handle, ps2_abi::gptr format_addr, ps2_abi::VarArgs args)
+    {
+        FILE *fp = get_file_ptr(file_handle);
+        const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
+        int ret = -1;
+
+        if (fp && format_addr != 0)
+        {
+            std::string rendered = formatPs2StringWithVarArgs(rdram, runtime, formatOwned.c_str(), args);
+            ret = std::fprintf(fp, "%s", rendered.c_str());
+        }
+        else
+        {
+            std::cerr << "fprintf error: Invalid file handle or format address."
+                      << " Handle: 0x" << std::hex << file_handle << " (file valid: " << (fp != nullptr) << ")"
+                      << ", Format: 0x" << format_addr << std::dec
+                      << std::endl;
+        }
+
+        // returns the number of characters written, or negative on error.
+        return ret;
+    }
+
+    void fprintf_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t file_handle = getRegU32(ctx, 4); // $a0
         uint32_t format_addr = getRegU32(ctx, 5); // $a1
@@ -832,6 +1008,8 @@ namespace ps2_stubs
         // returns the number of characters written, or negative on error.
         setReturnS32(ctx, ret);
     }
+
+    PS2_STUB_DISPATCH(fprintf)
 
     void fseek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -1113,7 +1291,30 @@ namespace ps2_stubs
         setReturnS32(ctx, static_cast<int32_t>(lhs.size()) - static_cast<int32_t>(rhs.size()));
     }
 
-    void vfprintf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int vfprintf(FILE *stream, const char *format, va_list ap): ap is a guest pointer
+    PS2_STUB_TYPED(int32_t, vfprintf, uint32_t file_handle, ps2_abi::gptr format_addr, ps2_abi::gptr va_list_addr)
+    {
+        FILE *fp = get_file_ptr(file_handle);
+        const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
+        int ret = -1;
+
+        if (fp && format_addr != 0)
+        {
+            std::string rendered = formatPs2StringWithVaList(rdram, runtime, formatOwned.c_str(), va_list_addr);
+            ret = std::fprintf(fp, "%s", rendered.c_str());
+        }
+        else
+        {
+            std::cerr << "vfprintf error: Invalid file handle or format address."
+                      << " Handle: 0x" << std::hex << file_handle << " (file valid: " << (fp != nullptr) << ")"
+                      << ", Format: 0x" << format_addr << std::dec
+                      << std::endl;
+        }
+
+        return ret;
+    }
+
+    void vfprintf_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t file_handle = getRegU32(ctx, 4);  // $a0
         uint32_t format_addr = getRegU32(ctx, 5);  // $a1
@@ -1138,7 +1339,44 @@ namespace ps2_stubs
         setReturnS32(ctx, ret);
     }
 
-    void vsprintf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(vfprintf)
+
+    // int vsprintf(char *str, const char *format, va_list ap): ap is a guest pointer
+    PS2_STUB_TYPED(int32_t, vsprintf, ps2_abi::gptr str_addr, ps2_abi::gptr format_addr, ps2_abi::gptr va_list_addr)
+    {
+        constexpr size_t kSafeVsprintfBytes = 256u; // Keep guest stack temporaries from being overwritten.
+        const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
+        int ret = -1;
+
+        if (format_addr != 0)
+        {
+            std::string rendered = formatPs2StringWithVaList(rdram, runtime, formatOwned.c_str(), va_list_addr);
+            if (rendered.size() >= kSafeVsprintfBytes)
+            {
+                rendered.resize(kSafeVsprintfBytes - 1);
+            }
+            if (writeGuestBytes(rdram, runtime, str_addr, reinterpret_cast<const uint8_t *>(rendered.c_str()), rendered.size() + 1u))
+            {
+                ret = static_cast<int>(rendered.size());
+            }
+            else
+            {
+                std::cerr << "vsprintf error: Failed to write destination buffer at 0x"
+                          << std::hex << str_addr << std::dec << std::endl;
+            }
+        }
+        else
+        {
+            std::cerr << "vsprintf error: Invalid address provided."
+                      << " Dest: 0x" << std::hex << str_addr
+                      << ", Format: 0x" << format_addr << std::dec
+                      << std::endl;
+        }
+
+        return ret;
+    }
+
+    void vsprintf_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t str_addr = getRegU32(ctx, 4);      // $a0
         uint32_t format_addr = getRegU32(ctx, 5);   // $a1
@@ -1175,6 +1413,8 @@ namespace ps2_stubs
         setReturnS32(ctx, ret);
     }
 
+    PS2_STUB_DISPATCH(vsprintf)
+
     void __divdi3(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const int64_t num = GPR_S64(ctx, 4);
@@ -1192,4 +1432,21 @@ namespace ps2_stubs
         setReturnU64(ctx, static_cast<uint64_t>(num / den));
     }
 
+}
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    // No state of its own: only this file's copy of the Helpers/Support.h globals.
+    void saveLibC(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+    }
+
+    void loadLibC(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
+    }
 }

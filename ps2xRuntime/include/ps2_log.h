@@ -137,7 +137,23 @@ inline void clear_runtime_log_entries()
 #define RUNTIME_LOG(x) do {} while(0)
 #endif
 
+// PS2_IF_AGRESSIVE_LOGS: the verbose but capped runtime logs ([run:tick], GS/SIF/MPEG/pad
+// debug lines). PS2X_ENABLE_AGRESSIVE_LOGS in CMake.
 #if AGRESSIVE_LOGS
+#define PS2_IF_AGRESSIVE_LOGS(code) \
+    do                              \
+    {                               \
+        code;                       \
+    } while (0)
+#else
+#define PS2_IF_AGRESSIVE_LOGS(code) ((void)0)
+#endif
+
+// PS_LOG_ENTRY: the per-function call tracker. Every recompiled function logs its entry and
+// exit to ps2_log.txt, flushed per line: gigabytes per run and a large share of the EE
+// thread's time. Its own switch (PS2X_ENABLE_FUNCTION_LOG_TRACKER in CMake, default off),
+// independent of AGRESSIVE_LOGS.
+#ifdef PS2_FUNCTION_LOG_TRACKER
 
 namespace ps2_log
 {
@@ -186,11 +202,6 @@ inline void print_saved_location()
     ps2_log::log_entry(name); \
     struct _ps2_log_guard_ { const char *_n; _ps2_log_guard_(const char *n) : _n(n) {} \
         ~_ps2_log_guard_() { ps2_log::log_exit(_n); } } _ps2_log_guard_(name)
-#define PS2_IF_AGRESSIVE_LOGS(code) \
-    do                              \
-    {                               \
-        code;                       \
-    } while (0)
 
 #else
 
@@ -203,7 +214,6 @@ inline std::string log_path()
 inline void print_saved_location() {}
 }
 #define PS_LOG_ENTRY(name) ((void)0)
-#define PS2_IF_AGRESSIVE_LOGS(code) ((void)0)
 
 #endif
 

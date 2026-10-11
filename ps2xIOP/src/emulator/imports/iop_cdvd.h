@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include "ps2x/state_stream.h"
 
 namespace ps2x::iop
 {
@@ -32,6 +33,10 @@ namespace ps2x::iop::detail
         IopCdvd &operator=(const IopCdvd &) = delete;
 
         void reset() noexcept;
+
+        // Snapshots (docs/SNAPSHOT-DESIGN.md).
+        void saveState(ps2x::StateWriter &w) const;
+        void loadState(ps2x::StateReader &r);
 
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;

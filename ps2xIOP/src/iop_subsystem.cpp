@@ -114,6 +114,34 @@ namespace ps2x::iop
         m_impl->rebuildRoutes();
     }
 
+    void IopSubsystem::saveState(ps2x::StateWriter &w) const
+    {
+        w.beginSection("IOPM");
+        m_impl->moduleManager.saveState(w);
+        w.endSection();
+        w.beginSection("IOPE");
+        m_impl->emulator.saveState(w);
+        w.endSection();
+        // The HLE services (mcserv, dbcman, libsd) keep only log counters.
+    }
+
+    void IopSubsystem::loadState(ps2x::StateReader &r)
+    {
+        r.beginSection("IOPM");
+        m_impl->moduleManager.loadState(r);
+        r.endSection();
+        r.beginSection("IOPE");
+        m_impl->emulator.loadState(r);
+        r.endSection();
+        m_impl->refreshServiceModuleKeys();
+        m_impl->rebuildRoutes();
+    }
+
+    bool IopSubsystem::quiescent(std::string *why) const
+    {
+        return m_impl->emulator.quiescent(why);
+    }
+
     ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
         const ParsedPs2Path parsed = parsePs2Path(path);
@@ -167,6 +195,16 @@ namespace ps2x::iop
     void IopSubsystem::runEeCycles(uint64_t eeCycles) noexcept
     {
         m_impl->emulator.runEeCycles(eeCycles);
+    }
+
+    uint64_t IopSubsystem::eeCyclesUntilNextEvent() const noexcept
+    {
+        return m_impl->emulator.eeCyclesUntilNextEvent();
+    }
+
+    void IopSubsystem::setBatchedTiming(bool enabled) noexcept
+    {
+        m_impl->emulator.setBatchedTiming(enabled);
     }
 
     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
@@ -247,6 +285,16 @@ namespace ps2x::iop
     bool IopSubsystem::isMemoryRange(uint32_t address, size_t size) const
     {
         return m_impl->emulator.isMemoryRange(address, size);
+    }
+
+    void IopSubsystem::setAudioOutput(AudioOutputSink sink)
+    {
+        m_impl->emulator.setAudioOutput(std::move(sink));
+    }
+
+    void IopSubsystem::flushAudioOutput()
+    {
+        m_impl->emulator.flushAudioOutput();
     }
 
     DebugSnapshot IopSubsystem::debugSnapshot() const

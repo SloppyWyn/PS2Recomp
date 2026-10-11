@@ -26,5 +26,9 @@
 #include <atomic>
 #include <limits>
 
+// Typed stub ABI layer (ps2_stub_abi.h): handlers declared here register as stubs.
+#define PS2_STUB_KIND ::ps2_abi::Kind::Stub
+#include "ps2_stub_abi.h"
+
 #include "ps2_host_backend.h"
 #include "Helpers/Support.h"

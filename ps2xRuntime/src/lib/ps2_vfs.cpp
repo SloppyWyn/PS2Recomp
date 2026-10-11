@@ -201,7 +201,7 @@ int32_t PS2Vfs::open(std::string_view path, uint32_t flags, const PS2VfsMounts &
     if (m_nextDescriptor < 3)
         m_nextDescriptor = 3;
     const int32_t descriptor = m_nextDescriptor++;
-    m_descriptors.emplace(descriptor, OpenDescriptor{std::move(file), parsed.deviceName, std::string(path)});
+    m_descriptors.emplace(descriptor, OpenDescriptor{std::move(file), parsed.deviceName, std::string(path), flags});
     return descriptor;
 }
 

@@ -42,6 +42,25 @@ namespace ps2recomp
             config.outputPath = toml::find<std::string>(general, "output");
             config.singleFileOutput = toml::find_or<bool>(general, "single_file_output", false);
             config.lowMemoryMode = toml::find_or<bool>(general, "low_memory_mode", config.lowMemoryMode);
+            {
+                const int64_t groupBytes = toml::find_or<int64_t>(general, "output_group_bytes", config.outputGroupBytes);
+                if (groupBytes < 0 || groupBytes > 0x10000000 || (groupBytes & 3) != 0)
+                {
+                    throw std::runtime_error("output_group_bytes must be 0 or a multiple of 4 up to 0x10000000");
+                }
+                config.outputGroupBytes = static_cast<uint32_t>(groupBytes);
+            }
+            config.resumeIntoOwner = toml::find_or<bool>(general, "resume_into_owner", config.resumeIntoOwner);
+            config.leanCodegen = toml::find_or<bool>(general, "lean_codegen", config.leanCodegen);
+            if (config.leanCodegen)
+            {
+                config.lean = RecompilerConfig::LeanOptions::all();
+            }
+            config.lean.pcStores = toml::find_or<bool>(general, "lean_pc_stores", config.lean.pcStores);
+            config.lean.memoryHelpers = toml::find_or<bool>(general, "lean_memory_helpers", config.lean.memoryHelpers);
+            config.lean.delaySlotFlags = toml::find_or<bool>(general, "lean_delay_slot_flags", config.lean.delaySlotFlags);
+            config.lean.gprScalar = toml::find_or<bool>(general, "lean_gpr_scalar", config.lean.gprScalar);
+            config.lean.zeroFold = toml::find_or<bool>(general, "lean_zero_fold", config.lean.zeroFold);
             const int64_t configuredOutputWorkers = toml::find_or<int64_t>(
                 general,
                 "output_worker_threads",
@@ -291,6 +310,14 @@ namespace ps2recomp
         general["output"] = config.outputPath;
         general["single_file_output"] = config.singleFileOutput;
         general["low_memory_mode"] = config.lowMemoryMode;
+        general["output_group_bytes"] = static_cast<int64_t>(config.outputGroupBytes);
+        general["resume_into_owner"] = config.resumeIntoOwner;
+        general["lean_codegen"] = config.leanCodegen;
+        general["lean_pc_stores"] = config.lean.pcStores;
+        general["lean_memory_helpers"] = config.lean.memoryHelpers;
+        general["lean_delay_slot_flags"] = config.lean.delaySlotFlags;
+        general["lean_gpr_scalar"] = config.lean.gprScalar;
+        general["lean_zero_fold"] = config.lean.zeroFold;
         general["output_worker_threads"] = static_cast<int64_t>(config.outputWorkerThreads);
         general["patch_syscalls"] = config.patchSyscalls;
         general["patch_cop0"] = config.patchCop0;

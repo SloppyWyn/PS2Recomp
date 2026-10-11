@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "ps2x/state_stream.h"
 
 namespace ps2x::iop::detail
 {
@@ -25,6 +26,10 @@ namespace ps2x::iop::detail
         explicit IopImportRegistry(IopMemory &memory) noexcept;
 
         void reset();
+
+        // Snapshots (docs/SNAPSHOT-DESIGN.md).
+        void saveState(ps2x::StateWriter &w) const;
+        void loadState(ps2x::StateReader &r);
         [[nodiscard]] std::optional<IopImportCall> decode(uint32_t pc) const;
         [[nodiscard]] bool registerExportTable(uint32_t address);
         [[nodiscard]] bool releaseExportTable(uint32_t address);

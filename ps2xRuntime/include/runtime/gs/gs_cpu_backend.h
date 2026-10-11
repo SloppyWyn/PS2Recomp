@@ -7,8 +7,32 @@
 #include <mutex>
 #include <vector>
 
+struct GSRasterSetup;
+struct GSTexSetup;
+
+// A range of 8 KB local-memory pages: count pages from first, modulo 512 (addresses wrap at
+// 4 MB); count 0 is empty, 512 is all of local memory.
+struct GSPageRange
+{
+    static constexpr uint32_t kPages = 512u;
+    uint32_t first = 0;
+    uint32_t count = 0;
+};
+
+// A texture decoded to a linear layout for sampling (see GSCpuBackend::LookupDecodedTexture).
+struct GSDecodedTexture
+{
+    uint64_t key = 0;
+    uint64_t writeStamp = 0;
+    uint64_t lastUse = 0;
+    std::vector<uint8_t> indices; // CLUT formats: one index per texel
+    std::vector<uint32_t> rgba;   // other formats: RGBA8888, TEXA applied
+};
+
 class GSCpuBackend final : public GSRasterBackend
 {
+    friend struct PS2SnapshotAccess;
+
 public:
     GSCpuBackend();
 
@@ -41,12 +65,15 @@ private:
     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
 
     void DrawPrimitive(const GSPrimitiveBatch &batch);
-    void DrawSprite(const GSPrimitiveBatch &batch);
-    void DrawTriangle(const GSPrimitiveBatch &batch);
-    void DrawLine(const GSPrimitiveBatch &batch);
-    void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
-    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
-    uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+    void BuildRasterSetup(const GSDrawState &state, GSRasterSetup &setup, const GSPageRange &frameTarget, const GSPageRange &zTarget);
+    const uint32_t *DecodedPalette(const GSDrawState &state);
+    bool LookupDecodedTexture(GSTexSetup &setup, const GSPageRange &frameTarget, const GSPageRange &zTarget,
+                              uint8_t (*indexFetch)(const GSTexSetup &, int, int));
+    void StampPages(const GSPageRange &range);
+    void StampAllPages();
+    void DrawSprite(const GSPrimitiveBatch &batch, const GSRasterSetup &setup);
+    void DrawTriangle(const GSPrimitiveBatch &batch, const GSRasterSetup &setup);
+    void DrawLine(const GSPrimitiveBatch &batch, const GSRasterSetup &setup);
 
     void PerformLocalToLocalTransfer();
     void PerformLocalToHostTransfer();
@@ -72,6 +99,15 @@ private:
     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
+    // The CLUT decoded to RGBA8888 for the last indexed draw (see DecodedPalette).
+    std::array<uint32_t, 256> m_palette{};
+    uint64_t m_paletteKey = ~0ull;
+    uint32_t m_clutGeneration = 0;
+    // Decoded textures and, per local-memory page, the m_writeStamp of its last write.
+    std::vector<GSDecodedTexture> m_decodedTextures;
+    std::array<uint64_t, 512> m_pageWriteStamp{};
+    uint64_t m_writeStamp = 1;
+    uint64_t m_textureUseCounter = 0;
     GSMem::TexturePageCache m_texturePageCache;
 
     GSTransferCommand m_transfer{};

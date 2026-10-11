@@ -39,9 +39,14 @@ namespace ps2recomp
             }
         }
 
-        std::string genFastWrite(int width, uint32_t address, const std::string &val)
+        std::string genFastWrite(int width, uint32_t address, const std::string &val, bool lean)
         {
             const std::string addr = addressLiteral(address);
+            if (lean)
+            {
+                // Plain RAM at a known address: no runtime path, no ps2TraceGuestWrite no-op.
+                return fmt::format("FAST_WRITE{}({}, {})", width, addr, val);
+            }
             if (width == 128)
             {
                 return fmt::format(
@@ -93,6 +98,16 @@ namespace ps2recomp
         {
             return fmt::format("runtime->Load{}(rdram, ctx, {})", width, addr);
         }
+        if (m_codeGenerator.m_lean.memoryHelpers)
+        {
+            // Inline fast path; the slow path publishes this pc (and the delay-slot state).
+            if (m_codeGenerator.m_leanInDelaySlot)
+            {
+                return fmt::format("PS2X_READ{}_DS({}, {}, {})", width, addr, addressLiteral(inst.address),
+                                   addressLiteral(m_codeGenerator.m_leanDelaySlotBranchPc));
+            }
+            return fmt::format("PS2X_READ{}({}, {})", width, addr, addressLiteral(inst.address));
+        }
         return fmt::format("READ{}({})", width, addr);
     }
 
@@ -110,17 +125,36 @@ namespace ps2recomp
             {
                 return fmt::format("runtime->Store{}(rdram, ctx, {}, {})", width, resolvedAddressExpr, value);
             }
-            return genFastWrite(width, resolvedAddress, value);
+            return genFastWrite(width, resolvedAddress, value, m_codeGenerator.m_lean.memoryHelpers);
         }
 
         if (inst.isMmio)
         {
             return fmt::format("runtime->Store{}(rdram, ctx, {}, {})", width, addr, value);
         }
+        if (m_codeGenerator.m_lean.memoryHelpers)
+        {
+            if (m_codeGenerator.m_leanInDelaySlot)
+            {
+                return fmt::format("PS2X_WRITE{}_DS({}, {}, {}, {})", width, addr, value, addressLiteral(inst.address),
+                                   addressLiteral(m_codeGenerator.m_leanDelaySlotBranchPc));
+            }
+            return fmt::format("PS2X_WRITE{}({}, {}, {})", width, addr, value, addressLiteral(inst.address));
+        }
         return fmt::format("WRITE{}({}, {})", width, addr, value);
     }
 
     std::string InstructionTranslator::translate(const Instruction &inst, const MemoryAccessHint &memoryHint)
+    {
+        std::string code = translateUnfolded(inst, memoryHint);
+        if (m_codeGenerator.m_lean.zeroFold)
+        {
+            code = CodeGenerator::leanFoldZeroRegisters(std::move(code));
+        }
+        return code;
+    }
+
+    std::string InstructionTranslator::translateUnfolded(const Instruction &inst, const MemoryAccessHint &memoryHint)
     {
         if (inst.isMMI)
         {
@@ -211,6 +245,9 @@ namespace ps2recomp
                 inst.rt,
                 genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
         case OPCODE_LDC2:
+            // LQC2: VF0 is hardwired to (0,0,0,1); a load into it still reads memory but is dropped.
+            if (inst.rt == 0)
+                return fmt::format("{{ const __m128i vf0Discard = {}; (void)vf0Discard; }}", genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
             return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
         case OPCODE_SDC2:
             return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
@@ -338,12 +375,32 @@ namespace ps2recomp
         case OPCODE_PREF:
             return "// PREF instruction (ignored)";
         case OPCODE_LL:
+            if (m_codeGenerator.m_lean.memoryHelpers)
+            {
+                return fmt::format(
+                    "{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
+                    "SET_GPR_S32(ctx, {}, (int32_t){}); "
+                    "ctx->llbit = 1; ctx->lladdr = addr; }}",
+                    inst.rs, inst.simmediate, inst.rt, translateMemoryRead(inst, {}, 32, "addr"));
+            }
             return fmt::format(
                 "{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
                 "SET_GPR_S32(ctx, {}, (int32_t)READ32(addr)); "
                 "ctx->llbit = 1; ctx->lladdr = addr; }}",
                 inst.rs, inst.simmediate, inst.rt);
         case OPCODE_SC:
+            if (m_codeGenerator.m_lean.memoryHelpers)
+            {
+                return fmt::format(
+                    "{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
+                    "if (ctx->llbit && ctx->lladdr == addr) {{ {}; "
+                    "SET_GPR_S32(ctx, {}, 1); }} "
+                    "else {{ SET_GPR_S32(ctx, {}, 0); }} "
+                    "ctx->llbit = 0; ctx->lladdr = 0; }}",
+                    inst.rs, inst.simmediate,
+                    translateMemoryWrite(inst, {}, 32, "addr", fmt::format("GPR_U32(ctx, {})", inst.rt)),
+                    inst.rt, inst.rt);
+            }
             return fmt::format(
                 "{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
                 "if (ctx->llbit && ctx->lladdr == addr) {{ WRITE32(addr, GPR_U32(ctx, {})); "

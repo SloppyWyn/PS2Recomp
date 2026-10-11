@@ -6,6 +6,8 @@
 #include "runtime/ee_scheduler.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -17,16 +19,47 @@ namespace ps2_stubs
         TODO_NAMED("sceSifCmdIntrHdlr", rdram, ctx, runtime);
     }
 
-    void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_ALIAS(sceSifLoadModule, ps2_syscalls::SifLoadModule, ::ps2_abi::Kind::Syscall)
+
+    // sceSifSendCmd(u_int cid, void *packet, int packet_size, void *src_extra, void *dest_extra,
+    //               int size_extra). Shadowed by ps2_syscalls::sceSifSendCmd when bound by name.
+    // dest and size are arguments 5-6, in t0/t1 (game's copy 0x11e530).
+    PS2_STUB_TYPED(int32_t, sceSifSendCmd, uint32_t cid, ps2_abi::gptr packet, uint32_t packetSize,
+                   ps2_abi::gptr srcAddr, ps2_abi::gptr dstAddr, uint32_t size)
     {
-        ps2_syscalls::SifLoadModule(rdram, ctx, runtime);
+        (void)cid;
+        (void)packet;
+        (void)packetSize;
+        if (size != 0u && srcAddr != 0u && dstAddr != 0u)
+        {
+            std::vector<uint8_t> payload(size);
+            bool valid = runtime != nullptr;
+            for (uint32_t i = 0; i < size; ++i)
+            {
+                const uint8_t *src = getConstMemPtr(rdram, srcAddr + i);
+                if (!src)
+                {
+                    valid = false;
+                    break;
+                }
+                payload[i] = *src;
+            }
+            if (!valid || !runtime->writeIopMemory(dstAddr, payload.data(), payload.size()))
+            {
+                return 0;
+            }
+        }
+
+        return 1;
     }
 
-    void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void sceSifSendCmd_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // Shadowed by ps2_syscalls::sceSifSendCmd when bound by name; kept in step with it.
+        // dest and size are arguments 5-6, in t0/t1 (game's copy 0x11e530).
         const uint32_t srcAddr = getRegU32(ctx, 7); // $a3
-        const uint32_t dstAddr = readStackU32(rdram, ctx, 16);
-        const uint32_t size = readStackU32(rdram, ctx, 20);
+        const uint32_t dstAddr = getRegU32(ctx, 8); // $t0
+        const uint32_t size = getRegU32(ctx, 9);    // $t1
         if (size != 0u && srcAddr != 0u && dstAddr != 0u)
         {
             std::vector<uint8_t> payload(size);
@@ -50,6 +83,8 @@ namespace ps2_stubs
 
         setReturnS32(ctx, 1);
     }
+
+    PS2_STUB_DISPATCH(sceSifSendCmd)
 
     namespace
     {
@@ -279,6 +314,7 @@ namespace ps2_stubs
             {
                 runtime->guestFree(packetAddress);
             };
+            invocation.completeTag = {GuestInvocationCompleteKind::GuestFree, packetAddress};
             runtime->eeScheduler().queueInvocation(std::move(invocation));
             return true;
         }
@@ -289,7 +325,15 @@ namespace ps2_stubs
         }
     }
 
-    void sceSifAddCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // sceSifAddCmdHandler(u_int cid, sceSifCmdHandler handler, void *data)
+    PS2_STUB_TYPED(int32_t, sceSifAddCmdHandler, uint32_t cid, ps2_abi::gptr handler, ps2_abi::gptr argument)
+    {
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        g_sifCmdHandlers[cid] = SifCmdHandler{handler, argument};
+        return 0;
+    }
+
+    void sceSifAddCmdHandler_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t cid = getRegU32(ctx, 4);
         const uint32_t handler = getRegU32(ctx, 5);
@@ -299,31 +343,59 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
-    void sceSifAllocIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifAddCmdHandler)
+    PS2_STUB_DEVIATION(sceSifAddCmdHandler, "SDK: void sceSifAddCmdHandler(u_int cid, sceSifCmdHandler handler, void *data); the handler writes 0 to v0 (kept)")
+
+    // void *sceSifAllocIopHeap(int size)
+    PS2_STUB_TYPED(ps2_abi::gptr, sceSifAllocIopHeap, int32_t size)
+    {
+        (void)rdram;
+        return runtime ? runtime->allocateIopMemory(static_cast<uint32_t>(size), 64u) : 0u;
+    }
+
+    void sceSifAllocIopHeap_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
         const uint32_t reqSize = getRegU32(ctx, 4);
         setReturnU32(ctx, runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u);
     }
 
-    void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifAllocIopHeap)
+
+    // void *sceSifAllocSysMemory(int type, int size, void *addr)
+    PS2_STUB_TYPED(ps2_abi::gptr, sceSifAllocSysMemory, int32_t type, int32_t size, ps2_abi::gptr addr)
+    {
+        (void)rdram;
+        (void)type;
+        (void)addr;
+        return runtime ? runtime->allocateIopMemory(static_cast<uint32_t>(size), 64u) : 0u;
+    }
+
+    void sceSifAllocSysMemory_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
         const uint32_t size = getRegU32(ctx, 5);
         setReturnU32(ctx, runtime ? runtime->allocateIopMemory(size, 64u) : 0u);
     }
 
-    void sceSifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifAllocSysMemory)
+
+    PS2_STUB_ALIAS(sceSifBindRpc, ps2_syscalls::SifBindRpc, ::ps2_abi::Kind::Syscall)
+
+    PS2_STUB_ALIAS(sceSifCheckStatRpc, ps2_syscalls::SifCheckStatRpc, ::ps2_abi::Kind::Syscall)
+
+    // int sceSifDmaStat(unsigned int id)
+    PS2_STUB_TYPED(int32_t, sceSifDmaStat, uint32_t id)
     {
-        ps2_syscalls::SifBindRpc(rdram, ctx, runtime);
+        (void)rdram;
+        (void)runtime;
+        (void)id;
+
+        // Transfers are applied immediately by sceSifSetDma in this runtime.
+        return -1;
     }
 
-    void sceSifCheckStatRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        ps2_syscalls::SifCheckStatRpc(rdram, ctx, runtime);
-    }
-
-    void sceSifDmaStat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void sceSifDmaStat_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
         (void)runtime;
@@ -333,64 +405,136 @@ namespace ps2_stubs
         setReturnS32(ctx, -1);
     }
 
-    void sceSifExecRequest(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifDmaStat)
+
+    // void sceSifExecRequest(sceSifServeData *sd)
+    PS2_STUB_TYPED(int32_t, sceSifExecRequest, ps2_abi::gptr sd)
+    {
+        (void)sd;
+        return 0;
+    }
+
+    void sceSifExecRequest_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
     }
 
-    void sceSifExitCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifExecRequest)
+    PS2_STUB_DEVIATION(sceSifExecRequest, "SDK: void sceSifExecRequest(sceSifServeData *sd); the handler writes 0 to v0 (kept)")
+
+    // void sceSifExitCmd(void)
+    PS2_STUB0_TYPED(int32_t, sceSifExitCmd)
+    {
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        seedDefaultSifRegsLocked();
+        return 0;
+    }
+
+    void sceSifExitCmd_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
         seedDefaultSifRegsLocked();
         setReturnS32(ctx, 0);
     }
 
-    void sceSifExitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifExitCmd)
+    PS2_STUB_DEVIATION(sceSifExitCmd, "SDK: void sceSifExitCmd(void); the handler writes 0 to v0 (kept)")
+
+    // void sceSifExitRpc(void)
+    PS2_STUB0_TYPED(int32_t, sceSifExitRpc)
+    {
+        return 0;
+    }
+
+    void sceSifExitRpc_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
     }
 
-    void sceSifFreeIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifExitRpc)
+    PS2_STUB_DEVIATION(sceSifExitRpc, "SDK: void sceSifExitRpc(void); the handler writes 0 to v0 (kept)")
+
+    // int sceSifFreeIopHeap(void *addr)
+    PS2_STUB_TYPED(int32_t, sceSifFreeIopHeap, ps2_abi::gptr addr)
+    {
+        (void)rdram;
+        return runtime && runtime->freeIopMemory(addr) ? 0 : -1;
+    }
+
+    void sceSifFreeIopHeap_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
         const uint32_t addr = getRegU32(ctx, 4);
         setReturnS32(ctx, runtime && runtime->freeIopMemory(addr) ? 0 : -1);
     }
 
-    void sceSifFreeSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifFreeIopHeap)
+
+    // int sceSifFreeSysMemory(void *addr)
+    PS2_STUB_TYPED(int32_t, sceSifFreeSysMemory, ps2_abi::gptr addr)
+    {
+        (void)rdram;
+        return runtime && runtime->freeIopMemory(addr) ? 0 : -1;
+    }
+
+    void sceSifFreeSysMemory_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
         const uint32_t addr = getRegU32(ctx, 4);
         setReturnS32(ctx, runtime && runtime->freeIopMemory(addr) ? 0 : -1);
     }
 
-    void sceSifGetDataTable(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifFreeSysMemory)
+
+    // unsigned int *sceSifGetDataTable(void)
+    PS2_STUB0_TYPED(ps2_abi::gptr, sceSifGetDataTable)
+    {
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        return g_sifCmdBuffer;
+    }
+
+    void sceSifGetDataTable_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
         setReturnU32(ctx, g_sifCmdBuffer);
     }
 
-    void sceSifGetIopAddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifGetDataTable)
+
+    // sceSifGetIopAddr(addr): returns its argument (identity mapping).
+    PS2_STUB_TYPED(uint32_t, sceSifGetIopAddr, uint32_t addr)
+    {
+        return addr;
+    }
+
+    void sceSifGetIopAddr_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnU32(ctx, getRegU32(ctx, 4));
     }
 
-    void sceSifGetNextRequest(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifGetIopAddr)
+
+    // sceSifServeData *sceSifGetNextRequest(sceSifQueueData *qd)
+    PS2_STUB_TYPED(ps2_abi::gptr, sceSifGetNextRequest, ps2_abi::gptr qd)
+    {
+        (void)qd;
+        return 0u;
+    }
+
+    void sceSifGetNextRequest_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
     }
 
-    void sceSifGetOtherData(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        const uint32_t rdAddr = getRegU32(ctx, 4);
-        const uint32_t srcAddr = getRegU32(ctx, 5);
-        const uint32_t dstAddr = getRegU32(ctx, 6);
-        const int32_t sizeSigned = static_cast<int32_t>(getRegU32(ctx, 7));
+    PS2_STUB_DISPATCH(sceSifGetNextRequest)
 
+    // The body of sceSifGetOtherData after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sifGetOtherDataBody(uint8_t *rdram, PS2Runtime *runtime, uint32_t rdAddr, uint32_t srcAddr,
+                                       uint32_t dstAddr, int32_t sizeSigned)
+    {
         if (sizeSigned <= 0)
         {
-            setReturnS32(ctx, 0);
-            return;
+            return 0;
         }
 
         const uint32_t size = static_cast<uint32_t>(sizeSigned);
@@ -403,8 +547,7 @@ namespace ps2_stubs
                           << std::hex << size << std::dec << std::endl;
                 ++warnCount;
             }
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         if (runtime)
@@ -435,8 +578,7 @@ namespace ps2_stubs
                 });
                 ++warnCount;
             }
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         // SifRpcReceiveData_t keeps src/dest/size at offsets 0x10/0x14/0x18.
@@ -458,12 +600,33 @@ namespace ps2_stubs
                                                             });
         }
 
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void sceSifGetReg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceSifGetOtherData(sceSifReceiveData *rd, void *src, void *dest, int size, unsigned int mode)
+    PS2_STUB_TYPED(int32_t, sceSifGetOtherData, ps2_abi::gptr rd, ps2_abi::gptr src, ps2_abi::gptr dest, int32_t size,
+                   uint32_t mode)
     {
-        const uint32_t reg = getRegU32(ctx, 4);
+        (void)ctx;
+        (void)mode;
+        return sifGetOtherDataBody(rdram, runtime, rd, src, dest, size);
+    }
+
+    void sceSifGetOtherData_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t rdAddr = getRegU32(ctx, 4);
+        const uint32_t srcAddr = getRegU32(ctx, 5);
+        const uint32_t dstAddr = getRegU32(ctx, 6);
+        const int32_t sizeSigned = static_cast<int32_t>(getRegU32(ctx, 7));
+
+        setReturnS32(ctx, sifGetOtherDataBody(rdram, runtime, rdAddr, srcAddr, dstAddr, sizeSigned));
+    }
+
+    PS2_STUB_DISPATCH(sceSifGetOtherData)
+
+    // The body of sceSifGetReg after decoding (shared by both forms); returns v0.
+    static uint32_t sifGetRegBody(R5900Context *ctx, uint32_t reg)
+    {
         uint32_t value = 0u;
         bool shouldLog = false;
         {
@@ -491,10 +654,41 @@ namespace ps2_stubs
                 std::cerr.flags(flags);
             });
         }
-        setReturnU32(ctx, value);
+        return value;
     }
 
-    void sceSifGetSreg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // unsigned int sceSifGetReg(unsigned int reg)
+    PS2_STUB_TYPED(uint32_t, sceSifGetReg, uint32_t reg)
+    {
+        (void)rdram;
+        (void)runtime;
+        return sifGetRegBody(ctx, reg);
+    }
+
+    void sceSifGetReg_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t reg = getRegU32(ctx, 4);
+        setReturnU32(ctx, sifGetRegBody(ctx, reg));
+    }
+
+    PS2_STUB_DISPATCH(sceSifGetReg)
+
+    // unsigned int sceSifGetSreg(int reg)
+    PS2_STUB_TYPED(uint32_t, sceSifGetSreg, int32_t reg)
+    {
+        uint32_t value = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+            auto it = g_sifSregs.find(static_cast<uint32_t>(reg));
+            if (it != g_sifSregs.end())
+            {
+                value = it->second;
+            }
+        }
+        return value;
+    }
+
+    void sceSifGetSreg_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t reg = getRegU32(ctx, 4);
         uint32_t value = 0u;
@@ -509,66 +703,118 @@ namespace ps2_stubs
         setReturnU32(ctx, value);
     }
 
-    void sceSifInitCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifGetSreg)
+
+    // void sceSifInitCmd(void)
+    PS2_STUB0_TYPED(int32_t, sceSifInitCmd)
+    {
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        g_sifCmdInitialized = true;
+        return 0;
+    }
+
+    void sceSifInitCmd_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
         g_sifCmdInitialized = true;
         setReturnS32(ctx, 0);
     }
 
-    void sceSifInitIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifInitCmd)
+    PS2_STUB_DEVIATION(sceSifInitCmd, "SDK: void sceSifInitCmd(void); the handler writes 0 to v0 (kept)")
+
+    // int sceSifInitIopHeap(void)
+    PS2_STUB0_TYPED(int32_t, sceSifInitIopHeap)
+    {
+        // The physical IOP allocator is initialized by IopSubsystem::reset().
+        return 0;
+    }
+
+    void sceSifInitIopHeap_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         // The physical IOP allocator is initialized by IopSubsystem::reset().
         setReturnS32(ctx, 0);
     }
 
-    void sceSifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifInitIopHeap)
+
+    PS2_STUB_ALIAS(sceSifInitRpc, ps2_syscalls::SifInitRpc, ::ps2_abi::Kind::Syscall)
+
+    // int sceSifIsAliveIop(void)
+    PS2_STUB0_TYPED(int32_t, sceSifIsAliveIop)
     {
-        ps2_syscalls::SifInitRpc(rdram, ctx, runtime);
+        return 1;
     }
 
-    void sceSifIsAliveIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void sceSifIsAliveIop_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 1);
     }
 
-    void sceSifLoadElf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifIsAliveIop)
+
+    PS2_STUB_ALIAS(sceSifLoadElf, ps2_syscalls::sceSifLoadElf, ::ps2_abi::Kind::Syscall)
+
+    PS2_STUB_ALIAS(sceSifLoadElfPart, ps2_syscalls::sceSifLoadElfPart, ::ps2_abi::Kind::Syscall)
+
+    // void sceSifLoadFileReset(void)
+    PS2_STUB0_TYPED(int32_t, sceSifLoadFileReset)
     {
-        ps2_syscalls::sceSifLoadElf(rdram, ctx, runtime);
+        return 0;
     }
 
-    void sceSifLoadElfPart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        ps2_syscalls::sceSifLoadElfPart(rdram, ctx, runtime);
-    }
-
-    void sceSifLoadFileReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        setReturnS32(ctx, 0);
-    }
-
-    void sceSifLoadIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void sceSifLoadFileReset_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
     }
 
-    void sceSifLoadModuleBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifLoadFileReset)
+    PS2_STUB_DEVIATION(sceSifLoadFileReset, "SDK: void sceSifLoadFileReset(void); the handler writes 0 to v0 (kept)")
+
+    // int sceSifLoadIopHeap(const char *fname, void *addr)
+    PS2_STUB_TYPED(int32_t, sceSifLoadIopHeap, ps2_abi::gptr fname, ps2_abi::gptr addr)
     {
-        ps2_syscalls::sceSifLoadModuleBuffer(rdram, ctx, runtime);
+        (void)fname;
+        (void)addr;
+        return 0;
     }
 
-    void sceSifRebootIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void sceSifLoadIopHeap_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, 0);
+    }
+
+    PS2_STUB_DISPATCH(sceSifLoadIopHeap)
+
+    PS2_STUB_ALIAS(sceSifLoadModuleBuffer, ps2_syscalls::sceSifLoadModuleBuffer, ::ps2_abi::Kind::Syscall)
+
+    // int sceSifRebootIop(const char *img)
+    PS2_STUB_TYPED(int32_t, sceSifRebootIop, ps2_abi::gptr img)
+    {
+        (void)img;
+        PS2IopTransport::reset(runtime);
+        return 1;
+    }
+
+    void sceSifRebootIop_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         PS2IopTransport::reset(runtime);
         setReturnS32(ctx, 1);
     }
 
-    void sceSifRegisterRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifRebootIop)
+
+    PS2_STUB_ALIAS(sceSifRegisterRpc, ps2_syscalls::SifRegisterRpc, ::ps2_abi::Kind::Syscall)
+
+    // void sceSifRemoveCmdHandler(unsigned int cid)
+    PS2_STUB_TYPED(int32_t, sceSifRemoveCmdHandler, uint32_t cid)
     {
-        ps2_syscalls::SifRegisterRpc(rdram, ctx, runtime);
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        g_sifCmdHandlers.erase(cid);
+        return 0;
     }
 
-    void sceSifRemoveCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void sceSifRemoveCmdHandler_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t cid = getRegU32(ctx, 4);
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
@@ -576,28 +822,60 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
-    void sceSifRemoveRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifRemoveCmdHandler)
+    PS2_STUB_DEVIATION(sceSifRemoveCmdHandler, "SDK: void sceSifRemoveCmdHandler(unsigned int cid); the handler writes 0 to v0 (kept)")
+
+    PS2_STUB_ALIAS(sceSifRemoveRpc, ps2_syscalls::SifRemoveRpc, ::ps2_abi::Kind::Syscall)
+
+    PS2_STUB_ALIAS(sceSifRemoveRpcQueue, ps2_syscalls::SifRemoveRpcQueue, ::ps2_abi::Kind::Syscall)
+
+    // int sceSifResetIop(const char *arg, int mode): the game's copy (bound at 0x124748) reads a0
+    // and a1; the handler resets the IOP whatever they say.
+    PS2_STUB_TYPED(int32_t, sceSifResetIop, ps2_abi::gptr arg, int32_t mode)
     {
-        ps2_syscalls::SifRemoveRpc(rdram, ctx, runtime);
+        (void)arg;
+        (void)mode;
+        PS2IopTransport::reset(runtime);
+        return 1;
     }
 
-    void sceSifRemoveRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        ps2_syscalls::SifRemoveRpcQueue(rdram, ctx, runtime);
-    }
-
-    void sceSifResetIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void sceSifResetIop_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         PS2IopTransport::reset(runtime);
         setReturnS32(ctx, 1);
     }
 
-    void sceSifRpcLoop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifResetIop)
+
+    // void sceSifRpcLoop(sceSifQueueData *qd)
+    PS2_STUB_TYPED(int32_t, sceSifRpcLoop, ps2_abi::gptr qd)
+    {
+        (void)qd;
+        return 0;
+    }
+
+    void sceSifRpcLoop_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
     }
 
-    void sceSifSetCmdBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifRpcLoop)
+    PS2_STUB_DEVIATION(sceSifRpcLoop, "SDK: void sceSifRpcLoop(sceSifQueueData *qd); the handler writes 0 to v0 (kept)")
+
+    // sceSifCmdData *sceSifSetCmdBuffer(sceSifCmdData *db, int size): returns the previous buffer.
+    PS2_STUB_TYPED(ps2_abi::gptr, sceSifSetCmdBuffer, ps2_abi::gptr newBuffer, int32_t size)
+    {
+        (void)size;
+        uint32_t prev = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+            prev = g_sifCmdBuffer;
+            g_sifCmdBuffer = newBuffer;
+        }
+        return prev;
+    }
+
+    void sceSifSetCmdBuffer_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t newBuffer = getRegU32(ctx, 4);
         uint32_t prev = 0u;
@@ -609,59 +887,82 @@ namespace ps2_stubs
         setReturnU32(ctx, prev);
     }
 
-    void isceSifSetDChain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifSetCmdBuffer)
+
+    PS2_STUB_ALIAS(isceSifSetDChain, sceSifSetDChain, ::ps2_abi::Kind::Stub)
+
+    PS2_STUB_ALIAS(isceSifSetDma, sceSifSetDma, ::ps2_abi::Kind::Stub)
+
+    // void sceSifSetDChain(void)
+    PS2_STUB0_TYPED(int32_t, sceSifSetDChain)
     {
-        sceSifSetDChain(rdram, ctx, runtime);
+        (void)rdram;
+        (void)runtime;
+        return 0;
     }
 
-    void isceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        sceSifSetDma(rdram, ctx, runtime);
-    }
-
-    void sceSifSetDChain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void sceSifSetDChain_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
         (void)runtime;
         setReturnS32(ctx, 0);
     }
 
-    void sceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifSetDChain)
+    PS2_STUB_DEVIATION(sceSifSetDChain, "SDK: void sceSifSetDChain(void); the handler writes 0 to v0 (kept)")
+
+    // The body of sceSifSetDma after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sifSetDmaBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t dmatAddr, uint32_t count)
     {
-        const uint32_t dmatAddr = getRegU32(ctx, 4);
-        const uint32_t count = getRegU32(ctx, 5);
-
-        const uint32_t listAddr = getRegU32(ctx, 4);
         PS2_IF_AGRESSIVE_LOGS({
-            std::cerr << "[sceSifSetDma:CALL] pc=0x" << std::hex << ctx->pc
-                      << " ra=0x" << getRegU32(ctx, 31)
-                      << " list=0x" << listAddr
-                      << " count=" << std::dec << count
-                      << std::endl;
-
-            for (uint32_t i = 0; i < count; ++i)
+            // Capped like the other per-call logs (a streaming movie calls this ~35 times
+            // a second): 32 calls by default, PS2X_SIF_LOG_LIMIT=N raises the cap to N.
+            static const uint32_t s_setDmaLogLimit = []() -> uint32_t
             {
-                const uint32_t desc = listAddr + i * 16;
-                const uint32_t src = READ32(desc + 0);
-                const uint32_t dst = READ32(desc + 4);
-                const uint32_t size = READ32(desc + 8);
-                const uint32_t attr = READ32(desc + 12);
-
-                std::cerr << "[sceSifSetDma:DESC] i=" << i
-                          << " src=0x" << std::hex << src
-                          << " dst=0x" << dst
-                          << " size=0x" << size
-                          << " attr=0x" << attr
-                          << " pc=0x" << ctx->pc
+                const char *value = std::getenv("PS2X_SIF_LOG_LIMIT");
+                const unsigned long parsed = (value && *value) ? std::strtoul(value, nullptr, 10) : 0ul;
+                return parsed == 0ul ? 32u : (parsed > 0xFFFFFFFul ? 0xFFFFFFFu : static_cast<uint32_t>(parsed));
+            }();
+            static std::atomic<uint32_t> s_setDmaLogCount{0u};
+            const uint32_t logIndex = s_setDmaLogCount.fetch_add(1u, std::memory_order_relaxed);
+            if (logIndex == s_setDmaLogLimit)
+            {
+                std::cerr << "[sceSifSetDma:CALL] log cap of " << s_setDmaLogLimit
+                          << " calls reached; PS2X_SIF_LOG_LIMIT=N raises it" << std::endl;
+            }
+            if (logIndex < s_setDmaLogLimit)
+            {
+                std::cerr << "[sceSifSetDma:CALL] pc=0x" << std::hex << ctx->pc
                           << " ra=0x" << getRegU32(ctx, 31)
-                          << std::dec << std::endl;
+                          << " list=0x" << dmatAddr
+                          << " count=" << std::dec << count
+                          << std::endl;
+
+                // At most the 32 descriptors the call accepts: a bogus count (it is rejected
+                // below) once logged millions of lines here.
+                for (uint32_t i = 0; i < count && i < 32u; ++i)
+                {
+                    const uint32_t desc = dmatAddr + i * 16;
+                    const uint32_t src = READ32(desc + 0);
+                    const uint32_t dst = READ32(desc + 4);
+                    const uint32_t size = READ32(desc + 8);
+                    const uint32_t attr = READ32(desc + 12);
+
+                    std::cerr << "[sceSifSetDma:DESC] i=" << i
+                              << " src=0x" << std::hex << src
+                              << " dst=0x" << dst
+                              << " size=0x" << size
+                              << " attr=0x" << attr
+                              << " pc=0x" << ctx->pc
+                              << " ra=0x" << getRegU32(ctx, 31)
+                              << std::dec << std::endl;
+                }
             }
         });
 
         if (!dmatAddr || count == 0u || count > 32u)
         {
-            setReturnS32(ctx, 0);
-            return;
+            return 0;
         }
 
         std::array<Ps2SifDmaTransfer, 32u> pending{};
@@ -746,24 +1047,49 @@ namespace ps2_stubs
                 });
                 ++warnCount;
             }
-            setReturnS32(ctx, 0);
-            return;
+            return 0;
         }
 
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
 
-        setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
+        return static_cast<int32_t>(allocateSifDmaTransferId());
     }
 
-    void sceSifSetIopAddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // unsigned int sceSifSetDma(sceSifDmaData *sdd, int len)
+    PS2_STUB_TYPED(uint32_t, sceSifSetDma, ps2_abi::gptr sdd, int32_t len)
+    {
+        return static_cast<uint32_t>(sifSetDmaBody(rdram, ctx, runtime, sdd, static_cast<uint32_t>(len)));
+    }
+
+    void sceSifSetDma_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t dmatAddr = getRegU32(ctx, 4);
+        const uint32_t count = getRegU32(ctx, 5);
+
+        const uint32_t listAddr = getRegU32(ctx, 4);
+        (void)listAddr;
+        setReturnS32(ctx, sifSetDmaBody(rdram, ctx, runtime, dmatAddr, count));
+    }
+
+    PS2_STUB_DISPATCH(sceSifSetDma)
+
+    // sceSifSetIopAddr(addr, value): returns the second argument.
+    PS2_STUB_TYPED(uint32_t, sceSifSetIopAddr, uint32_t addr, uint32_t value)
+    {
+        (void)addr;
+        return value;
+    }
+
+    void sceSifSetIopAddr_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnU32(ctx, getRegU32(ctx, 5));
     }
 
-    void sceSifSetReg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifSetIopAddr)
+
+    // The body of sceSifSetReg after decoding (shared by both forms); returns v0 (the previous value).
+    static uint32_t sifSetRegBody(R5900Context *ctx, uint32_t reg, uint32_t value)
     {
-        const uint32_t reg = getRegU32(ctx, 4);
-        const uint32_t value = getRegU32(ctx, 5);
         uint32_t prev = 0u;
         bool shouldLog = false;
         {
@@ -793,15 +1119,45 @@ namespace ps2_stubs
                 std::cerr.flags(flags);
             });
         }
-        setReturnU32(ctx, prev);
+        return prev;
     }
 
-    void sceSifSetRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // unsigned int sceSifSetReg(unsigned int reg, unsigned int value)
+    PS2_STUB_TYPED(uint32_t, sceSifSetReg, uint32_t reg, uint32_t value)
     {
-        ps2_syscalls::SifSetRpcQueue(rdram, ctx, runtime);
+        (void)rdram;
+        (void)runtime;
+        return sifSetRegBody(ctx, reg, value);
     }
 
-    void sceSifSetSreg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void sceSifSetReg_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t reg = getRegU32(ctx, 4);
+        const uint32_t value = getRegU32(ctx, 5);
+        setReturnU32(ctx, sifSetRegBody(ctx, reg, value));
+    }
+
+    PS2_STUB_DISPATCH(sceSifSetReg)
+
+    PS2_STUB_ALIAS(sceSifSetRpcQueue, ps2_syscalls::SifSetRpcQueue, ::ps2_abi::Kind::Syscall)
+
+    // unsigned int sceSifSetSreg(int reg, unsigned int value): returns the previous value.
+    PS2_STUB_TYPED(uint32_t, sceSifSetSreg, int32_t reg, uint32_t value)
+    {
+        uint32_t prev = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+            auto it = g_sifSregs.find(static_cast<uint32_t>(reg));
+            if (it != g_sifSregs.end())
+            {
+                prev = it->second;
+            }
+            g_sifSregs[static_cast<uint32_t>(reg)] = value;
+        }
+        return prev;
+    }
+
+    void sceSifSetSreg_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t reg = getRegU32(ctx, 4);
         const uint32_t value = getRegU32(ctx, 5);
@@ -818,7 +1174,22 @@ namespace ps2_stubs
         setReturnU32(ctx, prev);
     }
 
-    void sceSifSetSysCmdBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifSetSreg)
+
+    // sceSifCmdData *sceSifSetSysCmdBuffer(sceSifCmdData *db, int size): returns the previous buffer.
+    PS2_STUB_TYPED(ps2_abi::gptr, sceSifSetSysCmdBuffer, ps2_abi::gptr newBuffer, int32_t size)
+    {
+        (void)size;
+        uint32_t prev = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+            prev = g_sifSysCmdBuffer;
+            g_sifSysCmdBuffer = newBuffer;
+        }
+        return prev;
+    }
+
+    void sceSifSetSysCmdBuffer_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t newBuffer = getRegU32(ctx, 4);
         uint32_t prev = 0u;
@@ -830,18 +1201,86 @@ namespace ps2_stubs
         setReturnU32(ctx, prev);
     }
 
-    void sceSifStopDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifSetSysCmdBuffer)
+
+    // void sceSifStopDma(void)
+    PS2_STUB0_TYPED(int32_t, sceSifStopDma)
+    {
+        return 0;
+    }
+
+    void sceSifStopDma_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
     }
 
-    void sceSifSyncIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifStopDma)
+    PS2_STUB_DEVIATION(sceSifStopDma, "SDK: void sceSifStopDma(void); the handler writes 0 to v0 (kept)")
+
+    // int sceSifSyncIop(void)
+    PS2_STUB0_TYPED(int32_t, sceSifSyncIop)
+    {
+        return 1;
+    }
+
+    void sceSifSyncIop_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 1);
     }
 
-    void sceSifWriteBackDCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifSyncIop)
+
+    // void sceSifWriteBackDCache(void *ptr, int size)
+    PS2_STUB_TYPED(int32_t, sceSifWriteBackDCache, ps2_abi::gptr ptr, int32_t size)
+    {
+        (void)ptr;
+        (void)size;
+        return 0;
+    }
+
+    void sceSifWriteBackDCache_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
+    }
+
+    PS2_STUB_DISPATCH(sceSifWriteBackDCache)
+    PS2_STUB_DEVIATION(sceSifWriteBackDCache, "SDK: void sceSifWriteBackDCache(void *ptr, int size); the handler writes 0 to v0 (kept)")
+}
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    void saveSif(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+        {
+            std::lock_guard<std::mutex> lock(g_sifDmaTransferMutex);
+            w.u32(g_nextSifDmaTransferId);
+        }
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        w.podMap(g_sifRegs);
+        w.podMap(g_sifSregs);
+        w.podMap(g_sifCmdHandlers);
+        w.u32(g_sifCmdBuffer);
+        w.u32(g_sifSysCmdBuffer);
+        w.boolean(g_sifCmdInitialized);
+    }
+
+    void loadSif(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
+        {
+            std::lock_guard<std::mutex> lock(g_sifDmaTransferMutex);
+            g_nextSifDmaTransferId = r.u32();
+        }
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        r.podMap(g_sifRegs);
+        r.podMap(g_sifSregs);
+        r.podMap(g_sifCmdHandlers);
+        g_sifCmdBuffer = r.u32();
+        g_sifSysCmdBuffer = r.u32();
+        g_sifCmdInitialized = r.boolean();
     }
 }

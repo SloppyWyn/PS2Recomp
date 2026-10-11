@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Audio.h"
+#include "runtime/ee_scheduler.h"
 
 namespace ps2_stubs
 {
@@ -16,6 +17,8 @@ namespace ps2_stubs
         constexpr uint32_t kLibSdTransModeIo = 0x08u;
         constexpr uint32_t kLibSdTransDirectionMask = 0x03u;
         constexpr uint32_t kLibSdTransStop = 0x02u;
+        constexpr uint32_t kLibSdTransWrite = 0x00u;     // SD_TRANS_MODE_WRITE: IOP memory -> SPU2 (playback)
+        constexpr uint32_t kLibSdTransWriteFrom = 0x03u; // SD_TRANS_MODE_WRITE_FROM: the same, from a given point
         constexpr uint32_t kLibSdTransLoop = 0x10u;
 
         struct VoiceTransferState
@@ -37,7 +40,75 @@ namespace ps2_stubs
             uint16_t mode = 0u;
             bool active = false;
             bool loop = false;
+            // Guest-clock position of the transfer (see blockTransferAdvance).
+            bool clocked = false;
+            uint64_t clockCycle = 0u;
+            uint64_t clockRemainder = 0u;
+            bool finished = false; // a one-shot transfer that reached its end
         };
+
+        // SPU2 block transfer (AutoDMA): the core's input FIFO takes 48,000 stereo 16-bit
+        // samples per second, 1024 bytes (256 samples per channel) per DMA block.
+        constexpr uint64_t kBlockTransBytesPerSecond = 48000u * 2u * 2u;
+        constexpr uint64_t kEeClockHz = 294912000u;
+
+        // PS2X_SD_BLOCK_CLOCK=0: the status poll advances one block per call (the old model;
+        // A/B only). Also the model without a runtime (unit tests that pass none), and for
+        // SD_TRANS_MODE_READ (SPU2 -> IOP capture): the clock is the playback (write) rate;
+        // the capture rate is not verified and no game here uses it, so reads keep the old model.
+        bool blockTransferClockEnabled()
+        {
+            static const bool enabled = []
+            {
+                const char *v = std::getenv("PS2X_SD_BLOCK_CLOCK");
+                return !(v && v[0] == '0' && v[1] == '\0');
+            }();
+            return enabled;
+        }
+
+        // Moves the transfer position on by the blocks the hardware would have sent since the
+        // last poll (guest EE clock), or by one block per poll without a clock.
+        // A one-shot transfer (no SD_BLOCK_LOOP) stops at the end of its buffer instead of
+        // wrapping; sceSdBlockTransStatus then reports no transfer in progress (address 0, as
+        // libsd reads it from the stopped DMA channel).
+        void blockTransferMove(BlockTransferState &transfer, uint64_t bytes)
+        {
+            const uint64_t raw = static_cast<uint64_t>(transfer.offset) + bytes;
+            if (!transfer.loop && raw >= transfer.size)
+            {
+                transfer.offset = transfer.size;
+                transfer.active = false;
+                transfer.finished = true;
+                return;
+            }
+            transfer.offset = static_cast<uint32_t>(raw % transfer.size);
+        }
+
+        void blockTransferAdvance(BlockTransferState &transfer, const uint64_t *nowCycle)
+        {
+            const uint32_t direction = transfer.mode & kLibSdTransDirectionMask;
+            const bool playback = direction == kLibSdTransWrite || direction == kLibSdTransWriteFrom;
+            if (nowCycle == nullptr || !blockTransferClockEnabled() || !playback)
+            {
+                blockTransferMove(transfer, kAudioTransferUnit);
+                return;
+            }
+            if (!transfer.clocked || *nowCycle < transfer.clockCycle)
+            {
+                transfer.clocked = true;
+                transfer.clockCycle = *nowCycle;
+                transfer.clockRemainder = 0u;
+                return;
+            }
+            constexpr uint64_t kCyclesPerBlockScaled = kEeClockHz * kAudioTransferUnit;
+            const uint64_t elapsed = *nowCycle - transfer.clockCycle;
+            transfer.clockCycle = *nowCycle;
+            const uint64_t scaled = elapsed * kBlockTransBytesPerSecond + transfer.clockRemainder;
+            const uint64_t blocks = scaled / kCyclesPerBlockScaled;
+            transfer.clockRemainder = scaled % kCyclesPerBlockScaled;
+            blockTransferMove(transfer, transfer.loop ? (blocks % transfer.size) * kAudioTransferUnit
+                                                      : blocks * kAudioTransferUnit);
+        }
 
         struct AudioStubState
         {
@@ -56,6 +127,10 @@ namespace ps2_stubs
 
         uint32_t currentBlockStatus(const BlockTransferState &transfer)
         {
+            if (transfer.finished)
+            {
+                return 0u;
+            }
             const uint32_t position = (transfer.base + transfer.offset) & kAudioPositionMask;
             const uint32_t halfSize = transfer.size / 2u;
             const uint32_t bank = (transfer.loop && halfSize != 0u && transfer.offset >= halfSize) ? 1u : 0u;
@@ -74,24 +149,10 @@ namespace ps2_stubs
         TODO_NAMED("sceSdCallBack", rdram, ctx, runtime);
     }
 
-    void sceSdRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // sceSdRemote after decoding, shared by the typed and the legacy form; returns v0.
+    static uint32_t sdRemoteBody(uint32_t cmd, uint32_t cmdArg0, uint32_t cmdArg1, uint32_t arg4, uint32_t arg5,
+                                 uint32_t arg6, const uint64_t *nowCycle)
     {
-        (void)runtime;
-
-        const uint32_t cmd = getRegU32(ctx, 5);
-        const uint32_t cmdArg0 = getRegU32(ctx, 6);
-        const uint32_t cmdArg1 = getRegU32(ctx, 7);
-        const uint32_t sp = getRegU32(ctx, 29);
-        const uint32_t arg4Reg = getRegU32(ctx, 8);
-        const uint32_t arg5Reg = getRegU32(ctx, 9);
-        const uint32_t arg6Reg = getRegU32(ctx, 10);
-        const uint32_t arg4Stk = FAST_READ32(sp + 0x10u);
-        const uint32_t arg5Stk = FAST_READ32(sp + 0x14u);
-        const uint32_t arg6Stk = FAST_READ32(sp + 0x18u);
-        const uint32_t arg4 = (arg4Reg != 0u) ? arg4Reg : arg4Stk;
-        const uint32_t arg5 = (arg5Reg != 0u) ? arg5Reg : arg5Stk;
-        const uint32_t arg6 = (arg6Reg != 0u) ? arg6Reg : arg6Stk;
-
         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
         g_audio_stub_state.initialized = true;
         const uint32_t core = cmdArg0 & (kLibSdCoreCount - 1u);
@@ -144,6 +205,9 @@ namespace ps2_stubs
                 blockTransfer.offset = (pauseOffset < blockTransfer.size) ? pauseOffset : 0u;
                 blockTransfer.statusTraceCount = 0u;
                 blockTransfer.active = true;
+                blockTransfer.clocked = nowCycle != nullptr;
+                blockTransfer.clockCycle = nowCycle != nullptr ? *nowCycle : 0u;
+                blockTransfer.clockRemainder = 0u;
                 returnValue = 0u;
             }
             else
@@ -169,7 +233,7 @@ namespace ps2_stubs
         {
             if (blockTransfer.active && blockTransfer.size != 0u)
             {
-                blockTransfer.offset = (blockTransfer.offset + kAudioTransferUnit) % blockTransfer.size;
+                blockTransferAdvance(blockTransfer, nowCycle);
                 if (blockTransfer.statusTraceCount < 32u)
                 {
                     PS2_IF_AGRESSIVE_LOGS({
@@ -191,10 +255,57 @@ namespace ps2_stubs
             returnValue = 0u;
         }
 
-        setReturnU32(ctx, returnValue);
+        return returnValue;
     }
 
-    void sceSdRemoteInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // sceSdRemote(int arg, int command, ...): libsdr's variadic RPC call. The game's copy (0x127688)
+    // takes a0-t3 and copies a2..t3 into the RPC buffer, nothing from the caller's stack, so it is
+    // declared with seven fixed integer arguments (the varargs continue the a0-t3 sequence): a0
+    // (`arg`, the RPC wait mode) is not used by the runtime; t3 is not read either.
+    PS2_STUB_TYPED(uint32_t, sceSdRemote, uint32_t arg, uint32_t cmd, uint32_t cmdArg0, uint32_t cmdArg1, uint32_t arg4,
+                   uint32_t arg5, uint32_t arg6)
+    {
+        (void)rdram;
+        (void)ctx;
+        (void)arg;
+        const uint64_t now = runtime != nullptr ? runtime->eeScheduler().eeCycle() : 0u;
+        return sdRemoteBody(cmd, cmdArg0, cmdArg1, arg4, arg5, arg6, runtime != nullptr ? &now : nullptr);
+    }
+
+    void sceSdRemote_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+
+        const uint32_t cmd = getRegU32(ctx, 5);
+        const uint32_t cmdArg0 = getRegU32(ctx, 6);
+        const uint32_t cmdArg1 = getRegU32(ctx, 7);
+        // Arguments 5-7 are in t0-t2 (EE ABI). The game's copy (0x127688) copies a2..t3 into the
+        // RPC buffer and reads nothing from the caller's stack, so a 0 in t0-t2 is a real 0.
+        const uint32_t arg4 = getRegU32(ctx, 8);
+        const uint32_t arg5 = getRegU32(ctx, 9);
+        const uint32_t arg6 = getRegU32(ctx, 10);
+
+        const uint64_t now = runtime != nullptr ? runtime->eeScheduler().eeCycle() : 0u;
+        setReturnU32(ctx, sdRemoteBody(cmd, cmdArg0, cmdArg1, arg4, arg5, arg6, runtime != nullptr ? &now : nullptr));
+    }
+
+    PS2_STUB_DISPATCH(sceSdRemote)
+    PS2_STUB_DEVIATION(sceSdRemote, "SDK: int sceSdRemote(int arg, int command, ...), variadic; declared with 7 fixed integer arguments (the varargs continue a0-t3; the game's copy reads nothing from the stack) and a u32 return, as the old decoding")
+
+    // int sceSdRemoteInit(void) (libsdr)
+    PS2_STUB0_TYPED(int32_t, sceSdRemoteInit)
+    {
+        (void)rdram;
+        (void)runtime;
+
+        std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
+        resetAudioStubStateUnlocked();
+        g_audio_stub_state.initialized = true;
+        return 0;
+    }
+
+    void sceSdRemoteInit_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
         (void)runtime;
@@ -204,6 +315,8 @@ namespace ps2_stubs
         g_audio_stub_state.initialized = true;
         setReturnS32(ctx, 0);
     }
+
+    PS2_STUB_DISPATCH(sceSdRemoteInit)
 
     void sceSdTransToIOP(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -260,10 +373,19 @@ namespace ps2_stubs
         TODO_NAMED("sceSSyn_SetOutputAssign", rdram, ctx, runtime);
     }
 
-    void sceSSyn_SetOutputMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceSSyn_SetOutputMode(int mode)
+    PS2_STUB_TYPED(int32_t, sceSSyn_SetOutputMode, int32_t mode)
+    {
+        (void)mode;
+        return 0;
+    }
+
+    void sceSSyn_SetOutputMode_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
     }
+
+    PS2_STUB_DISPATCH(sceSSyn_SetOutputMode)
 
     void sceSSyn_SetPortMaxPoly(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -653,5 +775,66 @@ namespace ps2_stubs
     void sceSynthSizerLfoTriangle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         TODO_NAMED("sceSynthSizerLfoTriangle", rdram, ctx, runtime);
+    }
+}
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    void saveAudio(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+        std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
+        w.boolean(g_audio_stub_state.initialized);
+        w.pod(g_audio_stub_state.voiceTransfers);
+        for (const BlockTransferState &b : g_audio_stub_state.blockTransfers)
+        {
+            w.u32(b.base);
+            w.u32(b.size);
+            w.u32(b.pauseBase);
+            w.u32(b.offset);
+            w.u32(b.statusTraceCount);
+            w.u32(b.mode);
+            w.boolean(b.active);
+            w.boolean(b.loop);
+            w.boolean(b.clocked);
+            w.u64(b.clockCycle);
+            w.u64(b.clockRemainder);
+            w.boolean(b.finished);
+        }
+    }
+
+    void loadAudio(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        snapshotLoadSupport(r);
+        std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
+        g_audio_stub_state = {};
+        g_audio_stub_state.initialized = r.boolean();
+        r.pod(g_audio_stub_state.voiceTransfers);
+        // The EE scheduler section (and its eeCycle) loads before the stub sections.
+        const uint64_t now = runtime.eeScheduler().eeCycle();
+        for (BlockTransferState &b : g_audio_stub_state.blockTransfers)
+        {
+            b.base = r.u32();
+            b.size = r.u32();
+            b.pauseBase = r.u32();
+            b.offset = r.u32();
+            b.statusTraceCount = r.u32();
+            b.mode = static_cast<uint16_t>(r.u32());
+            b.active = r.boolean();
+            b.loop = r.boolean();
+            b.clocked = r.boolean();
+            b.clockCycle = r.u64();
+            b.clockRemainder = r.u64();
+            b.finished = r.boolean();
+            // The position clock runs on the guest EE clock, which the load restores: the saved
+            // cycle stays valid. Rebase it if it lies ahead of the loaded clock (a state put
+            // into a runtime whose clock is behind), so the next poll does not wait for it.
+            if (b.clocked && b.clockCycle > now)
+            {
+                b.clockCycle = now;
+            }
+        }
     }
 }

@@ -2,6 +2,7 @@
 
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
+#include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/SIF.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
@@ -403,6 +404,19 @@ void PS2IopHostAdapter::closeHostFile(uint64_t handle)
     {
         std::fclose(stream);
     }
+}
+
+bool PS2IopHostAdapter::cdSearchFile(std::string_view guestPath, uint32_t &lsn, uint32_t &sizeBytes)
+{
+    return ps2_stubs::cdLookupFile(std::string(guestPath), lsn, sizeBytes);
+}
+
+bool PS2IopHostAdapter::cdReadSectors(uint32_t lsn, uint32_t sectors, void *destination)
+{
+    if (!destination || sectors == 0u)
+        return false;
+    return ps2_stubs::cdReadSectorsByLbn(lsn, sectors, static_cast<uint8_t *>(destination),
+                                         static_cast<size_t>(sectors) * 2048u);
 }
 
 int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &request)

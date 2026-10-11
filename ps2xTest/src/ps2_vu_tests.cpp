@@ -5,6 +5,8 @@
 #include "Kernel/Stubs/VU.h"
 
 #include <cmath>
+#include <climits>
+#include <limits>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -177,9 +179,9 @@ void register_ps2_vu_tests()
             ps2_stubs::sceVu0DivVector(env.rdram.data(), &env.ctx, &env.runtime);
             float out[4]{};
             readVec4f(env, kDst, out);
-            t.IsTrue(nearlyEqual(out[0], 0.0f) && nearlyEqual(out[1], 0.0f) &&
-                         nearlyEqual(out[2], 0.0f) && nearlyEqual(out[3], 0.0f),
-                     "DivVector should produce finite zero, not Inf/NaN, when the divisor is zero");
+            const float max = std::numeric_limits<float>::max();
+            t.IsTrue(out[0] == max && out[1] == max && out[2] == max && out[3] == max,
+                     "DivVector by zero: Q = +MAX (VU DIV), 5*MAX clamps to +MAX (no Inf/NaN)");
         });
 
         tc.Run("DivVectorXYZ_w_passthrough", [](TestCase &t)
@@ -296,7 +298,7 @@ void register_ps2_vu_tests()
             t.IsTrue(allMatch, "MulMatrix(dst, I, A) should equal A");
         });
 
-        tc.Run("MulMatrix_equals_arg1_times_arg2", [](TestCase &t)
+        tc.Run("MulMatrix_equals_arg2_times_arg1", [](TestCase &t)
         {
             VuEnv env;
             float m0[16] = {
@@ -317,9 +319,9 @@ void register_ps2_vu_tests()
                     float sum = 0.0f;
                     for (int k = 0; k < 4; ++k)
                     {
-                        // expected = mulVuMatrix(m0, m1) = m0 * m1 (arg1 * arg2);
-                        // mulVuMatrix is file-local to VU.cpp, so mirror its formula here.
-                        sum += m1[4 * k + j] * m0[4 * i + k];
+                        // libvu0 (game copy at 0x10e9f8): each row of arg2 combines the rows
+                        // of arg1, so out = arg2 . arg1 with row-major storage.
+                        sum += m0[4 * k + j] * m1[4 * i + k];
                     }
                     expected[4 * i + j] = sum;
                 }
@@ -340,7 +342,45 @@ void register_ps2_vu_tests()
                     allMatch = false;
                 }
             }
-            t.IsTrue(allMatch, "MulMatrix(dst, m0, m1) should equal m0*m1 (mulVuMatrix(m0,m1), arg1*arg2)");
+            t.IsTrue(allMatch, "MulMatrix(dst, m1, m2) should equal m2 . m1 (row-major), like libvu0");
+        });
+
+        tc.Run("InnerProduct_xyz_only", [](TestCase &t)
+        {
+            VuEnv env;
+            writeVec4(env, kA, 1.0f, 2.0f, 3.0f, 100.0f);
+            writeVec4(env, kB, 4.0f, 5.0f, 6.0f, 100.0f);
+            SET_GPR_U32(&env.ctx, 4, kA);
+            SET_GPR_U32(&env.ctx, 5, kB);
+            ps2_stubs::sceVu0InnerProduct(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(env.ctx.f[0] == 32.0f, "InnerProduct is x*x' + y*y' + z*z' (libvu0 vmul.xyz), w ignored");
+        });
+
+        tc.Run("Normalize_xyz_length_w_zero", [](TestCase &t)
+        {
+            VuEnv env;
+            writeVec4(env, kA, 3.0f, 0.0f, 4.0f, 7.0f);
+            SET_GPR_U32(&env.ctx, 4, kDst);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            ps2_stubs::sceVu0Normalize(env.rdram.data(), &env.ctx, &env.runtime);
+            float out[4]{};
+            readVec4f(env, kDst, out);
+            t.IsTrue(nearlyEqual(out[0], 0.6f) && nearlyEqual(out[1], 0.0f) && nearlyEqual(out[2], 0.8f) && out[3] == 0.0f,
+                     "Normalize divides xyz by the xyz length and clears w (libvu0)");
+        });
+
+        tc.Run("ScaleVector_zero_scale_is_zero", [](TestCase &t)
+        {
+            VuEnv env;
+            writeVec4(env, kA, 3.0f, 4.0f, 5.0f, 6.0f);
+            env.ctx.f[12] = 0.0f;
+            SET_GPR_U32(&env.ctx, 4, kDst);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            SET_GPR_U32(&env.ctx, 6, 0x40490FDBu); // a2 is not an argument: must not be used as the scale
+            ps2_stubs::sceVu0ScaleVector(env.rdram.data(), &env.ctx, &env.runtime);
+            float out[4]{};
+            readVec4f(env, kDst, out);
+            t.IsTrue(out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.0f && out[3] == 0.0f, "ScaleVector by 0 is 0");
         });
 
         tc.Run("RotMatrix_Z_matches_RotMatrixZ", [](TestCase &t)
@@ -749,7 +789,7 @@ void register_ps2_vu_tests()
             SET_GPR_U32(&env.ctx, 4, kDst);
             SET_GPR_U32(&env.ctx, 5, kA);
             SET_GPR_U32(&env.ctx, 6, kB);
-            SET_GPR_U32(&env.ctx, 7, 1u); // fullFtoi4 = true
+            SET_GPR_U32(&env.ctx, 7, 0u); // mode 0: FTOI4 on all four fields
             ps2_stubs::sceVu0RotTransPers(env.rdram.data(), &env.ctx, &env.runtime);
             int32_t out[4]{};
             readVec4i(env, kDst, out);
@@ -757,7 +797,7 @@ void register_ps2_vu_tests()
                      "RotTransPers should perspective-divide x/y/z then FTOI4, with w taking the un-divided FTOI4 value");
         });
 
-        tc.Run("RotTransPers_ftoi0_z_when_flag0", [](TestCase &t)
+        tc.Run("RotTransPers_ftoi0_zw_when_mode_set", [](TestCase &t)
         {
             VuEnv env;
             float ident[16]{};
@@ -767,12 +807,12 @@ void register_ps2_vu_tests()
             SET_GPR_U32(&env.ctx, 4, kDst);
             SET_GPR_U32(&env.ctx, 5, kA);
             SET_GPR_U32(&env.ctx, 6, kB);
-            SET_GPR_U32(&env.ctx, 7, 0u); // fullFtoi4 = false
+            SET_GPR_U32(&env.ctx, 7, 1u); // mode != 0: FTOI0 on z and w (libvu0 0x10fc60)
             ps2_stubs::sceVu0RotTransPers(env.rdram.data(), &env.ctx, &env.runtime);
             int32_t out[4]{};
             readVec4i(env, kDst, out);
             t.IsTrue(out[2] == 8 && out[3] == 2,
-                     "RotTransPers should FTOI0-truncate z/w instead of FTOI4 when fullFtoi4 is clear");
+                     "RotTransPers should FTOI0-truncate z/w instead of FTOI4 when mode is non-zero");
         });
 
         tc.Run("RotTransPers_persp_wzero_zero", [](TestCase &t)
@@ -781,16 +821,16 @@ void register_ps2_vu_tests()
             float ident[16]{};
             makeIdentity(ident);
             writeMat4(env, kA, ident);
-            writeVec4(env, kB, 5.0f, 5.0f, 5.0f, 0.0f);
+            writeVec4(env, kB, 5.0f, -5.0f, 0.0f, 0.0f);
             SET_GPR_U32(&env.ctx, 4, kDst);
             SET_GPR_U32(&env.ctx, 5, kA);
             SET_GPR_U32(&env.ctx, 6, kB);
-            SET_GPR_U32(&env.ctx, 7, 1u);
+            SET_GPR_U32(&env.ctx, 7, 0u);
             ps2_stubs::sceVu0RotTransPers(env.rdram.data(), &env.ctx, &env.runtime);
             int32_t out[4]{};
             readVec4i(env, kDst, out);
-            t.IsTrue(out[0] == 0 && out[1] == 0 && out[2] == 0,
-                     "RotTransPers should produce finite zero (not Inf/NaN) when w is zero");
+            t.IsTrue(out[0] == INT32_MAX && out[1] == INT32_MIN && out[2] == 0,
+                     "RotTransPers with w = 0: Q = +MAX (VU DIV), x*Q clamps to +-MAX, FTOI4 saturates; 0*MAX = 0");
         });
 
         tc.Run("RotTransPers_nonidentity_matrix_apply", [](TestCase &t)
@@ -805,7 +845,7 @@ void register_ps2_vu_tests()
             //   t1 = m1*1 + m5*2 + m9*3  + m13*1 = 3 + 2  + 0  + 20 = 25
             //   t2 = m2*1 + m6*2 + m10*3 + m14*1 = 0 + 8  + 3  + 30 = 41
             //   t3 = m3*1 + m7*2 + m11*3 + m15*1 = 1
-            // fullFtoi4=true => every lane x16: (432, 400, 656, 16).
+            // mode 0 => every lane FTOI4 (x16): (432, 400, 656, 16).
             VuEnv env;
             float m[16] = {
                 2.0f, 3.0f, 0.0f, 0.0f,
@@ -818,7 +858,7 @@ void register_ps2_vu_tests()
             SET_GPR_U32(&env.ctx, 4, kDst);
             SET_GPR_U32(&env.ctx, 5, kA);
             SET_GPR_U32(&env.ctx, 6, kB);
-            SET_GPR_U32(&env.ctx, 7, 1u); // fullFtoi4 = true
+            SET_GPR_U32(&env.ctx, 7, 0u); // mode 0: FTOI4 everywhere
             ps2_stubs::sceVu0RotTransPers(env.rdram.data(), &env.ctx, &env.runtime);
             int32_t out[4]{};
             readVec4i(env, kDst, out);
@@ -838,7 +878,7 @@ void register_ps2_vu_tests()
             SET_GPR_U32(&env.ctx, 5, kA);
             SET_GPR_U32(&env.ctx, 6, kArr);
             SET_GPR_U32(&env.ctx, 7, 2u);
-            SET_GPR_U32(&env.ctx, 8, 1u);
+            SET_GPR_U32(&env.ctx, 8, 0u); // mode 0: FTOI4 on w too
             ps2_stubs::sceVu0RotTransPersN(env.rdram.data(), &env.ctx, &env.runtime);
             int32_t out0[4]{}, out1[4]{};
             readVec4i(env, kDst, out0);
@@ -864,19 +904,22 @@ void register_ps2_vu_tests()
         tc.Run("ClipScreen_inside_zero", [](TestCase &t)
         {
             VuEnv env;
-            writeVec4(env, kA, 100.0f, 100.0f, 0.0f, 0.0f);
+            writeVec4(env, kA, 100.0f, 100.0f, 0.0f, 1.0f);
             SET_GPR_U32(&env.ctx, 4, kA);
             ps2_stubs::sceVu0ClipScreen(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegU32(&env.ctx, 2), 0u, "ClipScreen should return 0 for an in-bounds vertex");
+            writeVec4(env, kA, 100.0f, 100.0f, 0.0f, 0.0f);
+            ps2_stubs::sceVu0ClipScreen(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegU32(&env.ctx, 2), 0x40u, "w = 0 sets the sticky Z flag (libvu0 checks x, y and w)");
         });
 
         tc.Run("ClipScreen_offscreen_nonzero", [](TestCase &t)
         {
             VuEnv env;
-            writeVec4(env, kA, 5000.0f, 100.0f, 0.0f, 0.0f);
+            writeVec4(env, kA, 5000.0f, 100.0f, 0.0f, 1.0f);
             SET_GPR_U32(&env.ctx, 4, kA);
             ps2_stubs::sceVu0ClipScreen(env.rdram.data(), &env.ctx, &env.runtime);
-            t.IsTrue(getRegU32(&env.ctx, 2) != 0u, "ClipScreen should return nonzero when x exceeds the guard band");
+            t.Equals(getRegU32(&env.ctx, 2), 0x80u, "x > 4096: 4096 - x is negative, sticky S");
         });
 
         tc.Run("ClipScreen_negx_nonzero", [](TestCase &t)
@@ -885,10 +928,10 @@ void register_ps2_vu_tests()
             // the mirror of ClipScreen_offscreen_nonzero's +x clause. Without this
             // case, deleting the negative-x clause leaves the suite green.
             VuEnv env;
-            writeVec4(env, kA, -5000.0f, 100.0f, 0.0f, 0.0f);
+            writeVec4(env, kA, -5000.0f, 100.0f, 0.0f, 1.0f);
             SET_GPR_U32(&env.ctx, 4, kA);
             ps2_stubs::sceVu0ClipScreen(env.rdram.data(), &env.ctx, &env.runtime);
-            t.IsTrue(getRegU32(&env.ctx, 2) != 0u, "ClipScreen should return nonzero when x is below the negative guard band");
+            t.Equals(getRegU32(&env.ctx, 2), 0x80u, "x < 0 sets the sticky S flag");
         });
 
         tc.Run("ClipScreen3_ors_three", [](TestCase &t)
@@ -896,14 +939,14 @@ void register_ps2_vu_tests()
             // Both offscreen vertices trip the y-guard clauses (not x) so this
             // test does not overlap ClipScreen_offscreen_nonzero's x-guard mutation.
             VuEnv env;
-            writeVec4(env, kA, 0.0f, 5000.0f, 0.0f, 0.0f);
-            writeVec4(env, kB, 0.0f, 0.0f, 0.0f, 0.0f);
-            writeVec4(env, kC, 0.0f, -5000.0f, 0.0f, 0.0f);
+            writeVec4(env, kA, 10.0f, 5000.0f, 0.0f, 1.0f);
+            writeVec4(env, kB, 10.0f, 10.0f, 0.0f, 1.0f);
+            writeVec4(env, kC, 10.0f, 0.0f, 0.0f, 1.0f);
             SET_GPR_U32(&env.ctx, 4, kA);
             SET_GPR_U32(&env.ctx, 5, kB);
             SET_GPR_U32(&env.ctx, 6, kC);
             ps2_stubs::sceVu0ClipScreen3(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegU32(&env.ctx, 2), 0xCu, "ClipScreen3 should OR the guard-band codes across all 3 vertices");
+            t.Equals(getRegU32(&env.ctx, 2), 0xC0u, "ClipScreen3 ORs the flags of all 3 vertices (S from y > 4096, Z from y = 0)");
         });
 
         tc.Run("ClipAll_all_out_returns_1", [](TestCase &t)
@@ -912,7 +955,7 @@ void register_ps2_vu_tests()
             float ident[16]{};
             makeIdentity(ident);
             writeVec4(env, kA, -1.0f, -1.0f, 0.0f, 0.0f); // lo
-            writeVec4(env, kB, 1.0f, 1.0f, 0.0f, 0.0f);   // hi
+            writeVec4(env, kB, 1.0f, 1.0f, 0.0f, 100.0f); // hi (w: upper bound of the vertex w)
             writeMat4(env, kC, ident);
             writeVec4(env, kArr, 5.0f, 5.0f, 0.0f, 1.0f);
             writeVec4(env, kArr + 16u, -5.0f, -5.0f, 0.0f, 1.0f);
@@ -931,7 +974,7 @@ void register_ps2_vu_tests()
             float ident[16]{};
             makeIdentity(ident);
             writeVec4(env, kA, -1.0f, -1.0f, 0.0f, 0.0f); // lo
-            writeVec4(env, kB, 1.0f, 1.0f, 0.0f, 0.0f);   // hi
+            writeVec4(env, kB, 1.0f, 1.0f, 0.0f, 100.0f); // hi (w: upper bound of the vertex w)
             writeMat4(env, kC, ident);
             writeVec4(env, kArr, 5.0f, 5.0f, 0.0f, 1.0f);
             writeVec4(env, kArr + 16u, 0.0f, 0.0f, 0.0f, 1.0f);
@@ -950,7 +993,7 @@ void register_ps2_vu_tests()
             float ident[16]{};
             makeIdentity(ident);
             writeVec4(env, kA, -1.0f, -1.0f, 0.0f, 0.0f); // lo
-            writeVec4(env, kB, 1.0f, 1.0f, 0.0f, 0.0f);   // hi
+            writeVec4(env, kB, 1.0f, 1.0f, 0.0f, 100.0f); // hi (w: upper bound of the vertex w)
             writeMat4(env, kC, ident);
             // Vertex x=2 sits OUTSIDE the raw [-1,1] band but INSIDE the
             // homogeneous band [-w,w] = [-4,4] once scaled by w=4. With the

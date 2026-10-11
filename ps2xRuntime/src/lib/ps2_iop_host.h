@@ -12,6 +12,8 @@ struct R5900Context;
 
 class PS2IopHostAdapter final : public ps2x::iop::IopHost
 {
+    friend struct PS2SnapshotAccess;
+
 public:
     class CallScope
     {
@@ -73,6 +75,8 @@ public:
     void closeHostFile(uint64_t handle) override;
 
     int32_t memoryCard(const ps2x::iop::MemoryCardRequest &request) override;
+    bool cdSearchFile(std::string_view guestPath, uint32_t &lsn, uint32_t &sizeBytes) override;
+    bool cdReadSectors(uint32_t lsn, uint32_t sectors, void *destination) override;
 
     bool hasGuestFunction(uint32_t address) const override;
     bool invokeGuestFunction(uint64_t callToken,

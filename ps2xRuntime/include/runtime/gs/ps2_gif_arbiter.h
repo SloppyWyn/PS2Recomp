@@ -22,6 +22,8 @@ struct GifArbiterPacket
 
 class GifArbiter
 {
+    friend struct PS2SnapshotAccess;
+
 public:
     using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
 

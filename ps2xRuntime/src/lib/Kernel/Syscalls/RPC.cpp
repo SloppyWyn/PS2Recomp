@@ -1,6 +1,19 @@
 #include "Common.h"
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
+#include "../ps2_snapshot_hooks.h"
+
+#include <cstdio>
+#include <cstdlib>
+
+namespace
+{
+    // Guest time between a NOWAIT sceSifCallRpc served by the IOP and its completion on the
+    // EE (end function, semaphore, client idle): ~200 us of EE cycles. An estimate of the IOP
+    // turnaround (SIF DMA of the packet, the server's work, the END packet back), not a
+    // measurement; docs/SPU2-MODEL.md.
+    constexpr uint64_t kSifRpcNowaitCompletionCycles = 200u * 294912000ull / 1000000ull;
+}
 
 namespace ps2_syscalls
 {
@@ -150,11 +163,9 @@ namespace ps2_syscalls
 
     } // namespace
 
-    void SifStopModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // The body of sceSifStopModule after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sifStopModuleBody(uint8_t *rdram, PS2Runtime *runtime, int32_t moduleId, uint32_t resultAddr)
     {
-        const int32_t moduleId = static_cast<int32_t>(getRegU32(ctx, 4)); // $a0
-        const uint32_t resultAddr = getRegU32(ctx, 7);                    // $a3 (int* result, optional)
-
         int32_t moduleResult = -1;
         const bool stoppedByEmulator = runtime->stopIopModule(moduleId, &moduleResult);
         uint32_t refsLeft = 0;
@@ -184,48 +195,109 @@ namespace ps2_syscalls
             logSifModuleAction(stoppedByEmulator ? "stop-emulated" : "stop", moduleId, modulePath, refsLeft);
         }
 
-        setReturnS32(ctx, ret);
+        return ret;
     }
 
-    void SifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceSifStopModule(int modid, int args, const char *argp, int *result)
+    PS2_STUB_TYPED(int32_t, SifStopModule, int32_t moduleId, int32_t args, ps2_abi::gptr argp, ps2_abi::gptr result)
     {
-        const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0
-        const uint32_t argumentSize = getRegU32(ctx, 5); // $a1
-        const uint32_t argumentAddr = getRegU32(ctx, 6); // $a2
+        (void)ctx;
+        (void)args;
+        (void)argp;
+        return sifStopModuleBody(rdram, runtime, moduleId, result);
+    }
+
+    void SifStopModule_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const int32_t moduleId = static_cast<int32_t>(getRegU32(ctx, 4)); // $a0
+        const uint32_t resultAddr = getRegU32(ctx, 7);                    // $a3 (int* result, optional)
+
+        setReturnS32(ctx, sifStopModuleBody(rdram, runtime, moduleId, resultAddr));
+    }
+
+    PS2_STUB_DISPATCH(SifStopModule)
+
+    // The body of sceSifLoadModule after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sifLoadModuleBody(uint8_t *rdram, PS2Runtime *runtime, uint32_t pathAddr, uint32_t argumentSize,
+                                     uint32_t argumentAddr)
+    {
         const std::string modulePath = readGuestCStringBounded(rdram, pathAddr, kMaxSifModulePathBytes);
         if (modulePath.empty())
         {
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         std::vector<uint8_t> arguments;
         constexpr uint32_t kMaxIopModuleArguments = 64u * 1024u;
         if (!copyGuestBytesBounded(rdram, argumentAddr, argumentSize, kMaxIopModuleArguments, arguments))
         {
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         if (!runtime)
         {
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         const auto loaded = runtime->loadIopModule(modulePath, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
         if (!loaded.handled || loaded.moduleId <= 0)
         {
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         trackSifModuleLoadExternal(modulePath, loaded.moduleId);
         logSifModuleAction("load-emulated", loaded.moduleId, modulePath, 1u);
-        setReturnS32(ctx, loaded.moduleId);
+        return loaded.moduleId;
     }
 
-    void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceSifLoadModule(const char *filename, int args, const char *argp)
+    PS2_STUB_TYPED(int32_t, SifLoadModule, ps2_abi::gptr path, int32_t args, ps2_abi::gptr argp)
+    {
+        (void)ctx;
+        return sifLoadModuleBody(rdram, runtime, path, static_cast<uint32_t>(args), argp);
+    }
+
+    void SifLoadModule_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0
+        const uint32_t argumentSize = getRegU32(ctx, 5); // $a1
+        const uint32_t argumentAddr = getRegU32(ctx, 6); // $a2
+
+        setReturnS32(ctx, sifLoadModuleBody(rdram, runtime, pathAddr, argumentSize, argumentAddr));
+    }
+
+    PS2_STUB_DISPATCH(SifLoadModule)
+
+    // void sceSifInitRpc(unsigned int mode)
+    PS2_STUB_TYPED(int32_t, SifInitRpc, uint32_t mode)
+    {
+        (void)rdram;
+        (void)mode;
+        std::lock_guard<std::mutex> lock(g_rpc_mutex);
+        if (!g_rpc_initialized)
+        {
+            g_rpc_servers.clear();
+            g_rpc_clients.clear();
+            g_rpc_next_id = 1;
+            g_rpc_packet_index = 0;
+            g_rpc_server_index = 0;
+            g_rpc_active_queue = 0;
+            g_sif_rpc_debug_next_seq = 0;
+            for (size_t i = 0; i < kSifRpcDebugHistoryCount; ++i)
+            {
+                g_sif_rpc_debug_history[i] = SifRpcDebugEvent{};
+            }
+            g_rpc_initialized = true;
+            RUNTIME_LOG("[SifInitRpc] Initialized");
+        }
+
+        SifRpcDebugEvent event = makeRpcDebugEvent("InitRpc", ctx, runtime);
+        event.result = 0;
+        pushSifRpcDebugEventLocked(event);
+        return 0;
+    }
+
+    void SifInitRpc_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_rpc_mutex);
         if (!g_rpc_initialized)
@@ -251,12 +323,13 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
-    void SifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        uint32_t clientPtr = getRegU32(ctx, 4);
-        uint32_t rpcId = getRegU32(ctx, 5);
-        uint32_t mode = getRegU32(ctx, 6);
+    PS2_STUB_DISPATCH(SifInitRpc)
+    PS2_STUB_DEVIATION(SifInitRpc, "SDK: void sceSifInitRpc(unsigned int mode); the handler writes 0 to v0 (kept)")
 
+    // The body of sceSifBindRpc after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sifBindRpcBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t clientPtr,
+                                  uint32_t rpcId, uint32_t mode)
+    {
         t_SifRpcClientData *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
 
         if (!client)
@@ -268,8 +341,7 @@ namespace ps2_syscalls
             event.flags = kSifRpcDebugFlagMissingClient;
             event.result = -1;
             pushSifRpcDebugEvent(event);
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         client->command = 0;
@@ -336,71 +408,34 @@ namespace ps2_syscalls
         event.mode = mode;
         event.result = 0;
         pushSifRpcDebugEvent(event);
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceSifBindRpc(sceSifClientData *cd, unsigned int request, unsigned int mode)
+    PS2_STUB_TYPED(int32_t, SifBindRpc, ps2_abi::gptr cd, uint32_t request, uint32_t mode)
+    {
+        return sifBindRpcBody(rdram, ctx, runtime, cd, request, mode);
+    }
+
+    void SifBindRpc_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        uint32_t clientPtr = getRegU32(ctx, 4);
+        uint32_t rpcId = getRegU32(ctx, 5);
+        uint32_t mode = getRegU32(ctx, 6);
+
+        setReturnS32(ctx, sifBindRpcBody(rdram, ctx, runtime, clientPtr, rpcId, mode));
+    }
+
+    PS2_STUB_DISPATCH(SifBindRpc)
+
+    // The body of SifCallRpc, shared by the typed and the legacy decoding (ps2_stub_abi.h). It
+    // writes v0 itself, possibly from finishCall after a guest callback.
+    static void sifCallRpcBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t clientPtr,
+                               uint32_t rpcNum, uint32_t mode, uint32_t sendBuf, uint32_t sendSize,
+                               uint32_t receiveBuffer, uint32_t receiveSize, uint32_t endFunction,
+                               uint32_t endParameter)
     {
         std::lock_guard<std::recursive_mutex> rpcCallLock(g_sif_call_rpc_mutex);
-
-        const uint32_t clientPtr = getRegU32(ctx, 4);
-        const uint32_t rpcNum = getRegU32(ctx, 5);
-        const uint32_t mode = getRegU32(ctx, 6);
-        const uint32_t sendBuf = getRegU32(ctx, 7);
-        const uint32_t stackPointer = getRegU32(ctx, 29);
-
-        const uint32_t sendSizeRegisters = getRegU32(ctx, 8);
-        const uint32_t receiveBufferRegisters = getRegU32(ctx, 9);
-        const uint32_t receiveSizeRegisters = getRegU32(ctx, 10);
-        const uint32_t endFunctionRegisters = getRegU32(ctx, 11);
-        uint32_t endParameterRegisters = 0u;
-        (void)readStackU32(rdram, stackPointer, 0x0u, endParameterRegisters);
-
-        uint32_t sendSizeStack = 0u;
-        uint32_t receiveBufferStack = 0u;
-        uint32_t receiveSizeStack = 0u;
-        uint32_t endFunctionStack = 0u;
-        uint32_t endParameterStack = 0u;
-        (void)readStackU32(rdram, stackPointer, 0x10u, sendSizeStack);
-        (void)readStackU32(rdram, stackPointer, 0x14u, receiveBufferStack);
-        (void)readStackU32(rdram, stackPointer, 0x18u, receiveSizeStack);
-        (void)readStackU32(rdram, stackPointer, 0x1Cu, endFunctionStack);
-        (void)readStackU32(rdram, stackPointer, 0x20u, endParameterStack);
-
-        const auto looksLikeGuestPointer = [](uint32_t value)
-        {
-            if (value == 0u)
-            {
-                return true;
-            }
-            const uint32_t normalized = value & 0x1FFFFFFFu;
-            return normalized >= 0x10000u && normalized < PS2_RAM_SIZE;
-        };
-        const auto looksLikeSize = [](uint32_t value)
-        {
-            return value <= 0x02000000u;
-        };
-        const auto plausiblePack = [&](uint32_t sendSize,
-                                       uint32_t receiveBuffer,
-                                       uint32_t receiveSize,
-                                       uint32_t endFunction)
-        {
-            return looksLikeSize(sendSize) &&
-                   looksLikeGuestPointer(receiveBuffer) &&
-                   looksLikeSize(receiveSize) &&
-                   (endFunction == 0u || looksLikeGuestPointer(endFunction));
-        };
-
-        const bool registerPackPlausible =
-            plausiblePack(sendSizeRegisters,
-                          receiveBufferRegisters,
-                          receiveSizeRegisters,
-                          endFunctionRegisters);
-        const bool stackPackPlausible =
-            plausiblePack(sendSizeStack,
-                          receiveBufferStack,
-                          receiveSizeStack,
-                          endFunctionStack);
 
         uint32_t sidHint = 0u;
         {
@@ -411,51 +446,6 @@ namespace ps2_syscalls
                 sidHint = clientIt->second.sid;
             }
         }
-
-        ps2x::iop::RpcAbi selectedAbi = ps2x::iop::RpcAbi::RuntimeDefault;
-        {
-            ps2x::iop::RpcAbiRequest request{};
-            request.boundSid = sidHint;
-            request.function = rpcNum;
-            request.registers = {
-                sendSizeRegisters,
-                receiveBufferRegisters,
-                receiveSizeRegisters,
-                endFunctionRegisters,
-                endParameterRegisters,
-                registerPackPlausible,
-            };
-            request.stack = {
-                sendSizeStack,
-                receiveBufferStack,
-                receiveSizeStack,
-                endFunctionStack,
-                endParameterStack,
-                stackPackPlausible,
-            };
-            selectedAbi = PS2IopTransport::selectRpcAbi(runtime, request);
-        }
-
-        bool useRegisterConvention = selectedAbi != ps2x::iop::RpcAbi::Stack;
-        if (selectedAbi == ps2x::iop::RpcAbi::RuntimeDefault && !registerPackPlausible && stackPackPlausible)
-        {
-            const bool registersHaveCallback = endFunctionRegisters != 0u && looksLikeGuestPointer(endFunctionRegisters);
-            const bool stackHasCallback = endFunctionStack != 0u && looksLikeGuestPointer(endFunctionStack);
-            if (!(registersHaveCallback && !stackHasCallback))
-            {
-                useRegisterConvention = false;
-            }
-        }
-        else if (selectedAbi == ps2x::iop::RpcAbi::Registers)
-        {
-            useRegisterConvention = true;
-        }
-
-        const uint32_t sendSize = useRegisterConvention ? sendSizeRegisters : sendSizeStack;
-        const uint32_t receiveBuffer = useRegisterConvention ? receiveBufferRegisters : receiveBufferStack;
-        const uint32_t receiveSize = useRegisterConvention ? receiveSizeRegisters : receiveSizeStack;
-        const uint32_t endFunction = useRegisterConvention ? endFunctionRegisters : endFunctionStack;
-        const uint32_t endParameter = useRegisterConvention ? endParameterRegisters : endParameterStack;
 
         auto *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
         if (!client)
@@ -484,10 +474,12 @@ namespace ps2_syscalls
         client->hdr.mode = mode;
 
         uint32_t sid = 0u;
+        uint32_t callSequence = 0u;
         {
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
             auto &state = g_rpc_clients[clientPtr];
             state.busy = true;
+            callSequence = ++state.callSequence;
             state.last_rpc = rpcNum;
             sid = state.sid;
             if (sid != 0u)
@@ -544,17 +536,15 @@ namespace ps2_syscalls
             request.endParameter = endParameter;
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
-
-            if (iopResult.signalNowaitCompletion &&
-                (mode & kSifRpcModeNowait) != 0u)
-            {
-                (void)signalRpcCompletionSema(runtime, completionSemaphore);
-            }
-            if (iopResult.signalCompletion)
-            {
-                (void)signalRpcCompletionSema(runtime, completionSemaphore);
-            }
         }
+        // Completion semaphore signals the IOP's answer asks for. A synchronous call gives
+        // them now; a deferred NOWAIT call gives them at its completion (below), as the END
+        // packet does on the hardware.
+        uint32_t completionSignals = 0u;
+        if (iopResult.signalNowaitCompletion && (mode & kSifRpcModeNowait) != 0u)
+            ++completionSignals;
+        if (iopResult.signalCompletion)
+            ++completionSignals;
 
         uint32_t guestFunction = iopResult.guestFunction;
         uint32_t guestA0 = iopResult.guestArguments[0];
@@ -572,6 +562,12 @@ namespace ps2_syscalls
             guestDefaultResult = server->buf != 0u ? server->buf : receiveBuffer;
         }
         const bool serverDispatched = guestFunction != 0u && runtime->hasFunction(guestFunction);
+        const bool deferredNowait = (mode & kSifRpcModeNowait) != 0u && !serverDispatched;
+        if (!deferredNowait)
+        {
+            for (uint32_t i = 0u; i < completionSignals; ++i)
+                (void)signalRpcCompletionSema(runtime, completionSemaphore);
+        }
 
         auto finishCall = [=](const R5900Context *guestResult, R5900Context &parent)
         {
@@ -611,7 +607,9 @@ namespace ps2_syscalls
             {
                 {
                     std::lock_guard<std::mutex> lock(g_rpc_mutex);
-                    g_rpc_clients[clientPtr].busy = false;
+                    auto &state = g_rpc_clients[clientPtr];
+                    if (state.callSequence == callSequence)
+                        state.busy = false;
                 }
                 SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", &base, runtime);
                 event.clientPtr = clientPtr;
@@ -648,8 +646,24 @@ namespace ps2_syscalls
             };
 
             setReturnS32(&parent, 0);
+            // PS2X_SIF_RPC_LOG=1: one stderr line per sceSifCallRpc completion (sid, function,
+            // mode, end function and how it was handled), up to 4000 lines.
+            static const bool s_rpcLog = [] {
+                const char *value = std::getenv("PS2X_SIF_RPC_LOG");
+                return value && *value && *value != '0';
+            }();
+            static int s_rpcLogLines = 0;
+            auto rpcLog = [&](const char *what)
+            {
+                if (!s_rpcLog || s_rpcLogLines >= 4000)
+                    return;
+                ++s_rpcLogLines;
+                std::fprintf(stderr, "[sif:rpc] sid=0x%X fn=%u mode=%u end=0x%X param=0x%X handled=%d: %s\n",
+                             sid, rpcNum, mode, endFunction, endParameter, handled ? 1 : 0, what);
+            };
             if (endFunction == 0u || iopResult.callbackPolicy == ps2x::iop::CallbackPolicy::Suppress)
             {
+                rpcLog(endFunction == 0u ? "no end function" : "end function suppressed");
                 completeClient(parent, endFunction != 0u);
                 return;
             }
@@ -662,10 +676,12 @@ namespace ps2_syscalls
             }
             if (!runtime->hasFunction(callbackFunction))
             {
+                rpcLog("end function unknown: skipped");
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
                 completeClient(parent, false);
                 return;
             }
+            rpcLog("end function invoked");
 
             GuestInvocation callback{};
             callback.kind = GuestInvocationKind::RpcCallback;
@@ -680,6 +696,115 @@ namespace ps2_syscalls
             };
             runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
+
+        // A NOWAIT call served by the IOP completes later on the hardware: the IOP runs the
+        // server, its RPC END packet raises a SIF interrupt on the EE, and that handler marks
+        // the client done and runs the end function. Completing inside this call would let
+        // the caller see the reply before sceSifCallRpc returns, so code that compares a reply
+        // counter against the value it saved after the call (SRWZ's sound driver, which echoes
+        // the IOP's "stream prepared" id back as the start command) never sees a change. The
+        // reply is copied now and the client stays busy; the end function (or a bare
+        // completion) runs as a queued invocation, which the dispatcher takes only after the
+        // calling guest code has returned to it. On the hardware the END packet does all of
+        // the completion at once: end function, completion semaphore, client idle; so the
+        // semaphore signals wait for the completion too. (The reply words themselves are
+        // already in the receive buffer: the IOP bridge writes them during the call.)
+        if (deferredNowait)
+        {
+            const bool handled = iopResult.handled;
+            const uint32_t resultPointer = iopResult.resultAddress;
+            bool copiedFallback = false;
+            bool zeroedFallback = false;
+            if (receiveBuffer != 0u && receiveSize != 0u)
+            {
+                if (handled && resultPointer != 0u && resultPointer != receiveBuffer)
+                {
+                    rpcCopyToRdram(rdram, receiveBuffer, resultPointer, receiveSize);
+                }
+                else if (!handled && sendBuf != 0u && sendSize != 0u && sendBuf != receiveBuffer)
+                {
+                    rpcCopyToRdram(rdram, receiveBuffer, sendBuf, std::min(sendSize, receiveSize));
+                    copiedFallback = true;
+                }
+                else if (!handled)
+                {
+                    rpcZeroRdram(rdram, receiveBuffer, receiveSize);
+                    zeroedFallback = true;
+                }
+            }
+            uint32_t callbackFunction = endFunction;
+            if (callbackFunction != 0u && !runtime->hasFunction(callbackFunction) && callbackFunction >= 0x10000u &&
+                runtime->hasFunction(callbackFunction - 0x10000u))
+            {
+                callbackFunction -= 0x10000u;
+            }
+            const bool runCallback = callbackFunction != 0u &&
+                                     iopResult.callbackPolicy != ps2x::iop::CallbackPolicy::Suppress &&
+                                     runtime->hasFunction(callbackFunction);
+            if (endFunction != 0u && !runCallback)
+                ++completionSignals;
+            static const bool s_deferLog = [] {
+                const char *value = std::getenv("PS2X_SIF_RPC_LOG");
+                return value && *value && *value != '0';
+            }();
+            static int s_deferLogLines = 0;
+            if (s_deferLog && s_deferLogLines < 4000)
+            {
+                ++s_deferLogLines;
+                std::fprintf(stderr, "[sif:rpc] sid=0x%X fn=%u mode=%u end=0x%X param=0x%X handled=%d: deferred (%s)\n",
+                             sid, rpcNum, mode, endFunction, endParameter, handled ? 1 : 0,
+                             runCallback ? "end function queued" : "completion queued");
+            }
+
+            GuestInvocation deferred{};
+            deferred.kind = GuestInvocationKind::RpcCallback;
+            deferred.context = *ctx;
+            deferred.context.pc = runCallback ? callbackFunction : 0u;
+            SET_GPR_U32(&deferred.context, 4, endParameter);
+            SET_GPR_U32(&deferred.context, 29, 0u);
+            SET_GPR_U32(&deferred.context, 31, 0u);
+            const uint32_t eventFlags =
+                kSifRpcDebugFlagNowait |
+                (handled ? kSifRpcDebugFlagHandledByHle : 0u) |
+                (runCallback ? kSifRpcDebugFlagCallback : 0u) |
+                (!handled ? kSifRpcDebugFlagUnhandled : 0u) |
+                (copiedFallback ? kSifRpcDebugFlagFallbackCopy : 0u) |
+                (zeroedFallback ? kSifRpcDebugFlagFallbackZero : 0u);
+            deferred.completeTag = {GuestInvocationCompleteKind::RpcClientComplete,
+                                    static_cast<uint64_t>(clientPtr) | (static_cast<uint64_t>(callSequence) << 32u),
+                                    static_cast<uint64_t>(completionSemaphore) | (static_cast<uint64_t>(completionSignals) << 32u)};
+            // The same closure a snapshot rebuilds from the tag, plus the debug event.
+            auto complete = ps2_stubs::snapshot::makeRpcClientComplete(*runtime, deferred.completeTag);
+            deferred.onComplete = [=](const R5900Context &completed, R5900Context &base)
+            {
+                complete(completed, base);
+                SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", &base, runtime);
+                event.clientPtr = clientPtr;
+                event.serverPtr = serverPtr;
+                event.sid = sid;
+                event.rpcNum = rpcNum;
+                event.mode = mode;
+                event.sendBuf = sendBuf;
+                event.sendSize = sendSize;
+                event.recvBuf = receiveBuffer;
+                event.recvSize = receiveSize;
+                event.resultPtr = resultPointer;
+                event.endFunc = endFunction;
+                event.endParam = endParameter;
+                event.semaId = completionSemaphore;
+                event.flags = eventFlags;
+                fillRpcDebugPreview(rdram, sendBuf, sendSize, event.sendPreview, event.sendPreviewSize);
+                fillRpcDebugPreview(rdram, receiveBuffer, receiveSize, event.recvPreview, event.recvPreviewSize);
+                event.result = 0;
+                pushSifRpcDebugEvent(event);
+            };
+            setReturnS32(ctx, 0);
+            // The IOP's turnaround (SIF DMA of the packet, the server's work, the END packet
+            // back): a fraction of a millisecond. The dispatcher would otherwise run a plain
+            // queued invocation as soon as this stub returns, still inside the caller.
+            runtime->eeScheduler().queueInvocationAfter(std::move(deferred), kSifRpcNowaitCompletionCycles);
+            return;
+        }
 
         if (serverDispatched)
         {
@@ -702,21 +827,47 @@ namespace ps2_syscalls
         finishCall(nullptr, *ctx);
     }
 
-    void SifRegisterRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // sceSifCallRpc(sceSifClientData *cd, int fno, u_int mode, void *send, int ssize, void *recv,
+    //               int rsize, sceSifEndFunc end_func, void *end_para): EE ABI, as the game's own
+    // copy (0x11f130) reads them: arguments 5-8 in t0-t3, the 9th (end_para) in the first 8-byte
+    // stack slot at sp+0. Nothing is read from sp+0x10..: those are the caller's locals.
+    PS2_STUB_TYPED(ps2_abi::SelfReturn<int32_t>, SifCallRpc, ps2_abi::gptr cd, uint32_t fno, uint32_t mode,
+                   ps2_abi::gptr send, uint32_t ssize, ps2_abi::gptr recv, uint32_t rsize,
+                   ps2_abi::gptr endFunc, uint32_t endPara)
     {
-        uint32_t sdPtr = getRegU32(ctx, 4);
-        uint32_t sid = getRegU32(ctx, 5);
-        uint32_t func = getRegU32(ctx, 6);
-        uint32_t buf = getRegU32(ctx, 7);
-        // stack args: cfunc, cbuf, qd...
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t cfunc = 0;
-        uint32_t cbuf = 0;
-        uint32_t qd = 0;
-        readStackU32(rdram, sp, 0x10, cfunc);
-        readStackU32(rdram, sp, 0x14, cbuf);
-        readStackU32(rdram, sp, 0x18, qd);
+        sifCallRpcBody(rdram, ctx, runtime, cd, fno, mode, send, ssize, recv, rsize, endFunc, endPara);
+        return {};
+    }
 
+    void SifCallRpc_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t clientPtr = getRegU32(ctx, 4);
+        const uint32_t rpcNum = getRegU32(ctx, 5);
+        const uint32_t mode = getRegU32(ctx, 6);
+        const uint32_t sendBuf = getRegU32(ctx, 7);
+        const uint32_t stackPointer = getRegU32(ctx, 29);
+
+        // EE ABI, as the game's own copy (0x11f130) reads them: arguments 5-8 in t0-t3, the 9th
+        // (end_param) in the first 8-byte stack slot at sp+0. Nothing is read from sp+0x10..: those
+        // are the caller's locals.
+        const uint32_t sendSize = getRegU32(ctx, 8);
+        const uint32_t receiveBuffer = getRegU32(ctx, 9);
+        const uint32_t receiveSize = getRegU32(ctx, 10);
+        const uint32_t endFunction = getRegU32(ctx, 11);
+        uint32_t endParameter = 0u;
+        (void)readStackU32(rdram, stackPointer, 0x0u, endParameter);
+
+        sifCallRpcBody(rdram, ctx, runtime, clientPtr, rpcNum, mode, sendBuf, sendSize, receiveBuffer, receiveSize,
+                       endFunction, endParameter);
+    }
+
+    PS2_STUB_DISPATCH(SifCallRpc)
+
+    // The body of SifRegisterRpc, shared by the typed and the legacy decoding; returns v0.
+    static int32_t sifRegisterRpcBody(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t sdPtr,
+                                      uint32_t sid, uint32_t func, uint32_t buf, uint32_t cfunc, uint32_t cbuf,
+                                      uint32_t qd)
+    {
         t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, sdPtr));
         if (!sd)
         {
@@ -730,8 +881,7 @@ namespace ps2_syscalls
             event.flags = kSifRpcDebugFlagMissingClient;
             event.result = -1;
             pushSifRpcDebugEvent(event);
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         sd->sid = static_cast<int>(sid);
@@ -811,10 +961,49 @@ namespace ps2_syscalls
         event.endFunc = cfunc;
         event.result = 0;
         pushSifRpcDebugEvent(event);
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void SifCheckStatRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // sceSifRegisterRpc(sceSifServeData *sd, int sid, sceSifRpcFunc func, void *buf,
+    //                   sceSifRpcFunc cfunc, void *cbuf, sceSifQueueData *qd): arguments 5-7
+    // (cfunc, cbuf, qd) are in t0-t2: the game's copy (0x11f408) stores t0/t1 in the server data
+    // and links the server into the queue t2 points at.
+    PS2_STUB_TYPED(int32_t, SifRegisterRpc, ps2_abi::gptr sd, uint32_t sid, ps2_abi::gptr func, ps2_abi::gptr buf,
+                   ps2_abi::gptr cfunc, ps2_abi::gptr cbuf, ps2_abi::gptr qd)
+    {
+        return sifRegisterRpcBody(rdram, ctx, runtime, sd, sid, func, buf, cfunc, cbuf, qd);
+    }
+
+    void SifRegisterRpc_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        uint32_t sdPtr = getRegU32(ctx, 4);
+        uint32_t sid = getRegU32(ctx, 5);
+        uint32_t func = getRegU32(ctx, 6);
+        uint32_t buf = getRegU32(ctx, 7);
+        // Arguments 5-7 (cfunc, cbuf, qd) are in t0-t2: the game's copy (0x11f408) stores t0/t1
+        // in the server data and links the server into the queue t2 points at.
+        uint32_t cfunc = getRegU32(ctx, 8);
+        uint32_t cbuf = getRegU32(ctx, 9);
+        uint32_t qd = getRegU32(ctx, 10);
+
+        setReturnS32(ctx, sifRegisterRpcBody(rdram, ctx, runtime, sdPtr, sid, func, buf, cfunc, cbuf, qd));
+    }
+
+    PS2_STUB_DISPATCH(SifRegisterRpc)
+
+    // int sceSifCheckStatRpc(sceSifRpcData *cd)
+    PS2_STUB_TYPED(int32_t, SifCheckStatRpc, ps2_abi::gptr clientPtr)
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_mutex);
+        auto it = g_rpc_clients.find(clientPtr);
+        if (it == g_rpc_clients.end())
+        {
+            return 0;
+        }
+        return it->second.busy ? 1 : 0;
+    }
+
+    void SifCheckStatRpc_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t clientPtr = getRegU32(ctx, 4);
         std::lock_guard<std::mutex> lock(g_rpc_mutex);
@@ -827,16 +1016,15 @@ namespace ps2_syscalls
         setReturnS32(ctx, it->second.busy ? 1 : 0);
     }
 
-    void SifSetRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        uint32_t qdPtr = getRegU32(ctx, 4);
-        int threadId = static_cast<int>(getRegU32(ctx, 5));
+    PS2_STUB_DISPATCH(SifCheckStatRpc)
 
+    // The body of sceSifSetRpcQueue after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sifSetRpcQueueBody(uint8_t *rdram, uint32_t qdPtr, int threadId)
+    {
         t_SifRpcDataQueue *qd = reinterpret_cast<t_SifRpcDataQueue *>(getMemPtr(rdram, qdPtr));
         if (!qd)
         {
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         qd->thread_id = threadId;
@@ -872,31 +1060,47 @@ namespace ps2_syscalls
             }
         }
 
-        setReturnS32(ctx, 0);
+        return 0;
     }
 
-    void SifRemoveRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // void sceSifSetRpcQueue(sceSifQueueData *qd, int thread_id)
+    PS2_STUB_TYPED(int32_t, SifSetRpcQueue, ps2_abi::gptr qd, int32_t threadId)
+    {
+        (void)ctx;
+        (void)runtime;
+        return sifSetRpcQueueBody(rdram, qd, threadId);
+    }
+
+    void SifSetRpcQueue_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t qdPtr = getRegU32(ctx, 4);
+        int threadId = static_cast<int>(getRegU32(ctx, 5));
+
+        setReturnS32(ctx, sifSetRpcQueueBody(rdram, qdPtr, threadId));
+    }
+
+    PS2_STUB_DISPATCH(SifSetRpcQueue)
+    PS2_STUB_DEVIATION(SifSetRpcQueue, "SDK: void sceSifSetRpcQueue(sceSifQueueData *qd, int thread_id); the handler writes 0 (or -1 for a bad queue pointer) to v0 (kept)")
+
+    // The body of sceSifRemoveRpcQueue after decoding, shared by the typed and the legacy form; returns v0.
+    static uint32_t sifRemoveRpcQueueBody(uint8_t *rdram, uint32_t qdPtr)
+    {
         if (!qdPtr)
         {
-            setReturnU32(ctx, 0);
-            return;
+            return 0;
         }
 
         std::lock_guard<std::mutex> lock(g_rpc_mutex);
         if (!g_rpc_active_queue)
         {
-            setReturnU32(ctx, 0);
-            return;
+            return 0;
         }
 
         if (g_rpc_active_queue == qdPtr)
         {
             t_SifRpcDataQueue *qd = reinterpret_cast<t_SifRpcDataQueue *>(getMemPtr(rdram, qdPtr));
             g_rpc_active_queue = qd ? qd->next : 0;
-            setReturnU32(ctx, qdPtr);
-            return;
+            return qdPtr;
         }
 
         uint32_t curPtr = g_rpc_active_queue;
@@ -909,25 +1113,38 @@ namespace ps2_syscalls
             {
                 t_SifRpcDataQueue *rem = reinterpret_cast<t_SifRpcDataQueue *>(getMemPtr(rdram, qdPtr));
                 cur->next = rem ? rem->next : 0;
-                setReturnU32(ctx, qdPtr);
-                return;
+                return qdPtr;
             }
             curPtr = cur->next;
         }
 
-        setReturnU32(ctx, 0);
+        return 0;
     }
 
-    void SifRemoveRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // sceSifQueueData *sceSifRemoveRpcQueue(sceSifQueueData *qd)
+    PS2_STUB_TYPED(ps2_abi::gptr, SifRemoveRpcQueue, ps2_abi::gptr qd)
     {
-        uint32_t sdPtr = getRegU32(ctx, 4);
-        uint32_t qdPtr = getRegU32(ctx, 5);
+        (void)ctx;
+        (void)runtime;
+        return sifRemoveRpcQueueBody(rdram, qd);
+    }
 
+    void SifRemoveRpcQueue_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        uint32_t qdPtr = getRegU32(ctx, 4);
+
+        setReturnU32(ctx, sifRemoveRpcQueueBody(rdram, qdPtr));
+    }
+
+    PS2_STUB_DISPATCH(SifRemoveRpcQueue)
+
+    // The body of sceSifRemoveRpc after decoding, shared by the typed and the legacy form; returns v0.
+    static uint32_t sifRemoveRpcBody(uint8_t *rdram, uint32_t sdPtr, uint32_t qdPtr)
+    {
         t_SifRpcDataQueue *qd = reinterpret_cast<t_SifRpcDataQueue *>(getMemPtr(rdram, qdPtr));
         if (!qd || !sdPtr)
         {
-            setReturnU32(ctx, 0);
-            return;
+            return 0;
         }
 
         std::lock_guard<std::mutex> lock(g_rpc_mutex);
@@ -938,8 +1155,7 @@ namespace ps2_syscalls
             qd->link = sd ? sd->link : 0;
             if (sd)
                 sd->link = 0;
-            setReturnU32(ctx, sdPtr);
-            return;
+            return sdPtr;
         }
 
         uint32_t curPtr = qd->link;
@@ -954,32 +1170,70 @@ namespace ps2_syscalls
                 cur->link = sd ? sd->link : 0;
                 if (sd)
                     sd->link = 0;
-                setReturnU32(ctx, sdPtr);
-                return;
+                return sdPtr;
             }
             curPtr = cur->link;
         }
 
-        setReturnU32(ctx, 0);
+        return 0;
     }
 
-    void sceSifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // sceSifServeData *sceSifRemoveRpc(sceSifServeData *sd, sceSifQueueData *qd)
+    PS2_STUB_TYPED(ps2_abi::gptr, SifRemoveRpc, ps2_abi::gptr sd, ps2_abi::gptr qd)
     {
-        SifCallRpc(rdram, ctx, runtime);
+        (void)ctx;
+        (void)runtime;
+        return sifRemoveRpcBody(rdram, sd, qd);
     }
 
-    void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void SifRemoveRpc_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        uint32_t sdPtr = getRegU32(ctx, 4);
+        uint32_t qdPtr = getRegU32(ctx, 5);
+
+        setReturnU32(ctx, sifRemoveRpcBody(rdram, sdPtr, qdPtr));
+    }
+
+    PS2_STUB_DISPATCH(SifRemoveRpc)
+
+    PS2_STUB_ALIAS(sceSifCallRpc, SifCallRpc, ::ps2_abi::Kind::Syscall)
+
+    // sceSifSendCmd(u_int cid, void *packet, int packet_size, void *src_extra, void *dest_extra,
+    //               int size_extra): the game's copy (0x11e530) passes t0/t1 on as dest/size, so
+    // they are arguments 5-6 in t0/t1.
+    PS2_STUB_TYPED(int32_t, sceSifSendCmd, uint32_t cid, ps2_abi::gptr packetAddr, uint32_t packetSize,
+                   ps2_abi::gptr srcExtra, ps2_abi::gptr destExtra, uint32_t sizeExtra)
+    {
+        if (sizeExtra > 0 && srcExtra && destExtra)
+        {
+            rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
+        }
+
+        static int logCount = 0;
+        if (logCount < 5)
+        {
+            RUNTIME_LOG("[sceSifSendCmd] cid=0x" << std::hex << cid
+                                                 << " packet=0x" << static_cast<uint32_t>(packetAddr)
+                                                 << " psize=0x" << packetSize
+                                                 << " extra=0x" << static_cast<uint32_t>(destExtra) << std::dec << std::endl);
+            ++logCount;
+        }
+
+        // Return non-zero on success.
+        return 1;
+    }
+
+    void sceSifSendCmd_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t cid = getRegU32(ctx, 4);
         uint32_t packetAddr = getRegU32(ctx, 5);
         uint32_t packetSize = getRegU32(ctx, 6);
         uint32_t srcExtra = getRegU32(ctx, 7);
 
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t destExtra = 0;
-        uint32_t sizeExtra = 0;
-        readStackU32(rdram, sp, 0x10, destExtra);
-        readStackU32(rdram, sp, 0x14, sizeExtra);
+        // sceSifSendCmd(cid, packet, packet_size, src_extra, dest_extra, size_extra): the game's
+        // copy (0x11e530) passes t0/t1 on as dest/size, so they are arguments 5-6 in t0/t1.
+        uint32_t destExtra = getRegU32(ctx, 8);
+        uint32_t sizeExtra = getRegU32(ctx, 9);
 
         if (sizeExtra > 0 && srcExtra && destExtra)
         {
@@ -1000,9 +1254,22 @@ namespace ps2_syscalls
         setReturnS32(ctx, 1);
     }
 
-    void sceRpcGetPacket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(sceSifSendCmd)
+
+    // libsifrpc internal: void *_rpc_get_packet(struct rpc_data *rpc_data); returns its argument here.
+    PS2_STUB_TYPED(ps2_abi::gptr, sceRpcGetPacket, ps2_abi::gptr queuePtr)
+    {
+        (void)rdram;
+        (void)ctx;
+        (void)runtime;
+        return queuePtr;
+    }
+
+    void sceRpcGetPacket_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t queuePtr = getRegU32(ctx, 4);
         setReturnS32(ctx, static_cast<int32_t>(queuePtr));
     }
+
+    PS2_STUB_DISPATCH(sceRpcGetPacket)
 }

@@ -178,3 +178,34 @@ namespace ps2x::iop::detail
             m_loadedKeyReferences.erase(found);
     }
 }
+
+namespace ps2x::iop::detail
+{
+    void IopModuleManager::saveState(ps2x::StateWriter &w) const
+    {
+        w.sortedMap(m_records, [&w](const Record &record)
+                    {
+                        w.str(record.key);
+                        w.u32(record.references);
+                        w.boolean(record.physical); });
+        w.sortedMap(m_hleIdsByKey, [&w](int32_t id)
+                    { w.i32(id); });
+        w.sortedMap(m_loadedKeyReferences, [&w](uint32_t references)
+                    { w.u32(references); });
+        w.i32(m_nextHleId);
+    }
+
+    void IopModuleManager::loadState(ps2x::StateReader &r)
+    {
+        r.sortedMap(m_records, [&r](Record &record)
+                    {
+                        record.key = r.str();
+                        record.references = r.u32();
+                        record.physical = r.boolean(); });
+        r.sortedMap(m_hleIdsByKey, [&r](int32_t &id)
+                    { id = r.i32(); });
+        r.sortedMap(m_loadedKeyReferences, [&r](uint32_t &references)
+                    { references = r.u32(); });
+        m_nextHleId = r.i32();
+    }
+}

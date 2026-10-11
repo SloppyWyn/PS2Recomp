@@ -117,7 +117,47 @@ namespace ps2_stubs
         setReturnS32(ctx, (ch == 0u) ? 0 : 1);
     }
 
-    void printf_r(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int _printf_r(struct _reent *reent, const char *format, ...)
+    PS2_STUB_TYPED(int32_t, printf_r, ps2_abi::gptr reent, ps2_abi::gptr format_addr, ps2_abi::VarArgs args)
+    {
+        const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
+        int ret = -1;
+
+        if (format_addr != 0)
+        {
+            std::string rendered = formatPs2StringWithVarArgs(rdram, runtime, formatOwned.c_str(), args);
+            if (rendered.size() > 2048)
+            {
+                rendered.resize(2048);
+            }
+            PS2_IF_AGRESSIVE_LOGS({
+                const std::string logLine = sanitizeForLog(rendered);
+                uint32_t count = 0;
+                {
+                    std::lock_guard<std::mutex> lock(g_printfLogMutex);
+                    count = ++g_printfLogCount;
+                }
+                if (count <= kMaxPrintfLogs)
+                {
+                    RUNTIME_LOG("PS2 printf: " << logLine);
+                    RUNTIME_LOG(std::flush);
+                }
+                else if (count == kMaxPrintfLogs + 1)
+                {
+                    std::cerr << "PS2 printf logging suppressed after " << kMaxPrintfLogs << " lines" << std::endl;
+                }
+            });
+            ret = static_cast<int>(rendered.size());
+        }
+        else
+        {
+            std::cerr << "printf_r error: Invalid format string address provided: 0x" << std::hex << format_addr << std::dec << std::endl;
+        }
+
+        return ret;
+    }
+
+    void printf_r_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t format_addr = getRegU32(ctx, 5); // $a1
         const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
@@ -155,5 +195,24 @@ namespace ps2_stubs
         }
 
         setReturnS32(ctx, ret);
+    }
+
+    PS2_STUB_DISPATCH(printf_r)
+}
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    // No state of its own: only this file's copy of the Helpers/Support.h globals.
+    void saveCompatibility(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+    }
+
+    void loadCompatibility(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
     }
 }

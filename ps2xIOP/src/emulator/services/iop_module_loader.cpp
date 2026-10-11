@@ -320,10 +320,10 @@ namespace ps2x::iop::detail
         return ok;
     }
 
-    bool IopModuleLoader::readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes)
+    bool IopModuleLoader::readElf(const ByteReader &read, uint32_t guestAddress, std::vector<uint8_t> &bytes)
     {
         Elf32Ehdr header{};
-        if (!host.readGuest(guestAddress, &header, sizeof(header)) || !validElfHeader(header))
+        if (!read(guestAddress, &header, sizeof(header)) || !validElfHeader(header))
             return false;
 
         uint64_t required = sizeof(header);
@@ -334,7 +334,7 @@ namespace ps2x::iop::detail
             return false; // Should we log an error here? TODO check later
 
         bytes.resize(static_cast<size_t>(required));
-        if (!host.readGuest(guestAddress, bytes.data(), bytes.size()))
+        if (!read(guestAddress, bytes.data(), bytes.size()))
             return false;
 
         if (header.shnum != 0u && header.shentsize >= sizeof(Elf32Shdr))
@@ -364,7 +364,23 @@ namespace ps2x::iop::detail
             return false;
 
         bytes.resize(static_cast<size_t>(required));
-        return host.readGuest(guestAddress, bytes.data(), bytes.size());
+        return read(guestAddress, bytes.data(), bytes.size());
+    }
+
+    bool IopModuleLoader::readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes)
+    {
+        return readElf([&host](uint32_t address, void *destination, size_t size)
+                       { return host.readGuest(address, destination, size); },
+                       guestAddress, bytes);
+    }
+
+    // The SCE SDK's sceSifLoadModuleBuffer takes the module's address in IOP memory: the
+    // game allocates IOP heap, copies the IRX there with sceSifSetDma, then loads it.
+    bool IopModuleLoader::readElfFromIop(const IopMemory &memory, uint32_t iopAddress, std::vector<uint8_t> &bytes)
+    {
+        return readElf([&memory](uint32_t address, void *destination, size_t size)
+                       { return memory.readRam(address, destination, size); },
+                       iopAddress, bytes);
     }
 
     IopImageLoadResult IopModuleLoader::load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor)
@@ -429,20 +445,45 @@ namespace ps2x::iop::detail
                               (minVaddr < kModuleLoadBase && minVaddr != 0u);
         uint32_t base = 0u;
         int64_t delta = 0;
+        // The image's memory comes from the shared IOP pool (sysmem), first fit; it is given back
+        // if the load fails below.
+        uint32_t pooled = 0u;
+        struct PoolGuard
+        {
+            IopMemory &memory;
+            uint32_t &address;
+            ~PoolGuard()
+            {
+                if (address != 0u)
+                    (void)memory.freeAllocation(address);
+            }
+        } guard{memory, pooled};
         if (relocate)
         {
-            base = alignUp(moduleCursor, 0x100u);
-            if (base + span >= IopMemory::HeapBase)
+            base = memory.allocate(span, 0x100u);
+            if (base == 0u)
             {
                 result.error = IopImageLoadError::ArenaExhausted;
                 return result;
             }
+            pooled = base;
             delta = static_cast<int64_t>(base) - minVaddr;
-            result.nextModuleCursor = base + span;
+            result.nextModuleCursor = std::max(moduleCursor, base + span);
         }
         else
         {
             base = minVaddr;
+            // A fixed-address image claims its range in the pool (sysmem ALLOC at address); if part
+            // of it is in use the load fails (KE_NO_MEMORY on the IOP) rather than overwrite it.
+            if (base < IopMemory::HeapLimit && base + span > IopMemory::HeapBase)
+            {
+                pooled = memory.allocate(span, 4u, base);
+                if (pooled == 0u)
+                {
+                    result.error = IopImageLoadError::ArenaExhausted;
+                    return result;
+                }
+            }
         }
 
         if (hasLoad)
@@ -556,6 +597,7 @@ namespace ps2x::iop::detail
         }
 
         result.error = IopImageLoadError::None;
+        pooled = 0u; // loaded: the module keeps its memory
         return result;
     }
 }

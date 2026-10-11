@@ -250,7 +250,19 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
-    void SifLoadElfPart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // int sceSifLoadElfPart(const char *name, const char *secname, sceExecData *data)
+    PS2_STUB_TYPED(int32_t, SifLoadElfPart, ps2_abi::gptr pathAddr, ps2_abi::gptr secNameAddr, ps2_abi::gptr execDataAddr)
+    {
+        std::string secName = readGuestCStringBounded(rdram, secNameAddr, kLoadfileArgMaxBytes);
+        if (secName.empty())
+        {
+            secName = "all";
+        }
+
+        return runSifLoadElfPart(rdram, ctx, runtime, pathAddr, secName, execDataAddr);
+    }
+
+    void SifLoadElfPart_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0 - path
         const uint32_t secNameAddr = getRegU32(ctx, 5);  // $a1 - section name ("all" typically)
@@ -266,7 +278,15 @@ namespace ps2_syscalls
         setReturnS32(ctx, ret);
     }
 
-    void sceSifLoadElf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_DISPATCH(SifLoadElfPart)
+
+    // int sceSifLoadElf(const char *name, sceExecData *data)
+    PS2_STUB_TYPED(int32_t, sceSifLoadElf, ps2_abi::gptr pathAddr, ps2_abi::gptr execDataAddr)
+    {
+        return runSifLoadElfPart(rdram, ctx, runtime, pathAddr, "all", execDataAddr);
+    }
+
+    void sceSifLoadElf_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0 - path
         const uint32_t execDataAddr = getRegU32(ctx, 5); // $a1 - t_ExecData*
@@ -274,26 +294,19 @@ namespace ps2_syscalls
         setReturnS32(ctx, ret);
     }
 
-    void sceSifLoadElfPart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        SifLoadElfPart(rdram, ctx, runtime);
-    }
+    PS2_STUB_DISPATCH(sceSifLoadElf)
 
-    void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        // Use the same tracker as SifLoadModule so both APIs return the same module IDs.
-        SifLoadModule(rdram, ctx, runtime);
-    }
+    PS2_STUB_ALIAS(sceSifLoadElfPart, SifLoadElfPart, ::ps2_abi::Kind::Syscall)
 
-    void sceSifLoadModuleBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    PS2_STUB_ALIAS(sceSifLoadModule, SifLoadModule, ::ps2_abi::Kind::Syscall)
+
+    // The body of sceSifLoadModuleBuffer after decoding, shared by the typed and the legacy form; returns v0.
+    static int32_t sifLoadModuleBufferBody(uint8_t *rdram, PS2Runtime *runtime, uint32_t bufferAddr,
+                                           uint32_t argumentSize, uint32_t argumentAddr)
     {
-        const uint32_t bufferAddr = getRegU32(ctx, 4);   // $a0
-        const uint32_t argumentSize = getRegU32(ctx, 5); // $a1
-        const uint32_t argumentAddr = getRegU32(ctx, 6); // $a2
         if (!rdram || bufferAddr == 0u)
         {
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         const std::string moduleTag = makeSifModuleBufferTag(rdram, bufferAddr);
@@ -301,27 +314,42 @@ namespace ps2_syscalls
         constexpr uint32_t kMaxIopModuleArguments = 64u * 1024u;
         if (!copyGuestBytesBounded(rdram, argumentAddr, argumentSize, kMaxIopModuleArguments, arguments))
         {
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         if (!runtime)
         {
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         const auto loaded = runtime->loadIopModuleBuffer(bufferAddr, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
         if (!loaded.handled || loaded.moduleId <= 0)
         {
-            setReturnS32(ctx, -1);
-            return;
+            return -1;
         }
 
         trackSifModuleLoadExternal(moduleTag, loaded.moduleId);
         logSifModuleAction("load-buffer-emulated", loaded.moduleId, moduleTag, 1u);
-        setReturnS32(ctx, loaded.moduleId);
+        return loaded.moduleId;
     }
+
+    // int sceSifLoadModuleBuffer(const void *addr, int args, const char *argp)
+    PS2_STUB_TYPED(int32_t, sceSifLoadModuleBuffer, ps2_abi::gptr addr, int32_t args, ps2_abi::gptr argp)
+    {
+        (void)ctx;
+        return sifLoadModuleBufferBody(rdram, runtime, addr, static_cast<uint32_t>(args), argp);
+    }
+
+    void sceSifLoadModuleBuffer_legacy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t bufferAddr = getRegU32(ctx, 4);   // $a0
+        const uint32_t argumentSize = getRegU32(ctx, 5); // $a1
+        const uint32_t argumentAddr = getRegU32(ctx, 6); // $a2
+
+        setReturnS32(ctx, sifLoadModuleBufferBody(rdram, runtime, bufferAddr, argumentSize, argumentAddr));
+    }
+
+    PS2_STUB_DISPATCH(sceSifLoadModuleBuffer)
 
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId)
     {
@@ -420,6 +448,7 @@ namespace ps2_syscalls
         {
             parent.r[2] = completed.r[2];
         };
+        invocation.completeTag = {GuestInvocationCompleteKind::CopyReturnValue, 0u};
         scheduler.invokeCurrent(std::move(invocation));
     }
 

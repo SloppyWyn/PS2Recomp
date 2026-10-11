@@ -89,3 +89,31 @@ namespace ps2x::iop::detail
         }
     }
 }
+
+namespace ps2x::iop::detail
+{
+    void IopIoman::saveState(ps2x::StateWriter &w) const
+    {
+        w.size(m_devices.size());
+        for (const Device &device : m_devices)
+        {
+            w.u32(device.address);
+            w.u32(device.gp);
+            w.str(device.name);
+        }
+    }
+
+    void IopIoman::loadState(ps2x::StateReader &r)
+    {
+        m_devices.clear();
+        const size_t count = r.size();
+        for (size_t i = 0; i < count; ++i)
+        {
+            Device device;
+            device.address = r.u32();
+            device.gp = r.u32();
+            device.name = r.str();
+            m_devices.push_back(std::move(device));
+        }
+    }
+}

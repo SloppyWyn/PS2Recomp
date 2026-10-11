@@ -54,7 +54,9 @@ namespace ps2recomp
         bool isInternalTarget(uint32_t target) const;
         std::vector<uint32_t> resolvedLocalIndirectTargets() const;
 
-        std::string delaySlotCode() const;
+        // asDelaySlot = false: the instruction runs as a plain fallthrough instruction (the
+        // resume_into_owner delay-slot resume path), so lean memory accesses use the non-_DS form.
+        std::string delaySlotCode(bool asDelaySlot = true) const;
         void emitDelaySlot(std::string_view indent);
         void emitResumeFromDelaySlotEntry();
         void emitInternalTarget(uint32_t target, uint32_t sourcePc, std::string_view indent);

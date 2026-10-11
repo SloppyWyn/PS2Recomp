@@ -5,6 +5,7 @@
 #include "imports/iop_imports.h"
 #include "imports/iop_intrman.h"
 #include "imports/iop_ioman.h"
+#include "core/iop_call_wait.h"
 #include "core/iop_kernel.h"
 #include "imports/iop_loadcore.h"
 #include "core/iop_memory.h"
@@ -19,6 +20,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <map>
 #include <optional>
 #include <span>
@@ -37,6 +41,9 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
+        constexpr int kSpu2Irq = 9;
+        constexpr int kDmaSpu0Irq = 0x24;
+        constexpr int kDmaSpu1Irq = 0x28;
 
         uint32_t physicalAddress(uint32_t address)
         {
@@ -110,6 +117,8 @@ namespace ps2x::iop::detail
               imports(memory),
               loadcore(memory, imports)
         {
+            memory.bindClock(&totalCycles);
+            kernel.setCallContextWait([this](const std::function<bool()> &ready) { return waitInCallContextLogged(ready); });
             reset();
         }
 
@@ -126,6 +135,8 @@ namespace ps2x::iop::detail
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
+            rpcAheadCycles = 0;
+            rpcDrains = 0;
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
@@ -174,10 +185,19 @@ namespace ps2x::iop::detail
             schedulePendingDma();
         }
 
+        // SPU2 interrupts (DMA channel completion, IRQA hit) raised by the model since the
+        // last call: dispatched like the other hardware interrupts, at the current cycle.
         void schedulePendingDma()
         {
-            if (const auto dma = memory.takeDmaStart())
-                pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
+            const uint32_t irqs = memory.spu2().takePendingIrqs();
+            if (irqs == 0u)
+                return;
+            if (irqs & Spu2::IrqSpu2)
+                pendingDmaInterrupts[kSpu2Irq] = totalCycles;
+            if (irqs & Spu2::IrqDmaCore0)
+                pendingDmaInterrupts[kDmaSpu0Irq] = totalCycles;
+            if (irqs & Spu2::IrqDmaCore1)
+                pendingDmaInterrupts[kDmaSpu1Irq] = totalCycles;
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const
@@ -237,8 +257,65 @@ namespace ps2x::iop::detail
             Missing,
         };
 
+        // PS2X_IOP_TRACE_IMPORTS=<lib,lib,...|*> logs every import call of those libraries
+        // (library:ordinal, a0..a3, pc) on stderr as [iop:import], up to
+        // PS2X_IOP_TRACE_MAX lines (default 20000). Free when unset.
+        static const std::vector<std::string> &tracedImportLibraries()
+        {
+            static const std::vector<std::string> s_libs = [] {
+                std::vector<std::string> libs;
+                const char *value = std::getenv("PS2X_IOP_TRACE_IMPORTS");
+                if (!value || !*value)
+                    return libs;
+                std::string item;
+                for (const char *p = value;; ++p)
+                {
+                    if (*p == ',' || *p == '\0')
+                    {
+                        if (!item.empty())
+                            libs.push_back(item);
+                        item.clear();
+                        if (*p == '\0')
+                            break;
+                    }
+                    else
+                        item.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
+                }
+                return libs;
+            }();
+            return s_libs;
+        }
+
+        void traceImport(const IopImportCall &call, const CpuState &cpu)
+        {
+            const auto &libs = tracedImportLibraries();
+            if (libs.empty())
+                return;
+            std::string lib(call.library);
+            for (char &ch : lib)
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            bool match = false;
+            for (const std::string &item : libs)
+                if (item == "*" || item == lib)
+                    match = true;
+            if (!match)
+                return;
+            static int s_lines = 0;
+            static const int s_max = [] {
+                const char *value = std::getenv("PS2X_IOP_TRACE_MAX");
+                return value && *value ? std::atoi(value) : 20000;
+            }();
+            if (s_lines >= s_max)
+                return;
+            ++s_lines;
+            std::fprintf(stderr, "[iop:import] %s:%u a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X pc=0x%08X cyc=%llu\n",
+                         lib.c_str(), static_cast<unsigned>(call.ordinal), cpu.gpr[4], cpu.gpr[5], cpu.gpr[6],
+                         cpu.gpr[7], cpu.pc, static_cast<unsigned long long>(totalCycles));
+        }
+
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
         {
+            traceImport(call, cpu);
             const uint32_t a0 = cpu.gpr[4];
             auto setV0 = [&](uint32_t value)
             {
@@ -456,6 +533,19 @@ namespace ps2x::iop::detail
             }
             cpu.gpr[31] = kCallReturnSentinel;
             runCpu(cpu, budget);
+            if (!cpu.stopped)
+            {
+                // The function did not return: its budget ran out (v0 is whatever it held) or
+                // it blocked (a wait reached while a thread was current). Both are anomalies.
+                static int s_lines = 0;
+                if (s_lines < 32)
+                {
+                    ++s_lines;
+                    std::fprintf(stderr, "[iop:call] fn=0x%X did not return (%s) budget=%u pc=0x%X depth=%u cyc=%llu\n",
+                                 address, cpu.yielded ? "blocked" : "budget", budget, cpu.pc, depth,
+                                 static_cast<unsigned long long>(totalCycles));
+                }
+            }
             return cpu.gpr[2];
         }
 
@@ -478,6 +568,86 @@ namespace ps2x::iop::detail
                                                 uint32_t instructionBudget) override
         {
             return callFunction(address, a0, a1, a2, a3, gp, instructionBudget);
+        }
+
+        // IopGuestExecutor: an EE RPC request is about to be served by a server whose thread has
+        // priority `priority`. The RPC bridge calls server functions directly, at whatever
+        // point the IOP's last time slice ended; a thread of higher priority may be preempted
+        // in the middle of its work there (our slices end on a cycle budget, the hardware's only
+        // when the thread blocks or a higher-priority thread is readied). Its state would be
+        // seen half-updated, and what the server changes can break the work that thread resumes
+        // (SRWZ: ezmidi's stop freed modhsyn voices while ezmidi's tick thread, priority above
+        // the server's, was preempted in the middle of modhsyn's voice-list walk; the walk then
+        // never got back to the list head, the tick never ended, and the EE polled forever).
+        // So run, before the server, every ready thread that would run before the server's
+        // thread on the hardware (priority <= the server's), until none is ready, servicing due
+        // interrupts and timers between slices as runCycles does. Idle time is not skipped.
+        // The IOP time this takes is repaid from the next EE time slices (rpcAheadCycles), so
+        // the IOP clock stays in step with the EE's. Capped at kCallContextWaitLimitCycles per
+        // request; PS2X_IOP_RPC_PRIORITY=0 turns it off (A/B).
+        void runThreadsBeforeServer(uint32_t priority) override
+        {
+            static const bool s_enabled = [] {
+                const char *value = std::getenv("PS2X_IOP_RPC_PRIORITY");
+                return !(value && *value == '0');
+            }();
+            if (!s_enabled || priority == 0u || activeCpu != nullptr || callDepth != 0u ||
+                servicingDmaInterrupts || servicingGuestCallbacks)
+                return;
+            const uint64_t start = totalCycles;
+            const uint64_t limit = start + kCallContextWaitLimitCycles;
+            uint32_t slices = 0u;
+            std::string first;
+            while (totalCycles < limit)
+            {
+                memory.spu2().catchUp();
+                schedulePendingDma();
+                servicePendingDmaInterrupts();
+                servicePendingGuestCallbacks();
+                timrman.serviceDue(totalCycles, *this);
+                IopThread *next = kernel.beginNextReadyBefore(totalCycles, priority);
+                if (!next)
+                    break;
+                if (slices++ == 0u)
+                {
+                    char item[48];
+                    std::snprintf(item, sizeof(item), "%d:%u:%X", next->id, next->priority, next->cpu.pc);
+                    first = item;
+                }
+                const uint64_t before = totalCycles;
+                uint64_t budget = std::min<uint64_t>(kDefaultSlice, limit - totalCycles);
+                if (clipSlicesToEvents)
+                {
+                    // As in runCycles: do not run a slice past a due timer/interrupt.
+                    const uint64_t nextEvent = nextScheduledEventCycle(limit);
+                    if (nextEvent > totalCycles)
+                        budget = std::min(budget, nextEvent - totalCycles);
+                    budget = std::max<uint64_t>(budget, 1u);
+                }
+                runCpu(next->cpu, static_cast<uint32_t>(budget));
+                kernel.endTimeslice(*next, kThreadReturnSentinel);
+                if (totalCycles == before)
+                    ++totalCycles;
+            }
+            if (slices == 0u)
+                return;
+            const uint64_t spent = totalCycles - start;
+            rpcAheadCycles += spent;
+            ++rpcDrains;
+            // PS2X_IOP_RPC_LOG: the first 64 drains; the cap is always reported.
+            static int s_lines = 0;
+            static const bool s_log = [] {
+                const char *value = std::getenv("PS2X_IOP_RPC_LOG");
+                return value && *value && *value != '0';
+            }();
+            const bool capped = totalCycles >= limit;
+            if ((s_log || capped) && s_lines < 64)
+            {
+                ++s_lines;
+                std::fprintf(stderr, "[iop:rpc:before] prio=%u first=%s slices=%u cycles=%llu%s drains=%llu\n", priority,
+                             first.c_str(), slices, static_cast<unsigned long long>(spent), capped ? " CAPPED" : "",
+                             static_cast<unsigned long long>(rpcDrains));
+            }
         }
 
         // Not that good to use exception handling for control flow but will do for now
@@ -553,30 +723,167 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        // The next cycle at which a sleeping IOP has something to do (a delayed thread, a DMA
+        // completion, a scheduled callback, a timer, the SPU2), or fallback when nothing is
+        // scheduled.
+        // IopKernel::CallContextWait: a WaitSema/WaitEventFlag outside any IOP thread (an RPC
+        // server function the bridge calls directly, e.g. sdrdrv -> libsd clearing the reverb
+        // work area chunk by chunk, each waiting for its DMA interrupt). See core/iop_call_wait.h:
+        // IOP time moves from one scheduled hardware event (DMA/SPU2 completion, scheduled
+        // callback, timer) to the next while `ready` does not hold; threads do not run meanwhile.
+        // Nothing scheduled, or a wait reached while interrupts/callbacks are being serviced:
+        // gives up at once. Every give-up is logged ([iop:callwait] gave-up ...), the first 32
+        // satisfied waits too.
+        bool waitInCallContextLogged(const std::function<bool()> &ready)
+        {
+            CallWaitHooks hooks;
+            hooks.reentrant = [this] { return servicingDmaInterrupts || servicingGuestCallbacks; };
+            hooks.service = [this] {
+                memory.spu2().catchUp();
+                schedulePendingDma();
+                servicePendingDmaInterrupts();
+                servicePendingGuestCallbacks();
+                timrman.serviceDue(totalCycles, *this);
+            };
+            hooks.now = [this] { return totalCycles; };
+            hooks.nextEvent = [this](uint64_t limit, uint64_t &next, bool &transfer) {
+                // Hardware events only: a delayed thread's wake time says nothing here.
+                bool any = false;
+                for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                {
+                    next = std::min(next, completionCycle);
+                    any = transfer = true;
+                }
+                if (!pendingGuestCallbacks.empty())
+                {
+                    next = std::min(next, pendingGuestCallbacks.begin()->first);
+                    any = true;
+                }
+                const uint64_t timer = timrman.nextEventCycle(limit);
+                if (timer < limit)
+                {
+                    next = std::min(next, timer);
+                    any = true;
+                }
+                if (memory.spu2().dmaActive(0u) || memory.spu2().dmaActive(1u))
+                {
+                    next = std::min(next, memory.spu2().nextEventCycle(limit));
+                    any = transfer = true;
+                }
+                return any;
+            };
+            hooks.advanceTo = [this](uint64_t cycle) { totalCycles = cycle; };
+            const uint64_t start = totalCycles;
+            const CallWaitResult result = waitInCallContext(hooks, ready, kCallContextWaitLimitCycles);
+            static int s_okLines = 0;
+            if (result != CallWaitResult::Ready || s_okLines < 32)
+            {
+                if (result == CallWaitResult::Ready)
+                    ++s_okLines;
+                std::fprintf(stderr, "[iop:callwait] %s cycles=%llu at=%llu\n", callWaitResultName(result),
+                             static_cast<unsigned long long>(totalCycles - start), static_cast<unsigned long long>(totalCycles));
+            }
+            return result == CallWaitResult::Ready;
+        }
+
+        uint64_t nextScheduledEventCycle(uint64_t fallback) const noexcept
+        {
+            uint64_t nextWake = kernel.nextWakeCycle(fallback);
+            for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                nextWake = std::min(nextWake, completionCycle);
+            if (!pendingGuestCallbacks.empty())
+                nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+            nextWake = timrman.nextEventCycle(nextWake);
+            return memory.spu2().nextEventCycle(nextWake);
+        }
+
+        // PS2X_IOP_WATCH=<hex addr[,addr...]> prints those IOP RAM words (32-bit) once per
+        // second of IOP time on stderr as [iop:watch], for following a driver's state
+        // variables without a debugger. Free when unset.
+        void serviceWatch()
+        {
+            static const std::vector<uint32_t> s_addresses = [] {
+                std::vector<uint32_t> list;
+                const char *value = std::getenv("PS2X_IOP_WATCH");
+                if (!value || !*value)
+                    return list;
+                const char *p = value;
+                while (*p)
+                {
+                    char *end = nullptr;
+                    const unsigned long parsed = std::strtoul(p, &end, 16);
+                    if (end == p)
+                        break;
+                    list.push_back(static_cast<uint32_t>(parsed));
+                    p = end;
+                    while (*p == ',' || *p == ' ')
+                        ++p;
+                }
+                return list;
+            }();
+            if (s_addresses.empty() || totalCycles < watchNextCycle)
+                return;
+            watchNextCycle = totalCycles + kIopClockHz;
+            std::string line = "[iop:watch] cyc=" + std::to_string(totalCycles);
+            char item[48];
+            for (const uint32_t address : s_addresses)
+            {
+                std::snprintf(item, sizeof(item), " %05X=%08X", address, memory.read32(address));
+                line += item;
+            }
+            line += '\n';
+            std::fputs(line.c_str(), stderr);
+            // PS2X_IOP_WATCH_THREADS=1 (with PS2X_IOP_WATCH): IOP threads, semaphores, event
+            // flags and timers on the same cadence, as [iop:watch:thr] / [iop:watch:sync].
+            static const bool s_threads = [] {
+                const char *value = std::getenv("PS2X_IOP_WATCH_THREADS");
+                return value && *value && *value != '0';
+            }();
+            if (s_threads)
+            {
+                const std::string threads = "[iop:watch:thr] " + kernel.describeThreads(false) + " | " +
+                                            timrman.describe(totalCycles) + " | pend=" +
+                                            std::to_string(pendingDmaInterrupts.size()) + "/" +
+                                            std::to_string(pendingGuestCallbacks.size()) + "\n";
+                std::fputs(threads.c_str(), stderr);
+                const std::string sync = "[iop:watch:sync] " + kernel.describeSyncObjects() + "\n";
+                std::fputs(sync.c_str(), stderr);
+            }
+        }
+
         void runCycles(uint64_t cycles) noexcept
         {
             try
             {
                 const uint64_t target = totalCycles + cycles;
+                serviceWatch();
                 while (totalCycles < target)
                 {
+                    memory.spu2().catchUp();
+                    schedulePendingDma();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
-                        uint64_t nextWake = kernel.nextWakeCycle(target);
-                        for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
-                            nextWake = std::min(nextWake, completionCycle);
-                        if (!pendingGuestCallbacks.empty())
-                            nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
-                        nextWake = timrman.nextEventCycle(nextWake);
+                        const uint64_t nextWake = nextScheduledEventCycle(target);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
                     const uint64_t before = totalCycles;
-                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                    uint64_t budget = std::min<uint64_t>(kDefaultSlice, target - totalCycles);
+                    if (clipSlicesToEvents)
+                    {
+                        // Batched EE timing runs the IOP in chunks instead of one cycle per
+                        // guest call: keep a thread's slice from running past an event that
+                        // the one-cycle calls would have serviced on time.
+                        const uint64_t nextEvent = nextScheduledEventCycle(target);
+                        if (nextEvent > totalCycles)
+                            budget = std::min(budget, nextEvent - totalCycles);
+                        budget = std::max<uint64_t>(budget, 1u);
+                    }
+                    runCpu(next->cpu, static_cast<uint32_t>(budget));
                     kernel.endTimeslice(*next, kThreadReturnSentinel);
                     if (totalCycles == before)
                         ++totalCycles;
@@ -636,7 +943,9 @@ namespace ps2x::iop::detail
             out << "[IOP] loaded IRX id=" << result.moduleId
                 << " entry=0x" << std::hex << modules[result.moduleId].entry
                 << " base=0x" << modules[result.moduleId].base
-                << " start=" << std::dec << result.startResult;
+                << " size=0x" << modules[result.moduleId].size
+                << " start=" << std::dec << result.startResult
+                << " name=" << modules[result.moduleId].name;
             log(LogLevel::Info, out.str());
             return result;
         }
@@ -655,7 +964,10 @@ namespace ps2x::iop::detail
         ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
         {
             std::vector<uint8_t> image;
-            if (!IopModuleLoader::readElfFromGuest(host, guestAddress, image))
+            // SCE SDK callers pass an IOP address (the IRX was copied there by SIF DMA);
+            // homebrew-style callers pass an EE buffer. Try IOP memory first.
+            if (!IopModuleLoader::readElfFromIop(memory, guestAddress, image) &&
+                !IopModuleLoader::readElfFromGuest(host, guestAddress, image))
                 return {true, -1, -1};
             std::ostringstream tag;
             tag << "buffer@0x" << std::hex << guestAddress;
@@ -676,6 +988,115 @@ namespace ps2x::iop::detail
             if (result)
                 *result = 0;
             return true;
+        }
+
+        void saveState(ps2x::StateWriter &w) const
+        {
+            memory.saveState(w);
+            kernel.saveState(w);
+            cdvd.saveState(w);
+            rpc.saveState(w);
+            intrman.saveState(w);
+            timrman.saveState(w);
+            ioman.saveState(w);
+            imports.saveState(w);
+            w.size(modules.size());
+            for (const auto &[id, module] : modules)
+            {
+                w.i32(module.id);
+                w.str(module.path);
+                w.str(module.name);
+                w.u32(module.base);
+                w.u32(module.size);
+                w.u32(module.entry);
+                w.u32(module.gp);
+                w.boolean(module.resident);
+            }
+            w.podMap(pendingDmaInterrupts);
+            w.size(pendingGuestCallbacks.size());
+            for (const auto &[cycle, callback] : pendingGuestCallbacks)
+            {
+                w.u64(cycle);
+                w.pod(callback);
+            }
+            w.u32(nextModuleId);
+            w.u32(moduleCursor);
+            w.u64(totalCycles);
+            w.u64(totalInstructions);
+            w.u64(eeCycleCarry);
+            w.u64(rpcAheadCycles);
+            w.pod(secrMcCommandHandler);
+            w.pod(secrMcDevIdHandler);
+            w.pod(checkKelfPathCallback);
+        }
+
+        void loadState(ps2x::StateReader &r)
+        {
+            memory.loadState(r);
+            kernel.loadState(r);
+            cdvd.loadState(r);
+            rpc.loadState(r);
+            intrman.loadState(r);
+            timrman.loadState(r);
+            ioman.loadState(r);
+            imports.loadState(r);
+            modules.clear();
+            const size_t moduleCount = r.size();
+            for (size_t i = 0; i < moduleCount; ++i)
+            {
+                Module module;
+                module.id = r.i32();
+                module.path = r.str();
+                module.name = r.str();
+                module.base = r.u32();
+                module.size = r.u32();
+                module.entry = r.u32();
+                module.gp = r.u32();
+                module.resident = r.boolean();
+                modules[module.id] = std::move(module);
+            }
+            r.podMap(pendingDmaInterrupts);
+            pendingGuestCallbacks.clear();
+            const size_t callbackCount = r.size();
+            for (size_t i = 0; i < callbackCount; ++i)
+            {
+                const uint64_t cycle = r.u64();
+                pendingGuestCallbacks.emplace(cycle, r.pod<ScheduledGuestCallback>());
+            }
+            nextModuleId = r.u32();
+            moduleCursor = r.u32();
+            // Snapshots from before the shared pool kept module images outside the allocator, with no
+            // allocation records: claim each saved module's image so the pool does not hand it out.
+            for (const auto &[id, module] : modules)
+            {
+                (void)id;
+                if (module.size != 0u && !memory.allocationContaining(module.base))
+                    (void)memory.allocate(module.size, 4u, module.base);
+            }
+            totalCycles = r.u64();
+            totalInstructions = r.u64();
+            eeCycleCarry = r.u64();
+            rpcAheadCycles = r.u64();
+            r.pod(secrMcCommandHandler);
+            r.pod(secrMcDevIdHandler);
+            r.pod(checkKelfPathCallback);
+            activeCpu = nullptr;
+            servicingDmaInterrupts = false;
+            servicingGuestCallbacks = false;
+            callDepth = 0u;
+            lastError.clear();
+        }
+
+        bool quiescent(std::string *why) const
+        {
+            const char *reason = nullptr;
+            if (activeCpu != nullptr || callDepth != 0u)
+                reason = "IOP code is executing";
+            else if (servicingDmaInterrupts || servicingGuestCallbacks)
+                reason = "IOP is servicing interrupts or callbacks";
+            if (reason && why)
+                *why = reason;
+            return reason == nullptr;
         }
 
         IopHost &host;
@@ -702,6 +1123,11 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        bool clipSlicesToEvents = false;
+        // IOP cycles run ahead of the EE by runThreadsBeforeServer, repaid by runEeCycles.
+        uint64_t rpcAheadCycles = 0;
+        uint64_t rpcDrains = 0;
+        uint64_t watchNextCycle = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -724,6 +1150,21 @@ namespace ps2x::iop::detail
         m_impl->reset();
     }
 
+    void IopEmulator::saveState(ps2x::StateWriter &w) const
+    {
+        m_impl->saveState(w);
+    }
+
+    void IopEmulator::loadState(ps2x::StateReader &r)
+    {
+        m_impl->loadState(r);
+    }
+
+    bool IopEmulator::quiescent(std::string *why) const
+    {
+        return m_impl->quiescent(why);
+    }
+
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
         return m_impl->loadModule(path, arguments, argumentSize);
@@ -742,10 +1183,38 @@ namespace ps2x::iop::detail
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
-        const uint64_t iopCycles = total / 8u;
+        uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
+        // IOP time already run ahead of the EE (threads run before an RPC server) is repaid.
+        const uint64_t repaid = std::min(iopCycles, m_impl->rpcAheadCycles);
+        m_impl->rpcAheadCycles -= repaid;
+        iopCycles -= repaid;
         if (iopCycles)
             m_impl->runCycles(iopCycles);
+    }
+
+    void IopEmulator::setBatchedTiming(bool enabled) noexcept
+    {
+        m_impl->clipSlicesToEvents = enabled;
+    }
+
+    uint64_t IopEmulator::eeCyclesUntilNextEvent() const noexcept
+    {
+        const Impl &impl = *m_impl;
+        if (impl.kernel.hasRunnableThread())
+            return 0u;
+        constexpr uint64_t kNever = std::numeric_limits<uint64_t>::max();
+        const uint64_t next = impl.nextScheduledEventCycle(kNever);
+        if (next == kNever)
+            return kNever;
+        if (next <= impl.totalCycles)
+            return 0u;
+        const uint64_t iopCycles = next - impl.totalCycles + impl.rpcAheadCycles;
+        if (iopCycles > (kNever / 8u))
+            return kNever;
+        // runEeCycles turns 8 EE cycles (plus the carry) into one IOP cycle.
+        const uint64_t eeCycles = iopCycles * 8u;
+        return eeCycles > impl.eeCycleCarry ? eeCycles - impl.eeCycleCarry : 1u;
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
@@ -825,6 +1294,16 @@ namespace ps2x::iop::detail
     uint32_t IopEmulator::rpcServerCount() const noexcept
     {
         return static_cast<uint32_t>(m_impl->rpc.serverCount());
+    }
+
+    void IopEmulator::setAudioOutput(std::function<void(const int16_t *, size_t)> sink)
+    {
+        m_impl->memory.spu2().setOutputSink(std::move(sink));
+    }
+
+    void IopEmulator::flushAudioOutput()
+    {
+        m_impl->memory.spu2().flushOutput();
     }
 
 }

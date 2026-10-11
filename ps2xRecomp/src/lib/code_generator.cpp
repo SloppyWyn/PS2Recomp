@@ -143,11 +143,24 @@ namespace ps2recomp
     void CodeGenerator::setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner)
     {
         m_resumeEntryTargetsByOwner = resumeTargetsByOwner;
+        m_resumeOwnerByTarget.clear();
         for (auto &[owner, targets] : m_resumeEntryTargetsByOwner)
         {
-            (void)owner;
             std::sort(targets.begin(), targets.end());
             targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+            if (m_resumeIntoOwner)
+            {
+                for (uint32_t target : targets)
+                {
+                    // The function table keeps the first registration per address
+                    // (FunctionTableEmitter); mirror that with the lowest owner start.
+                    auto inserted = m_resumeOwnerByTarget.emplace(target, owner);
+                    if (!inserted.second && owner < inserted.first->second)
+                    {
+                        inserted.first->second = owner;
+                    }
+                }
+            }
         }
     }
 
@@ -266,7 +279,7 @@ namespace ps2recomp
     CodeGenerator::AnalysisResult CodeGenerator::collectInternalBranchTargets(
         const Function &function, const std::vector<Instruction> &instructions, const std::vector<Function> *allFunctions)
     {
-        ControlFlowAnalyzer analyzer(m_sections, m_configJumpTableTargetsByAddress, m_reporter);
+        ControlFlowAnalyzer analyzer(m_sections, m_configJumpTableTargetsByAddress, m_reporter, m_resumeIntoOwner);
         return analyzer.analyze(function, instructions, allFunctions);
     }
 
@@ -293,6 +306,91 @@ namespace ps2recomp
     {
         FunctionTableEmitter emitter(*this);
         return emitter.emit(functions, stubs);
+    }
+
+    std::string CodeGenerator::leanIncludeLines() const
+    {
+        if (!m_lean.any())
+        {
+            return {};
+        }
+        std::string lines;
+        if (m_lean.gprScalar)
+        {
+            lines += "#define PS2X_LEAN_GPR_SCALAR 1\n";
+        }
+        lines += std::string("#include \"") + kLeanMacrosHeader + "\"\n";
+        return lines;
+    }
+
+    bool CodeGenerator::leanTranslationObservesPc(const std::string &code)
+    {
+        if (code.find("runtime->") != std::string::npos ||
+            code.find("ps2_syscalls::") != std::string::npos ||
+            code.find("ps2_stubs::") != std::string::npos ||
+            code.find("throw") != std::string::npos ||
+            code.find("ctx->pc") != std::string::npos)
+        {
+            return true;
+        }
+
+        // The lambda-style macros READ8/16/32/64/128( and WRITE8/16/32/64/128( call
+        // runtime->Load/Store on special addresses; FAST_READ32( and PS2X_READ32( do not count.
+        auto isIdentChar = [](char c)
+        { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+        for (const char *macro : {"READ", "WRITE"})
+        {
+            const size_t macroLength = std::strlen(macro);
+            size_t pos = code.find(macro);
+            while (pos != std::string::npos)
+            {
+                const bool wordStart = pos == 0 || !isIdentChar(code[pos - 1]);
+                size_t digits = pos + macroLength;
+                while (digits < code.size() && std::isdigit(static_cast<unsigned char>(code[digits])))
+                {
+                    ++digits;
+                }
+                if (wordStart && digits > pos + macroLength && digits < code.size() && code[digits] == '(')
+                {
+                    return true;
+                }
+                pos = code.find(macro, pos + macroLength);
+            }
+        }
+        return false;
+    }
+
+    std::string CodeGenerator::leanFoldZeroRegisters(std::string code)
+    {
+        static const std::pair<const char *, const char *> kFolds[] = {
+            {"GPR_U32(ctx, 0)", "0u"},
+            {"GPR_S32(ctx, 0)", "0"},
+            {"GPR_U64(ctx, 0)", "0ull"},
+            {"GPR_S64(ctx, 0)", "0ll"},
+            {"GPR_VEC(ctx, 0)", "_mm_setzero_si128()"},
+        };
+        auto isIdentChar = [](char c)
+        { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+        for (const auto &[pattern, replacement] : kFolds)
+        {
+            const size_t patternLength = std::strlen(pattern);
+            size_t pos = code.find(pattern);
+            while (pos != std::string::npos)
+            {
+                // Not the tail of another identifier (SET_GPR_U32 has three arguments, so it
+                // never matches, but keep the check explicit).
+                if (pos == 0 || !isIdentChar(code[pos - 1]))
+                {
+                    code.replace(pos, patternLength, replacement);
+                    pos = code.find(pattern, pos + std::strlen(replacement));
+                }
+                else
+                {
+                    pos = code.find(pattern, pos + patternLength);
+                }
+            }
+        }
+        return code;
     }
 
     const Symbol *CodeGenerator::findSymbolByAddress(uint32_t address) const

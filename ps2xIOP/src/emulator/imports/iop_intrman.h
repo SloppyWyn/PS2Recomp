@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <map>
+#include "ps2x/state_stream.h"
 
 namespace ps2x::iop::detail
 {
@@ -15,6 +16,10 @@ namespace ps2x::iop::detail
         explicit IopIntrman(IopMemory &memory) noexcept;
 
         void reset();
+
+        // Snapshots (docs/SNAPSHOT-DESIGN.md).
+        void saveState(ps2x::StateWriter &w) const;
+        void loadState(ps2x::StateReader &r);
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
         [[nodiscard]] bool dispatchInterrupt(int irq, IopGuestExecutor &executor) const;
 

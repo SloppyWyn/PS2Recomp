@@ -3,6 +3,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include "ps2x/state_stream.h"
 
 namespace ps2x::iop::detail
 {
@@ -14,9 +16,16 @@ namespace ps2x::iop::detail
     public:
         void reset() noexcept;
 
+        // Snapshots (docs/SNAPSHOT-DESIGN.md).
+        void saveState(ps2x::StateWriter &w) const;
+        void loadState(ps2x::StateReader &r);
+
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+        // Debug text (PS2X_IOP_WATCH_THREADS): every allocated timer, "t<index>:<run|stop>
+        // cmp=<compare> in=<IOP cycles to the next compare/overflow event> fn=<handler>".
+        [[nodiscard]] std::string describe(uint64_t currentCycle) const;
 
     private:
         struct Callback

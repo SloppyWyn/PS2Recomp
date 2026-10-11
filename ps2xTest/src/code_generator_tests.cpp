@@ -819,6 +819,53 @@ void register_code_generator_tests()
                  "mid-function external entry should register back to the owner wrapper");
     });
 
+    tc.Run("registration emits the guest name table", [](TestCase &t) {
+        Function real;
+        real.name = "FUN_00005000";
+        real.start = 0x5000;
+        real.end = 0x5040;
+        real.isRecompiled = true;
+
+        Function fragment;
+        fragment.name = "entry_5010";
+        fragment.start = 0x5010;
+        fragment.end = 0x5040;
+        fragment.isRecompiled = true;
+
+        Function stub;
+        stub.name = "FUN_00006000"; // the config binding "sceOpen@0x6000" names it
+        stub.start = 0x6000;
+        stub.end = 0x6020;
+        stub.isStub = true;
+
+        Function odd;
+        odd.name = "Foo<\"x\">::bar??";
+        odd.start = 0x7000;
+        odd.end = 0x7010;
+        odd.isRecompiled = true;
+
+        CodeGenerator gen({}, {});
+        gen.setGuestDisplayNames({{0x6000u, "sceOpen"}});
+        const std::string registration = gen.generateFunctionRegistration({stub, fragment, real, odd}, {});
+        printGeneratedCode("registration emits the guest name table", registration);
+
+        t.IsTrue(registration.find("#include \"ps2_guest_names.h\"") != std::string::npos,
+                 "the name table needs the runtime's declaration");
+        t.IsTrue(registration.find("{0x5000u, 0x5040u, \"FUN_00005000\", 0u},") != std::string::npos,
+                 "a real function is emitted with its range and no flags");
+        t.IsTrue(registration.find("{0x5010u, 0x5040u, \"entry_5010\", 1u},") != std::string::npos,
+                 "a resume fragment is flagged");
+        t.IsTrue(registration.find("{0x6000u, 0x6020u, \"sceOpen\", 2u},") != std::string::npos,
+                 "a runtime-bound stub is flagged and shown under its config name");
+        t.IsTrue(registration.find("\"Foo<\\\"x\\\">::bar\\?\\?\"") != std::string::npos,
+                 "quotes and trigraph question marks are escaped");
+        t.IsTrue(registration.find("{0x5000u") < registration.find("{0x5010u") &&
+                     registration.find("{0x5010u") < registration.find("{0x6000u"),
+                 "entries are sorted by address");
+        t.IsTrue(registration.find("ps2xRegisterGuestFunctionNames(") != std::string::npos,
+                 "the table registers itself");
+    });
+
     tc.Run("branches outside function still set pc", [](TestCase &t) {
         Function func;
         func.name = "external_branch";
@@ -873,6 +920,344 @@ void register_code_generator_tests()
 
         t.IsTrue(generated.find("target_func(rdram, ctx, runtime); return;") != std::string::npos,
                  "jump to known function should emit direct call");
+    });
+
+    tc.Run("resume_into_owner: a jump to a label registered to an owner calls the owner", [](TestCase &t) {
+        Function func;
+        func.name = "jump_to_label";
+        func.start = 0x4000;
+        func.end = 0x400C;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        Instruction j{};
+        j.address = 0x4000;
+        j.opcode = OPCODE_J;
+        j.target = (0x5008u >> 2) & 0x3FFFFFF; // a label inside owner_0x5000, not a function
+        j.hasDelaySlot = true;
+        j.raw = 0x08000000 | (j.target & 0x3FFFFFF);
+        std::vector<Instruction> instructions{j, makeNop(0x4004), makeNop(0x4008)};
+
+        {
+            CodeGenerator gen({}, {});
+            gen.setRenamedFunctions({{0x5000u, "owner_0x5000"}});
+            gen.setResumeEntryTargets({{0x5000u, {0x5008u}}});
+            const std::string generated = gen.generateFunction(func, instructions, false);
+            t.IsTrue(generated.find("owner_0x5000(rdram, ctx, runtime); return;") == std::string::npos &&
+                         generated.find("dispatchGuestBranch(rdram, ctx, 0x5008u") != std::string::npos,
+                     "switch off: the jump goes through the dispatcher as before");
+        }
+        {
+            CodeGenerator gen({}, {});
+            gen.setResumeIntoOwner(true);
+            gen.setRenamedFunctions({{0x5000u, "owner_0x5000"}});
+            gen.setResumeEntryTargets({{0x5000u, {0x5008u}}});
+            const std::string generated = gen.generateFunction(func, instructions, false);
+            printGeneratedCode("resume_into_owner: a jump to a label registered to an owner calls the owner", generated);
+            const size_t pcStore = generated.find("ctx->pc = 0x5008u;");
+            const size_t call = generated.find("owner_0x5000(rdram, ctx, runtime); return;");
+            t.IsTrue(call != std::string::npos, "switch on: the jump calls the owner directly");
+            t.IsTrue(pcStore != std::string::npos && pcStore < call,
+                     "ctx->pc holds the label before the call so the owner's switch lands on it");
+            const size_t checkpoint = generated.find("if (runtime->eeCheckpointDue()) { return; }");
+            t.IsTrue(checkpoint != std::string::npos && pcStore < checkpoint && checkpoint < call,
+                     "a checkpoint sits between the pc store and the owner call (chains of label jumps stay bounded)");
+        }
+        {
+            // A jump to a real function is unchanged by the switch: no checkpoint, direct call.
+            CodeGenerator gen({}, {});
+            gen.setResumeIntoOwner(true);
+            gen.setRenamedFunctions({{0x5008u, "real_0x5008"}});
+            const std::string generated = gen.generateFunction(func, instructions, false);
+            t.IsTrue(generated.find("real_0x5008(rdram, ctx, runtime); return;") != std::string::npos &&
+                         generated.find("eeCheckpointDue") == std::string::npos,
+                     "switch on: a jump to a function start is still a plain direct call");
+        }
+    });
+
+    tc.Run("resume_into_owner: a resume at a labelled delay slot runs the slot as a plain instruction", [](TestCase &t) {
+        Function func;
+        func.name = "ds_label";
+        func.start = 0x7000;
+        func.end = 0x7010;
+        func.isRecompiled = true;
+        // beq (always taken) at 0x7000 -> 0x700C, delay slot addiu at 0x7004 is a label.
+        std::vector<Instruction> instructions{makeBranch(0x7000, 2), makeAddiu(0x7004, 2, 2, 1), makeNop(0x7008), makeNop(0x700C)};
+        auto block = [](const std::string &generated) {
+            const size_t begin = generated.find("if (ctx->pc == 0x7004u) {");
+            const size_t end = generated.find("ctx->pc = 0x7008u;", begin);
+            return begin == std::string::npos || end == std::string::npos ? std::string() : generated.substr(begin, end - begin);
+        };
+        {
+            CodeGenerator gen({}, {});
+            gen.setResumeEntryTargets({{0x7000u, {0x7004u}}});
+            const std::string b = block(gen.generateFunction(func, instructions, false));
+            t.IsTrue(!b.empty() && b.find("ctx->in_delay_slot = true;") != std::string::npos,
+                     "switch off: unchanged, the delay-slot entry still sets in_delay_slot");
+        }
+        {
+            CodeGenerator gen({}, {});
+            gen.setResumeIntoOwner(true);
+            gen.setResumeEntryTargets({{0x7000u, {0x7004u}}});
+            const std::string generated = gen.generateFunction(func, instructions, false);
+            printGeneratedCode("resume_into_owner: a resume at a labelled delay slot runs the slot as a plain instruction", generated);
+            const std::string b = block(generated);
+            t.IsTrue(!b.empty(), "the delay-slot entry block exists");
+            t.IsTrue(b.find("in_delay_slot") == std::string::npos && b.find("branch_pc") == std::string::npos,
+                     "switch on: the entry path sets neither in_delay_slot nor branch_pc");
+            t.IsTrue(b.find("ctx->pc = 0x7004u;") != std::string::npos && b.find("ADD32") != std::string::npos,
+                     "switch on: the slot instruction itself still runs on that path");
+            t.IsTrue(generated.find("ctx->in_delay_slot = true;") != std::string::npos,
+                     "the normal branch path still runs the slot as a delay slot");
+        }
+    });
+
+    tc.Run("resume_into_owner: branch-and-link return addresses are resume points", [](TestCase &t) {
+        Function func;
+        func.name = "bal";
+        func.start = 0x6000;
+        func.end = 0x6010;
+        func.isRecompiled = true;
+        Instruction bgezal{};
+        bgezal.address = 0x6000;
+        bgezal.opcode = OPCODE_REGIMM;
+        bgezal.rt = REGIMM_BGEZAL;
+        bgezal.rs = 0;
+        bgezal.simmediate = 0x100; // forward, outside the function
+        bgezal.isBranch = true;
+        bgezal.hasDelaySlot = true;
+        bgezal.raw = 0x04110100u;
+        std::vector<Instruction> instructions{bgezal, makeNop(0x6004), makeNop(0x6008), makeNop(0x600C)};
+        {
+            CodeGenerator gen({}, {});
+            const auto analysis = gen.collectInternalBranchTargets(func, instructions);
+            t.IsFalse(analysis.resumeEntryPoints.contains(0x6008u), "switch off: unchanged (no resume point)");
+        }
+        {
+            CodeGenerator gen({}, {});
+            gen.setResumeIntoOwner(true);
+            const auto analysis = gen.collectInternalBranchTargets(func, instructions);
+            t.IsTrue(analysis.resumeEntryPoints.contains(0x6008u), "switch on: bgezal+8 is a resume point like jal+8");
+        }
+    });
+
+    tc.Run("lean_codegen: pc is stored only before code that can reach the runtime", [](TestCase &t) {
+        Function func;
+        func.name = "lean_pc";
+        func.start = 0x7000;
+        func.end = 0x701C;
+        func.isRecompiled = true;
+
+        Instruction add{};
+        add.address = 0x7008;
+        add.opcode = OPCODE_SPECIAL;
+        add.function = SPECIAL_ADD; // overflow -> runtime->SignalException
+        add.rs = 4;
+        add.rt = 5;
+        add.rd = 2;
+        add.raw = 0x00851020u;
+        std::vector<Instruction> instructions{
+            makeAddiu(0x7000, 2, 4, 0x10), // pure
+            makeLw(0x7004, 3, 2, 0x20),    // lean memory helper
+            add,
+            makeSw(0x700C, 3, 29, 0x8),
+            makeSyscall(0x7010),
+            makeOri(0x7014, 6, 0, 0x7),
+            makeNop(0x7018)};
+
+        {
+            CodeGenerator gen({}, {});
+            const std::string generated = gen.generateFunction(func, instructions, false);
+            t.IsTrue(generated.find("ctx->pc = 0x7000u;\n    SET_GPR_S32") != std::string::npos &&
+                         generated.find("READ32(ADD32(GPR_U32(ctx, 2), 32))") != std::string::npos &&
+                         generated.find("WRITE32(ADD32(GPR_U32(ctx, 29), 8), GPR_U32(ctx, 3))") != std::string::npos &&
+                         generated.find("PS2X_") == std::string::npos &&
+                         generated.find("ps2_runtime_lean_macros.h") == std::string::npos,
+                     "switch off: every instruction stores pc and the lambda macros are used, as before");
+        }
+        {
+            CodeGenerator gen({}, {});
+            gen.setLeanCodegen(true);
+            const std::string generated = gen.generateFunction(func, instructions, false);
+            printGeneratedCode("lean_codegen: pc is stored only before code that can reach the runtime", generated);
+            t.IsTrue(generated.find("ctx->pc = 0x7000u;\n\n") != std::string::npos,
+                     "the function entry still publishes its start pc");
+            t.IsTrue(generated.find("ctx->pc = 0x7000u;\n    SET_GPR_S32") == std::string::npos,
+                     "a pure register instruction has no pc store");
+            t.IsTrue(generated.find("ctx->pc = 0x7004u;") == std::string::npos &&
+                         generated.find("SET_GPR_S32(ctx, 3, (int32_t)PS2X_READ32(ADD32(GPR_U32(ctx, 2), 32), 0x7004u));") != std::string::npos,
+                     "a load uses the lean helper carrying its pc, with no store before it");
+            t.IsTrue(generated.find("ctx->pc = 0x7008u;\n    { \n        int32_t rs_val") != std::string::npos ||
+                         (generated.find("ctx->pc = 0x7008u;") != std::string::npos &&
+                          generated.find("ctx->pc = 0x7008u;") < generated.find("runtime->SignalException")),
+                     "an instruction that can raise an exception stores pc before it");
+            t.IsTrue(generated.find("ctx->pc = 0x700Cu;") == std::string::npos &&
+                         generated.find("PS2X_WRITE32(ADD32(GPR_U32(ctx, 29), 8), GPR_U32(ctx, 3), 0x700Cu);") != std::string::npos,
+                     "a store uses the lean helper carrying its pc");
+            t.IsTrue(generated.find("ctx->pc = 0x7010u;\n    ctx->pc = 0x7014u;\nruntime->handleSyscall") != std::string::npos,
+                     "a syscall keeps the pc store before it and its own continuation store");
+            t.IsTrue(generated.find("ctx->pc = 0x7014u;\n    SET_GPR_U64(ctx, 6, 0ull | (uint64_t)(uint16_t)7);") == std::string::npos &&
+                         generated.find("SET_GPR_U64(ctx, 6, 0ull | (uint64_t)(uint16_t)7);") != std::string::npos,
+                     "ori from $zero folds the register read to a literal and stores no pc");
+            t.IsTrue(generated.find("ps2TraceGuestWrite") == std::string::npos &&
+                         generated.find("[&]") == std::string::npos,
+                     "no write-trace no-op and no lambda in lean output");
+            t.IsTrue(generated.find("ctx->pc = 0x701cu;") != std::string::npos,
+                     "the fallthrough end of the function still publishes the next pc");
+        }
+    });
+
+    tc.Run("lean_codegen: delay slots publish their state only when they can reach the runtime", [](TestCase &t) {
+        Function func;
+        func.name = "lean_delay";
+        func.start = 0x7100;
+        func.end = 0x7120;
+        func.isRecompiled = true;
+
+        // beq at 0x7100 with a pure delay slot, beq at 0x7108 with a load in the delay slot,
+        // beq at 0x7110 with an overflow-checking add in the delay slot; all branch forward
+        // to 0x7118 (inside the function).
+        Instruction add{};
+        add.address = 0x7114;
+        add.opcode = OPCODE_SPECIAL;
+        add.function = SPECIAL_ADD;
+        add.rs = 4;
+        add.rt = 5;
+        add.rd = 2;
+        add.raw = 0x00851020u;
+        std::vector<Instruction> instructions{
+            makeBranch(0x7100, 5), makeAddiu(0x7104, 2, 4, 0x10),
+            makeBranch(0x7108, 3), makeLw(0x710C, 3, 2, 0x20),
+            makeBranch(0x7110, 1), add,
+            makeNop(0x7118), makeNop(0x711C)};
+
+        CodeGenerator gen({}, {});
+        gen.setLeanCodegen(true);
+        const std::string generated = gen.generateFunction(func, instructions, false);
+        printGeneratedCode("lean_codegen: delay slots", generated);
+
+        const size_t firstBranch = generated.find("branch_taken_0x7100");
+        const size_t secondBranch = generated.find("branch_taken_0x7108");
+        const size_t thirdBranch = generated.find("branch_taken_0x7110");
+        t.IsTrue(firstBranch != std::string::npos && secondBranch != std::string::npos && thirdBranch != std::string::npos,
+                 "all three branches are emitted");
+        const std::string first = generated.substr(firstBranch, secondBranch - firstBranch);
+        const std::string second = generated.substr(secondBranch, thirdBranch - secondBranch);
+        const std::string third = generated.substr(thirdBranch);
+
+        t.IsTrue(first.find("in_delay_slot") == std::string::npos && first.find("branch_pc") == std::string::npos &&
+                     first.find("ctx->pc = 0x7104u") == std::string::npos && first.find("ctx->pc = 0x7100u") == std::string::npos,
+                 "a pure delay slot sets neither the delay-slot flags nor the branch/delay pc");
+        t.IsTrue(first.find("ctx->pc = 0x7118u;") != std::string::npos && first.find("ctx->pc = 0x7108u;") != std::string::npos,
+                 "the taken target and the fallthrough pc are still published");
+        t.IsTrue(second.find("PS2X_READ32_DS(ADD32(GPR_U32(ctx, 2), 32), 0x710Cu, 0x7108u)") != std::string::npos &&
+                     second.find("in_delay_slot") == std::string::npos,
+                 "a load in a delay slot carries its pc and the branch pc into the lean helper, with no flag stores");
+        const size_t flagOn = third.find("ctx->in_delay_slot = true;");
+        const size_t branchPc = third.find("ctx->branch_pc = 0x7110u;");
+        const size_t delayPc = third.find("ctx->pc = 0x7114u;");
+        const size_t signal = third.find("runtime->SignalException");
+        const size_t flagOff = third.find("ctx->in_delay_slot = false;");
+        t.IsTrue(flagOn != std::string::npos && branchPc != std::string::npos && delayPc != std::string::npos &&
+                     signal != std::string::npos && flagOff != std::string::npos &&
+                     flagOn < signal && branchPc < signal && delayPc < signal && signal < flagOff,
+                 "a delay slot that can raise an exception keeps the full delay-slot protocol");
+    });
+
+    tc.Run("lean_codegen: a branch into a delay slot keeps the resume-read invariant", [](TestCase &t) {
+        // A at 0x8000 branches to 0x800C, the delay slot of B at 0x8008. The emitter guards B's
+        // delay slot with `if (ctx->pc == 0x800Cu)` (entered from the switch or from A's goto):
+        // A must publish 0x800C before its goto, and the straight-line path into B must reach the
+        // check with no store of 0x800C (lean drops stores, so the stale pc is one of B's
+        // predecessors, all below 0x800C).
+        Function func;
+        func.name = "lean_delay_resume";
+        func.start = 0x8000;
+        func.end = 0x801C;
+        func.isRecompiled = true;
+        std::vector<Instruction> instructions{
+            makeBranch(0x8000, 2), makeNop(0x8004),           // A -> 0x800C
+            makeBranch(0x8008, 3), makeAddiu(0x800C, 2, 4, 1), // B -> 0x8018, delay slot 0x800C
+            makeNop(0x8010), makeNop(0x8014), makeNop(0x8018)};
+        for (const bool lean : {false, true})
+        {
+            CodeGenerator gen({}, {});
+            gen.setLeanCodegen(lean);
+            const std::string generated = gen.generateFunction(func, instructions, false);
+            printGeneratedCode(lean ? "delay-slot resume (lean)" : "delay-slot resume", generated);
+            const size_t check = generated.find("if (ctx->pc == 0x800Cu)");
+            const size_t gotoDelay = generated.find("goto label_800c;");
+            const size_t storeDelay = generated.find("ctx->pc = 0x800Cu;");
+            t.IsTrue(check != std::string::npos && gotoDelay != std::string::npos, "the delay-slot entry check and the jump into it exist");
+            t.IsTrue(storeDelay != std::string::npos && storeDelay < gotoDelay && gotoDelay < check,
+                     "the branch into the delay slot publishes 0x800C before its goto (the check relies on it)");
+            // Between A's block and B's check, straight-line code stores only pcs below 0x800C.
+            const std::string between = generated.substr(gotoDelay, check - gotoDelay);
+            std::regex store("ctx->pc = 0x([0-9A-Fa-f]+)u;");
+            bool allBelow = true;
+            for (auto it = std::sregex_iterator(between.begin(), between.end(), store); it != std::sregex_iterator(); ++it)
+            {
+                allBelow = allBelow && std::stoul((*it)[1].str(), nullptr, 16) < 0x800Cu;
+            }
+            t.IsTrue(allBelow, "no straight-line store of the delay-slot pc can make the check fire by accident");
+        }
+    });
+
+    tc.Run("lean_codegen: calls, dispatches and returns keep their pc stores", [](TestCase &t) {
+        Function func;
+        func.name = "lean_calls";
+        func.start = 0x7200;
+        func.end = 0x7214;
+        func.isRecompiled = true;
+        std::vector<Instruction> instructions{makeNop(0x7200), makeJal(0x7204, 0x5000), makeNop(0x7208),
+                                              makeJr(0x720C, 31), makeNop(0x7210)};
+
+        CodeGenerator gen({}, {});
+        gen.setLeanCodegen(true);
+        const std::string generated = gen.generateFunction(func, instructions, false);
+        printGeneratedCode("lean_codegen: calls", generated);
+
+        const size_t target = generated.find("ctx->pc = 0x5000u;");
+        const size_t dispatch = generated.find("dispatchGuestBranch(rdram, ctx, 0x5000u, 0x7204u, 0x720Cu");
+        t.IsTrue(target != std::string::npos && dispatch != std::string::npos && target < dispatch,
+                 "the call target is published before the dispatch");
+        t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, 0x720Cu);") != std::string::npos, "the link register is set");
+        t.IsTrue(generated.find("ctx->pc = 0x7204u;") == std::string::npos && generated.find("ctx->pc = 0x720Cu;") != std::string::npos,
+                 "the jal's own pc is not stored; the return address is (resume point)");
+        t.IsTrue(generated.find("ctx->pc = jumpTarget;") != std::string::npos, "jr publishes its target");
+    });
+
+    tc.Run("lean_codegen: zero-register folding and header", [](TestCase &t) {
+        t.Equals(CodeGenerator::leanFoldZeroRegisters("SET_GPR_S32(ctx, 10, (int32_t)ADD32(GPR_U32(ctx, 0), GPR_U32(ctx, 10)));"),
+                 std::string("SET_GPR_S32(ctx, 10, (int32_t)ADD32(0u, GPR_U32(ctx, 10)));"),
+                 "GPR_U32(ctx, 0) folds, GPR_U32(ctx, 10) and SET_GPR do not");
+        t.Equals(CodeGenerator::leanFoldZeroRegisters("GPR_S32(ctx, 0) GPR_U64(ctx, 0) GPR_S64(ctx, 0) GPR_VEC(ctx, 0) SET_GPR_U32(ctx, 0, 1)"),
+                 std::string("0 0ull 0ll _mm_setzero_si128() SET_GPR_U32(ctx, 0, 1)"),
+                 "every read form of $zero folds; the write form is left alone");
+
+        t.IsTrue(CodeGenerator::leanTranslationObservesPc("runtime->Load32(rdram, ctx, 0x10000000u)"), "runtime call observes");
+        t.IsTrue(CodeGenerator::leanTranslationObservesPc("SET_GPR_S32(ctx, 2, (int32_t)READ32(addr));"), "lambda READ32 observes");
+        t.IsTrue(CodeGenerator::leanTranslationObservesPc("WRITE128(addr, v);"), "lambda WRITE128 observes");
+        t.IsTrue(CodeGenerator::leanTranslationObservesPc("ctx->pc = 0x4u;"), "own pc store observes");
+        t.IsTrue(CodeGenerator::leanTranslationObservesPc("throw std::runtime_error(\"x\");"), "throw observes");
+        t.IsFalse(CodeGenerator::leanTranslationObservesPc("FAST_READ32(0x100u)"), "FAST_READ does not observe");
+        t.IsFalse(CodeGenerator::leanTranslationObservesPc("PS2X_READ32(a, 0x4u)"), "lean helper does not observe");
+        t.IsFalse(CodeGenerator::leanTranslationObservesPc("FAST_WRITE128(0x100u, v)"), "FAST_WRITE does not observe");
+        t.IsFalse(CodeGenerator::leanTranslationObservesPc("SET_GPR_U64(ctx, 2, GPR_U64(ctx, 3) & 7);"), "register op does not observe");
+        t.IsFalse(CodeGenerator::leanTranslationObservesPc(""), "empty does not observe");
+
+        Function func;
+        func.name = "lean_header";
+        func.start = 0x7300;
+        func.end = 0x7304;
+        func.isRecompiled = true;
+        CodeGenerator gen({}, {});
+        gen.setLeanCodegen(true);
+        const std::string generated = gen.generateFunction(func, {makeNop(0x7300)}, true);
+        t.IsTrue(generated.find("#include \"ps2_runtime_lean_macros.h\"") != std::string::npos,
+                 "lean output includes the lean runtime header after the standard ones");
+        t.IsTrue(generated.find("#include \"ps2_runtime_macros.h\"") < generated.find("#include \"ps2_runtime_lean_macros.h\""),
+                 "the lean header comes after ps2_runtime_macros.h, which it redefines");
     });
 
     tc.Run("jump to unknown target sets pc", [](TestCase &t) {
@@ -1268,6 +1653,9 @@ void register_code_generator_tests()
 
         tc.Run("VU0 macro mappings cover all S1/S2 enums", [](TestCase &t) {
             const std::vector<std::string> candidates = {
+#ifdef PS2X_SOURCE_DIR
+                std::string(PS2X_SOURCE_DIR) + "/ps2xRecomp/include/ps2recomp/instructions.h",
+#endif
                 "ps2xRecomp/include/ps2recomp/instructions.h",
                 "../ps2xRecomp/include/ps2recomp/instructions.h",
                 "../../ps2xRecomp/include/ps2recomp/instructions.h"
@@ -1352,7 +1740,7 @@ void register_code_generator_tests()
             CodeGenerator gen({}, {});
             std::string out = gen.translateInstruction(inst);
 
-            t.IsTrue(out.find("_mm_blendv_ps") != std::string::npos, "S1 q/i form should honor destination mask");
+            t.IsTrue(out.find(", 0x9u);") != std::string::npos, "S1 q/i form should honor destination mask");
             t.IsTrue(out.find("ctx->vu0_vf[13]") != std::string::npos, "S1 q/i source should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[4]") != std::string::npos, "S1 q/i destination should come from sa");
             t.IsTrue(out.find("ctx->vu0_vf[25]") == std::string::npos, "S1 q/i must not use rs(format) as register index");
@@ -1383,15 +1771,13 @@ void register_code_generator_tests()
             {
                 const std::string message =
                     std::string(name) + " writes VF and must not overwrite ACC";
-                t.IsTrue(code.find("ctx->vu0_acc = res") == std::string::npos,
+                t.IsTrue(code.find("&ctx->vu0_acc,") == std::string::npos &&
+                             code.find("(ctx, &ctx->vu0_vf[3], ctx->vu0_acc,") != std::string::npos,
                          message.c_str());
-                t.IsTrue(code.find("PS2_VADD(ctx->vu0_acc") != std::string::npos ||
-                             code.find("PS2_VSUB(ctx->vu0_acc") != std::string::npos,
-                         (std::string(name) + " must still read ACC").c_str());
             }
 
             const std::string madda = gen.translateVU_VMADDA(inst);
-            t.IsTrue(madda.find("ctx->vu0_acc =") != std::string::npos,
+            t.IsTrue(madda.find("ps2x_vu0::madd(ctx, &ctx->vu0_acc, ctx->vu0_acc,") != std::string::npos,
                      "MADDA must continue writing ACC");
         });
 
@@ -1408,17 +1794,15 @@ void register_code_generator_tests()
 
             for (const std::string *code : {&opmula, &opmsub})
             {
-                t.IsTrue(code->find("_MM_SHUFFLE(3,0,2,1)") != std::string::npos,
+                t.IsTrue(code->find("ps2x_vu0::yzx(ctx->vu0_vf[11])") != std::string::npos,
                          "OPM source Fs must be permuted to y,z,x");
-                t.IsTrue(code->find("_MM_SHUFFLE(3,1,0,2)") != std::string::npos,
+                t.IsTrue(code->find("ps2x_vu0::zxy(ctx->vu0_vf[7])") != std::string::npos,
                          "OPM source Ft must be permuted to z,x,y");
-                t.IsTrue(code->find("PS2_VMUL(fs_yzx, ft_zxy)") != std::string::npos,
-                         "OPM product must use the permuted operands");
             }
 
-            t.IsTrue(opmula.find("ctx->vu0_acc =") != std::string::npos,
+            t.IsTrue(opmula.find("ps2x_vu0::mul(ctx, &ctx->vu0_acc,") != std::string::npos,
                      "OPMULA must write the permuted product to ACC");
-            t.IsTrue(opmsub.find("ctx->vu0_acc = res") == std::string::npos,
+            t.IsTrue(opmsub.find("ps2x_vu0::msub(ctx, &ctx->vu0_vf[3], ctx->vu0_acc,") != std::string::npos,
                      "OPMSUB must preserve ACC after producing the cross product");
         });
 
@@ -2006,33 +2390,21 @@ void register_code_generator_tests()
                      "jalr fallback should not dispatch directly to tail-jump delay slot");
         });
 
-        tc.Run("VU random helpers emit line comments on separate lines", [](TestCase &t) {
+        tc.Run("VU random helpers use the R register helpers", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
             Instruction inst{};
             inst.rd = 7;
+            inst.rt = 3;
             inst.vectorInfo.fsf = 2;
+            inst.vectorInfo.vectorField = 0xF;
 
-            std::string vrnext = gen.translateVU_VRNEXT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRNEXT", vrnext);
-            t.IsTrue(vrnext.find("// Simple LFSR-based random number generation (PS2-like behavior)\n"
-                                 "    uint32_t feedback") != std::string::npos,
-                     "VRNEXT should place the generated line comment on its own line");
-
-            std::string vrinit = gen.translateVU_VRINIT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRINIT", vrinit);
-            t.IsTrue(vrinit.find("// PS2 uses a specific LFSR initialization pattern\n"
-                                 "    if (seed == 0) seed = 1;") != std::string::npos,
-                     "VRINIT should place the generated line comment on its own line");
-
-            std::string vrxor = gen.translateVU_VRXOR(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRXOR", vrxor);
-            t.IsTrue(vrxor.find("// XOR the current random value with the data from the VU vector register\n"
-                                "    __m128i xored") != std::string::npos,
-                     "VRXOR should keep the XOR comment on its own line");
-            t.IsTrue(vrxor.find("// Apply a simple mixing function similar to PS2's LFSR\n"
-                                "    __m128i mixed") != std::string::npos,
-                     "VRXOR should keep the LFSR comment on its own line");
+            t.IsTrue(gen.translateVU_VRNEXT(inst).find("ps2x_vu0::rnext(ctx, &ctx->vu0_vf[3], 0xFu);") != std::string::npos,
+                     "VRNEXT steps R and writes ft");
+            t.IsTrue(gen.translateVU_VRINIT(inst).find("ps2x_vu0::rinit(ctx, ps2x_vu0::lane(ctx->vu0_vf[7], 2u));") != std::string::npos,
+                     "VRINIT seeds R from fs.fsf");
+            t.IsTrue(gen.translateVU_VRXOR(inst).find("ps2x_vu0::rxor(ctx, ps2x_vu0::lane(ctx->vu0_vf[7], 2u));") != std::string::npos,
+                     "VRXOR xors fs.fsf into R");
         });
 
         tc.Run("resolveStubTarget allows leading underscore alias", [](TestCase &t) {

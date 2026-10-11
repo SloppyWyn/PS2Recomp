@@ -7,8 +7,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace ps2x::iop::detail
@@ -220,6 +223,7 @@ namespace ps2x::iop::detail
             server.callback = m_memory.read32(stackPointer + 16u);
             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
             server.queue = m_memory.read32(stackPointer + 24u);
+            server.threadPriority = m_kernel.currentThreadPriority();
             m_servers[server.sid] = server;
             if (server.serverData != 0u)
             {
@@ -280,6 +284,8 @@ namespace ps2x::iop::detail
         if (serverIt == m_servers.end() || serverIt->second.function == 0u)
             return result;
 
+        // The server function runs where its thread would: after the IOP threads that go first.
+        executor.runThreadsBeforeServer(serverIt->second.threadPriority);
         RpcServer &server = serverIt->second;
         if (request.send.size != 0u && server.buffer != 0u)
         {
@@ -292,6 +298,44 @@ namespace ps2x::iop::detail
             }
         }
 
+        // PS2X_IOP_RPC_LOG=1 logs every EE -> IOP RPC call served by a guest server: sid,
+        // function, the first 24 halfwords of the send buffer and the first 8 words of the
+        // reply, on stderr as [iop:rpc] (up to PS2X_IOP_RPC_LOG_MAX lines, default 20000).
+        static const int s_rpcLogMax = [] {
+            const char *on = std::getenv("PS2X_IOP_RPC_LOG");
+            if (!on || !*on || *on == '0')
+                return 0;
+            const char *max = std::getenv("PS2X_IOP_RPC_LOG_MAX");
+            return max && *max ? std::atoi(max) : 20000;
+        }();
+        static int s_rpcLogLines = 0;
+        const bool logThis = s_rpcLogLines < s_rpcLogMax;
+        std::string logLine;
+        if (logThis)
+        {
+            char item[64];
+            std::snprintf(item, sizeof(item), "[iop:rpc] sid=0x%X fn=%u send=", request.sid, request.function);
+            logLine = item;
+            const uint32_t words = std::min<uint32_t>(request.send.size / 2u, 24u);
+            for (uint32_t i = 0u; i < words; ++i)
+            {
+                std::snprintf(item, sizeof(item), "%s%04X", i ? "," : "", m_memory.read16(server.buffer + i * 2u));
+                logLine += item;
+            }
+        }
+
+        // IOP threads that were runnable (preempted mid-work) when the server ran, and whether
+        // the IOP had interrupts disabled (a thread inside a critical section).
+        std::string threadsAtCall;
+        if (logThis)
+        {
+            const std::string ready = m_kernel.describeThreads(true);
+            if (!ready.empty())
+                threadsAtCall += " ready=[" + ready + "]";
+            if (m_memory.interruptControl() == 0u)
+                threadsAtCall += " intr-off";
+        }
+
         uint32_t returnPointer = executor.executeGuestFunction(server.function,
                                                                request.function,
                                                                server.buffer,
@@ -300,6 +344,21 @@ namespace ps2x::iop::detail
                                                                server.gp);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
+        if (logThis)
+        {
+            ++s_rpcLogLines;
+            char item[32];
+            logLine += " reply=";
+            const uint32_t words = std::min<uint32_t>(request.receive.size / 4u, 8u);
+            for (uint32_t i = 0u; i < words; ++i)
+            {
+                std::snprintf(item, sizeof(item), "%s%08X", i ? "," : "", m_memory.read32(returnPointer + i * 4u));
+                logLine += item;
+            }
+            logLine += threadsAtCall;
+            logLine += '\n';
+            std::fputs(logLine.c_str(), stderr);
+        }
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
         {
             const uint32_t physical = IopMemory::physicalAddress(returnPointer);
@@ -345,5 +404,22 @@ namespace ps2x::iop::detail
     {
         const auto server = m_servers.find(sid);
         return server != m_servers.end() && server->second.function != 0u;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopRpcBridge::saveState(ps2x::StateWriter &w) const
+    {
+        w.podMap(m_servers);
+        w.u32(m_nextDmaId);
+        w.boolean(m_sifInitialized);
+    }
+
+    void IopRpcBridge::loadState(ps2x::StateReader &r)
+    {
+        r.podMap(m_servers);
+        m_nextDmaId = r.u32();
+        m_sifInitialized = r.boolean();
     }
 }

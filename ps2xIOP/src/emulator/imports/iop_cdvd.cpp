@@ -600,12 +600,26 @@ namespace ps2x::iop::detail
                 return false;
 
             const std::string guestPath = memory.readString(nameAddress, 1024u);
+            // sceCdlFILE: lsn, size, name[16], date/flags[8].
+            std::array<uint8_t, 32u> result{};
+            uint32_t hostLsn = 0u;
+            uint32_t hostSize = 0u;
+            if (host.cdSearchFile(guestPath, hostLsn, hostSize))
+            {
+                // The host's registry (the EE's libcdvd stubs use the same one): the LSN it
+                // hands out is what its cdReadSectors expects back.
+                writeLe32(result.data(), hostLsn);
+                writeLe32(result.data() + 4u, hostSize);
+                const ParsedPs2Path parsed = parsePs2Path(guestPath);
+                const size_t slash = parsed.path.find_last_of('/');
+                const std::string leaf = normalizedIsoComponent(slash == std::string::npos ? parsed.path : parsed.path.substr(slash + 1u));
+                std::memcpy(result.data() + 8u, leaf.data(), std::min<size_t>(16u, leaf.size()));
+                return memory.writeRam(resultAddress, result.data(), result.size());
+            }
             IsoNode *node = findVirtualIsoNode(guestPath);
             if (!node)
                 return false;
 
-            // sceCdlFILE: lsn, size, name[16], date/flags[8].
-            std::array<uint8_t, 32u> result{};
             writeLe32(result.data(), node->lsn);
             writeLe32(result.data() + 4u, node->size);
             const std::string leaf = normalizedIsoComponent(node->identifier);
@@ -667,9 +681,11 @@ namespace ps2x::iop::detail
             const size_t byteCount = static_cast<size_t>(byteCount64);
             std::vector<uint8_t> bytes(byteCount, 0u);
 
-            bool read = false;
+            // The host's registry first (an LSN its cdSearchFile handed out, or one the EE
+            // got from its own sceCdSearchFile and passed down): one LSN space for both CPUs.
+            bool read = host.cdReadSectors(lsn, sectors, bytes.data());
             const std::string imagePath = host.hostPath(HostPathKind::CdImage);
-            if (!imagePath.empty())
+            if (!read && !imagePath.empty())
             {
                 if (imageHandle == 0u)
                     imageHandle = host.openHostFile(imagePath);
@@ -705,6 +721,40 @@ namespace ps2x::iop::detail
             }
             lastError = kCdvdErrorNone;
             return true;
+        }
+
+    public:
+        void saveState(ps2x::StateWriter &w) const
+        {
+            w.pod(callback);
+            w.boolean(completionCallback.has_value());
+            w.pod(completionCallback.value_or(CompletionCallback{}));
+            w.boolean(initialized);
+            w.u32(mediaMode);
+            w.u32(currentLsn);
+            w.u32(lastError);
+            w.u32(streamFlag);
+            w.u32(lastReadTimeout);
+            w.i32(interruptEventFlagId);
+        }
+
+        void loadState(ps2x::StateReader &r)
+        {
+            // Host handles and the virtual ISO index are not saved: they reopen and
+            // rebuild on the next sector read.
+            reset();
+            r.pod(callback);
+            const bool hasCompletion = r.boolean();
+            const CompletionCallback completion = r.pod<CompletionCallback>();
+            if (hasCompletion)
+                completionCallback = completion;
+            initialized = r.boolean();
+            mediaMode = r.u32();
+            currentLsn = r.u32();
+            lastError = r.u32();
+            streamFlag = r.u32();
+            lastReadTimeout = r.u32();
+            interruptEventFlagId = r.i32();
         }
 
         IopHost &host;
@@ -747,5 +797,18 @@ namespace ps2x::iop::detail
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
     {
         return m_impl->takeCompletionCallback();
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopCdvd::saveState(ps2x::StateWriter &w) const
+    {
+        m_impl->saveState(w);
+    }
+
+    void IopCdvd::loadState(ps2x::StateReader &r)
+    {
+        m_impl->loadState(r);
     }
 }

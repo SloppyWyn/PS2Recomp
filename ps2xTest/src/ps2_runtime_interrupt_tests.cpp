@@ -93,6 +93,8 @@ namespace
     uint64_t g_vsyncTick = 0;
     uint64_t g_vsyncCsr = 0;
     std::atomic<bool> g_timer2Resumed{false};
+    uint64_t g_timer2HandlerCycle = 0u;
+    uint32_t g_timer2HandlerCount = 0u;
     uint32_t g_irqObservedSp = 0u;
     uint32_t g_invocationQueueRuns = 0u;
     uint32_t g_invocationQueueSp = 0u;
@@ -306,6 +308,8 @@ namespace
     {
         g_dispatchTrace.push_back(2);
         PS2Memory &memory = runtime->memory();
+        g_timer2HandlerCycle = runtime->eeScheduler().eeCycle();
+        g_timer2HandlerCount = memory.readIORegister(kTimer2Count);
         memory.writeIORegister(kTimer2Mode, memory.readIORegister(kTimer2Mode) | kTimerModeEquf);
         runtime->eeScheduler().signalSemaphore(g_testSemaphoreId, true);
         ctx->pc = 0u;
@@ -704,6 +708,73 @@ void register_ps2_runtime_interrupt_tests()
                      "Timer2 flow should run wait, interrupt handler, then the resumed thread");
             t.Equals(g_resumedResult, g_testSemaphoreId,
                      "the Timer2 handler should hand the semaphore directly to the waiter");
+        });
+
+        tc.Run("batched timing fires the Timer2 compare IRQ at the same guest cycle", [](TestCase &t)
+        {
+            // The same flow as above with a deterministic clock (no wall-clock top-ups), once
+            // with eager accounting and once batched (PS2X_BATCH_TIMING): the handler must run
+            // at the same EE cycle and read the same COUNT, through the lazy catch-up.
+            const auto runFlow = [&t](bool batched, uint64_t &handlerCycle, uint32_t &handlerCount) -> bool
+            {
+                TestEnv env;
+                t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+                env.runtime.registerFunction(kTimer2WaitPc, schedulerTimer2Wait);
+                env.runtime.registerFunction(kTimer2ResumePc, schedulerTimer2Resume);
+                env.runtime.registerFunction(kTimer2HandlerPc, schedulerTimer2Handler);
+                g_dispatchTrace.clear();
+                g_resumedResult = -1;
+                g_timer2HandlerCycle = 0u;
+                g_timer2HandlerCount = 0u;
+                g_timer2Resumed.store(false, std::memory_order_release);
+                R5900Context mainContext{};
+                mainContext.pc = kTimer2WaitPc;
+                std::atomic<bool> schedulerThrew{false};
+                std::thread gameThread([&]()
+                {
+                    try
+                    {
+                        EeScheduler &scheduler = env.runtime.eeScheduler();
+                        scheduler.reset(env.rdram.data(), mainContext);
+                        scheduler.setRealtimeClock(false);
+                        scheduler.setBatchTiming(batched ? EeScheduler::kDefaultBatchTimingCycles : 0u);
+                        scheduler.run();
+                    }
+                    catch (...)
+                    {
+                        schedulerThrew.store(true, std::memory_order_release);
+                    }
+                });
+                const bool resumed = waitUntil([]()
+                {
+                    return g_timer2Resumed.load(std::memory_order_acquire);
+                }, std::chrono::milliseconds(500));
+                if (!resumed)
+                {
+                    env.runtime.requestStop();
+                }
+                gameThread.join();
+                handlerCycle = g_timer2HandlerCycle;
+                handlerCount = g_timer2HandlerCount;
+                const std::vector<int> expected{1, 2, 3};
+                if (batched)
+                {
+                    // The flow is a handful of host-function dispatches (8 cycles each) and one
+                    // idle wait to the compare: a few charges, each ending a batch.
+                    const EeScheduler::BatchTimingStats &stats = env.runtime.eeScheduler().batchTimingStats();
+                    t.IsTrue(stats.charges > 0u && stats.flushes > 0u, "batched run should count charges and flushes");
+                }
+                return resumed && !schedulerThrew.load(std::memory_order_acquire) && g_dispatchTrace == expected;
+            };
+
+            uint64_t eagerCycle = 0u, batchedCycle = 0u;
+            uint32_t eagerCount = 0u, batchedCount = 0u;
+            t.IsTrue(runFlow(false, eagerCycle, eagerCount), "eager accounting: Timer2 flow completes");
+            t.IsTrue(runFlow(true, batchedCycle, batchedCount), "batched accounting: Timer2 flow completes");
+            t.Equals(eagerCount, 8u, "eager: COUNT equals COMP in the handler");
+            t.Equals(batchedCount, 8u, "batched: the lazy COUNT read equals COMP in the handler");
+            t.Equals(batchedCycle, eagerCycle, "the interrupt handler runs at the same EE cycle either way");
+            t.IsTrue(eagerCycle >= 8u * 512u, "the handler ran after the compare distance");
         });
 
         tc.Run("scheduler stop wakes an idle VSync wait without a timeout", [](TestCase &t)

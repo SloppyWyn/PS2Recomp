@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "ps2x/state_stream.h"
 
 namespace ps2x::iop::detail
 {
@@ -18,6 +19,10 @@ namespace ps2x::iop::detail
         IopModuleManager();
 
         void reset();
+
+        // Snapshots (docs/SNAPSHOT-DESIGN.md).
+        void saveState(ps2x::StateWriter &w) const;
+        void loadState(ps2x::StateReader &r);
         void setServiceModuleKeys(std::vector<std::string> keys);
 
         [[nodiscard]] ModuleLoadResult loadHle(std::string_view path);

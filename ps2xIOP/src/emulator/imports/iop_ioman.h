@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "ps2x/state_stream.h"
 
 namespace ps2x::iop::detail
 {
@@ -16,6 +17,10 @@ namespace ps2x::iop::detail
         explicit IopIoman(IopMemory &memory) noexcept;
 
         void reset();
+
+        // Snapshots (docs/SNAPSHOT-DESIGN.md).
+        void saveState(ps2x::StateWriter &w) const;
+        void loadState(ps2x::StateReader &r);
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
 
     private:

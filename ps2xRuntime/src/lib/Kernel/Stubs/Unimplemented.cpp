@@ -47,3 +47,20 @@ namespace ps2_stubs
         throw std::runtime_error("Unimplemented PS2 stub called: " + stubName);
     }
 }
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    // No state of its own: only this file's copy of the Helpers/Support.h globals.
+    void saveUnimplemented(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+    }
+
+    void loadUnimplemented(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
+    }
+}

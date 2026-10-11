@@ -193,3 +193,26 @@ namespace ps2x::iop::detail
         }
     }
 }
+
+namespace ps2x::iop::detail
+{
+    void IopImportRegistry::saveState(ps2x::StateWriter &w) const
+    {
+        w.sortedMap(m_libraries, [&w](const ExportLibrary &library)
+                    {
+                        w.u32(library.tableAddress);
+                        w.u16(library.version);
+                        w.str(library.name);
+                        w.podVector(library.functions); });
+    }
+
+    void IopImportRegistry::loadState(ps2x::StateReader &r)
+    {
+        r.sortedMap(m_libraries, [&r](ExportLibrary &library)
+                    {
+                        library.tableAddress = r.u32();
+                        library.version = r.u16();
+                        library.name = r.str();
+                        r.podVector(library.functions); });
+    }
+}

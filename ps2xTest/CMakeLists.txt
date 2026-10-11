@@ -8,7 +8,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(gs_cache)
+    add_subdirectory(gs_dbuff)
+    add_subdirectory(gs_replay)
+    add_subdirectory(pad_script)
+    add_subdirectory(debug_names)
+    add_subdirectory(audio_device)
+    add_subdirectory(iop_spu2)
+    add_subdirectory(iop_sched)
 endif()
+
+# ps2x_stubsigs: the typed stub ABI registry as JSON (tools/stubaudit.py --signatures).
+add_subdirectory(stubsigs)
 
 # Static library with test logic (no main), used by ps2xStudio
 add_library(ps2_test_function_table OBJECT
@@ -31,12 +41,19 @@ add_library(ps2_test_lib STATIC
     src/ps2_memory_tests.cpp
     src/ps2_vu1_tests.cpp
     src/ps2_vu_tests.cpp
+    src/ps2_vu0_macro_tests.cpp
+    src/ps2_mmi_hilo_tests.cpp
     src/ps2_gs_tests.cpp
     src/ps2_iop_tests.cpp
     src/ps2_sif_rpc_tests.cpp
     src/ps2_sif_dma_tests.cpp
     src/ps2_recompiler_tests.cpp
     src/ps2_runtime_expansion_tests.cpp
+    src/ps2_snapshot_tests.cpp
+    src/ps2_fastforward_tests.cpp
+    src/ps2_stub_poison_tests.cpp
+    src/ps2_stub_abi_tests.cpp
+    src/poison_guard.cpp
 )
 
 target_include_directories(ps2_test_lib PRIVATE
@@ -46,6 +63,9 @@ target_include_directories(ps2_test_lib PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
 )
+
+# Lets tests read repository files (e.g. instructions.h) whatever the working directory.
+target_compile_definitions(ps2_test_lib PRIVATE PS2X_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 target_link_libraries(ps2_test_lib PRIVATE
     ps2_recomp_lib
@@ -88,7 +108,8 @@ target_link_libraries(ps2x_tests PRIVATE
 # Windows executables default to a much smaller stack than Linux, and
 # sanitizer/debug instrumentation can push these test frames over 1 MiB.
 if(MSVC)
-    target_link_options(ps2x_tests PRIVATE "/STACK:8388608")
+    # /MAP: the stub poison test names the host code that touched the poison window.
+    target_link_options(ps2x_tests PRIVATE "/STACK:8388608" "/MAP")
 elseif(MINGW)
     target_link_options(ps2x_tests PRIVATE "--stack,8388608")
 endif()

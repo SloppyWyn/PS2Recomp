@@ -12,7 +12,12 @@
 #include <filesystem>
 #include <cctype>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
+#include <iterator>
+#include <map>
+#include <set>
+#include <string_view>
 #include <exception>
 #include <mutex>
 #include <queue>
@@ -99,7 +104,7 @@ namespace ps2recomp
             return 1;
         }
 
-        void writeCombinedOutputPreamble(std::ostream &output)
+        void writeCombinedOutputPreamble(std::ostream &output, const std::string &leanIncludeLines)
         {
             output << "#include <stdexcept>\n";
             output << "#include <ps2_recompiled_functions.h>\n\n";
@@ -108,6 +113,7 @@ namespace ps2recomp
             output << "#include <ps2_recompiled_stubs.h>\n";
             output << "#include \"ps2_syscalls.h\"\n";
             output << "#include \"ps2_stubs.h\"\n";
+            output << leanIncludeLines;
             output << "#ifdef _DEBUG\n";
             output << "#include \"ps2_log.h\"\n";
             output << "#endif\n";
@@ -823,6 +829,111 @@ namespace ps2recomp
 
             return addedCount;
         }
+
+        // resume_into_owner: an entry_* function whose start is an instruction of a real
+        // recompiled function is dropped as a function and its start becomes a resume target
+        // of that owner, so the function table maps the address to the owner and the owner's
+        // `switch (ctx->pc)` jumps to the label. When several real functions contain the
+        // address (Ghidra's caseD_* switch bodies lie inside their parent's range), the
+        // outermost one (lowest start) is the owner: it has the most code reachable natively,
+        // and FunctionTableEmitter resolves shared resume addresses the same way.
+        // The other rule in this file, findContainingFunction (configured entry hints and
+        // external branch targets), picks the innermost (greatest start) owner. Both are
+        // valid: every containing function has the instruction and emits a label for it, and
+        // the table keeps one owner per address (the lowest start under resume_into_owner).
+        // The innermost rule stays where it is so the output with the switch off is unchanged.
+        // entry_* blocks outside every real function are left alone (they stay fragments).
+        struct AbsorbStats
+        {
+            size_t fragments = 0;
+            size_t owners = 0;
+        };
+
+        AbsorbStats absorbNestedEntryFragmentsImpl(
+            std::vector<Function> &functions,
+            std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
+            std::unordered_map<uint32_t, std::vector<uint32_t>> &targetsByOwner)
+        {
+            std::unordered_set<uint32_t> fragmentStarts;
+            for (const auto &function : functions)
+            {
+                if (function.isRecompiled && !function.isStub && !function.isSkipped &&
+                    isEntryFunctionName(function.name))
+                {
+                    fragmentStarts.insert(function.start);
+                }
+            }
+
+            AbsorbStats stats{};
+            if (fragmentStarts.empty())
+            {
+                return stats;
+            }
+
+            // fragment start -> owner start (the owner with the lowest start wins), found by
+            // one pass over every real function's decoded instructions.
+            std::unordered_map<uint32_t, uint32_t> ownerByFragment;
+            for (const auto &function : functions)
+            {
+                if (!function.isRecompiled || function.isStub || function.isSkipped ||
+                    isEntryFunctionName(function.name))
+                {
+                    continue;
+                }
+
+                const auto decodedIt = decodedFunctions.find(function.start);
+                if (decodedIt == decodedFunctions.end())
+                {
+                    continue;
+                }
+
+                for (const Instruction &instruction : decodedIt->second)
+                {
+                    const uint32_t address = instruction.address;
+                    if (address == function.start || !fragmentStarts.contains(address))
+                    {
+                        continue;
+                    }
+
+                    auto inserted = ownerByFragment.emplace(address, function.start);
+                    if (!inserted.second && function.start < inserted.first->second)
+                    {
+                        inserted.first->second = function.start;
+                    }
+                }
+            }
+
+            std::unordered_set<uint32_t> ownersTouched;
+            for (auto &function : functions)
+            {
+                if (!function.isRecompiled || function.isStub || function.isSkipped ||
+                    !isEntryFunctionName(function.name))
+                {
+                    continue;
+                }
+
+                const auto ownerIt = ownerByFragment.find(function.start);
+                if (ownerIt == ownerByFragment.end())
+                {
+                    continue;
+                }
+
+                // Not a function any more: no generated code, no table entry, no name.
+                function.isRecompiled = false;
+                decodedFunctions.erase(function.start);
+
+                auto &targets = targetsByOwner[ownerIt->second];
+                if (std::find(targets.begin(), targets.end(), function.start) == targets.end())
+                {
+                    targets.push_back(function.start);
+                }
+                ownersTouched.insert(ownerIt->second);
+                ++stats.fragments;
+            }
+
+            stats.owners = ownersTouched.size();
+            return stats;
+        }
     }
 
     PS2Recompiler::PS2Recompiler(const std::string &configPath)
@@ -850,6 +961,7 @@ namespace ps2recomp
             m_stubFunctionStarts.clear();
             m_stubHandlerBindingsByStart.clear();
             m_entryPointHintStarts.clear();
+            m_guestDisplayNames.clear();
             m_correctnessCriticalFunctionStarts.clear();
 
             for (const auto &name : m_config.skipFunctions)
@@ -888,6 +1000,7 @@ namespace ps2recomp
                             m_reporter.warning("config", msg.str());
                         }
                         m_stubHandlerBindingsByStart[*selector.start] = selector.name;
+                        m_guestDisplayNames[*selector.start] = selector.name;
                     }
                 }
             }
@@ -897,6 +1010,10 @@ namespace ps2recomp
                 if (selector.start.has_value())
                 {
                     m_entryPointHintStarts.insert(*selector.start);
+                    if (!selector.name.empty())
+                    {
+                        m_guestDisplayNames.emplace(*selector.start, selector.name);
+                    }
                 }
             }
 
@@ -1000,6 +1117,8 @@ namespace ps2recomp
             m_decoder = std::make_unique<R5900Decoder>();
             m_codeGenerator = std::make_unique<CodeGenerator>(m_symbols, m_sections);
             m_codeGenerator->setReporter(&m_reporter);
+            m_codeGenerator->setResumeIntoOwner(m_config.resumeIntoOwner);
+            m_codeGenerator->setLeanOptions(m_config.effectiveLeanOptions());
             std::unordered_map<uint32_t, std::string> relocationCallNames;
             relocationCallNames.reserve(m_relocations.size());
             for (const auto &reloc : m_relocations)
@@ -1258,12 +1377,24 @@ namespace ps2recomp
                 {
                     std::string generatedName = m_codeGenerator->getFunctionName(function.start);
                     std::stringstream stub;
+                    // Optional call trace around every stub (PS2X_TRACE_STUBS at run time,
+                    // ps2xRuntime/src/lib/Kernel/ps2_stub_trace.cpp).
+                    std::string traceName = function.name;
+                    if (const auto traceBinding = m_stubHandlerBindingsByStart.find(function.start);
+                        traceBinding != m_stubHandlerBindingsByStart.end() && !traceBinding->second.empty())
+                    {
+                        traceName = traceBinding->second; // the runtime handler's name reads better than FUN_xxxxxxxx
+                    }
+                    std::stringstream traceArgs;
+                    traceArgs << "\"" << escapeCStringLiteral(traceName) << "\", 0x" << std::hex << function.start << "u";
+                    stub << "void ps2xStubTrace(const char *name, uint32_t address, uint8_t *rdram, R5900Context *ctx, bool leaving);\n";
                     stub << "void " << generatedName
                          << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
                     stub << "#ifdef _DEBUG\n";
                     stub << "    PS_LOG_ENTRY(\"" << generatedName << "\");\n";
                     stub << "#endif\n";
                     stub << "    ctx->pc = getRegU32(ctx, 31);\n"
+                         << "    ps2xStubTrace(" << traceArgs.str() << ", rdram, ctx, false);\n"
                          << "    ";
 
                     if (function.isSkipped)
@@ -1300,6 +1431,7 @@ namespace ps2recomp
                         }
                     }
 
+                    stub << "\n    ps2xStubTrace(" << traceArgs.str() << ", rdram, ctx, true);";
                     stub << "\n}";
                     m_generatedStubs[function.start] = stub.str();
                 }
@@ -1375,13 +1507,17 @@ namespace ps2recomp
             if (m_config.singleFileOutput)
             {
                 fs::path outputPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.cpp";
+                {
+                    std::lock_guard<std::mutex> lock(m_outputFilesMutex);
+                    m_outputFilesThisRun.insert(outputPath.filename().string());
+                }
                 std::ofstream combinedOutput(outputPath);
                 if (!combinedOutput)
                 {
                     throw std::runtime_error("Failed to open combined output: " + outputPath.string());
                 }
 
-                writeCombinedOutputPreamble(combinedOutput);
+                writeCombinedOutputPreamble(combinedOutput, m_codeGenerator->leanIncludeLines());
 
                 if (outputWorkerCount <= 1)
                 {
@@ -1592,16 +1728,88 @@ namespace ps2recomp
                     std::string code;
                 };
 
-                std::vector<fs::path> outputPaths;
-                outputPaths.reserve(outputFunctions.size());
-                for (const Function *function : outputFunctions)
+                // One output unit = one .cpp: a single function (output_group_bytes = 0) or
+                // every function whose start lies in one aligned window of guest addresses.
+                struct OutputUnit
                 {
-                    outputPaths.push_back(getOutputPath(*function));
+                    fs::path outputPath;
+                    uint32_t windowStart = 0;
+                    std::vector<const Function *> functions;
+                };
+
+                const uint32_t groupBytes = m_config.outputGroupBytes;
+                std::vector<OutputUnit> outputUnits;
+                if (groupBytes > 0)
+                {
+                    std::map<uint32_t, std::vector<const Function *>> byWindow;
+                    for (const Function *function : outputFunctions)
+                    {
+                        byWindow[function->start - (function->start % groupBytes)].push_back(function);
+                    }
+                    outputUnits.reserve(byWindow.size());
+                    for (auto &[windowStart, functions] : byWindow)
+                    {
+                        std::stable_sort(functions.begin(), functions.end(), [](const Function *a, const Function *b)
+                                         { return a->start < b->start; });
+                        outputUnits.push_back(OutputUnit{getGroupOutputPath(windowStart), windowStart, std::move(functions)});
+                    }
+                }
+                else
+                {
+                    outputUnits.reserve(outputFunctions.size());
+                    for (const Function *function : outputFunctions)
+                    {
+                        outputUnits.push_back(OutputUnit{getOutputPath(*function), function->start, {function}});
+                    }
+                }
+                const size_t unitCount = outputUnits.size();
+
+                // Grouped files declare only the generated functions they call directly, so
+                // they need neither ps2_recompiled_functions.h nor ps2_recompiled_stubs.h:
+                // a binding change no longer touches every translation unit.
+                std::unordered_set<std::string> generatedNames;
+                if (groupBytes > 0)
+                {
+                    generatedNames.reserve(outputFunctions.size());
+                    for (const Function *function : outputFunctions)
+                    {
+                        generatedNames.insert(m_codeGenerator->getFunctionName(function->start));
+                    }
                 }
 
                 auto generateFile = [&](CodeGenerator &codeGenerator, size_t outputIndex) -> GeneratedFile
                 {
-                    return GeneratedFile{outputPaths[outputIndex], generateFunctionCode(codeGenerator, *outputFunctions[outputIndex], true)};
+                    const OutputUnit &unit = outputUnits[outputIndex];
+                    if (groupBytes == 0)
+                    {
+                        return GeneratedFile{unit.outputPath, generateFunctionCode(codeGenerator, *unit.functions.front(), true)};
+                    }
+
+                    std::string body;
+                    for (const Function *function : unit.functions)
+                    {
+                        body += generateFunctionCode(codeGenerator, *function, false);
+                        body += "\n\n";
+                    }
+
+                    std::ostringstream file;
+                    file << "// Generated by PS2Recomp: the functions starting in [0x" << std::hex << unit.windowStart
+                         << ", 0x" << (static_cast<uint64_t>(unit.windowStart) + groupBytes) << std::dec << ").\n";
+                    file << "#include <stdexcept>\n";
+                    file << "#include \"ps2_runtime_macros.h\"\n";
+                    file << "#include \"ps2_runtime.h\"\n";
+                    file << "#include \"ps2_syscalls.h\"\n";
+                    file << "#include \"ps2_stubs.h\"\n";
+                    file << codeGenerator.leanIncludeLines();
+                    file << "#if defined(PS2_FUNCTION_LOG_TRACKER) || defined(_DEBUG)\n";
+                    file << "#include \"ps2_log.h\"\n";
+                    file << "#endif\n\n";
+                    for (const std::string &callee : CollectDirectCallees(body, generatedNames))
+                    {
+                        file << "void " << callee << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
+                    }
+                    file << "\n" << body;
+                    return GeneratedFile{unit.outputPath, file.str()};
                 };
 
                 auto writeGeneratedFile = [&](GeneratedFile generated)
@@ -1615,7 +1823,7 @@ namespace ps2recomp
 
                 if (outputWorkerCount <= 1)
                 {
-                    for (size_t outputIndex = 0; outputIndex < outputFunctions.size(); ++outputIndex)
+                    for (size_t outputIndex = 0; outputIndex < unitCount; ++outputIndex)
                     {
                         writeGeneratedFile(generateFile(*m_codeGenerator, outputIndex));
                     }
@@ -1707,7 +1915,7 @@ namespace ps2recomp
                     {
                         {
                             std::lock_guard<std::mutex> lock(outputMutex);
-                            while (nextFunction < outputFunctions.size() &&
+                            while (nextFunction < unitCount &&
                                    outstandingWork < maxBufferedOutput &&
                                    !stopWorkers)
                             {
@@ -1723,11 +1931,11 @@ namespace ps2recomp
                         scheduleAvailableWork();
 
                         size_t writtenCount = 0;
-                        while (writtenCount < outputFunctions.size())
+                        while (writtenCount < unitCount)
                         {
                             std::unique_lock<std::mutex> lock(outputMutex);
                             resultAvailable.wait(lock, [&]()
-                                                 { return workerException || !readyFiles.empty() || (outstandingWork == 0 && nextFunction >= outputFunctions.size()); });
+                                                 { return workerException || !readyFiles.empty() || (outstandingWork == 0 && nextFunction >= unitCount); });
 
                             if (workerException)
                             {
@@ -1761,13 +1969,14 @@ namespace ps2recomp
 
                 {
                     std::ostringstream msg;
-                    msg << "wrote individual function files to " << m_config.outputPath;
+                    msg << "wrote " << unitCount << (groupBytes > 0 ? " grouped" : " individual") << " function files to " << m_config.outputPath;
                     m_reporter.progress(msg.str());
                 }
             }
 
             m_decodedFunctions.clear();
 
+            m_codeGenerator->setGuestDisplayNames(m_guestDisplayNames);
             std::string registerFunctions = m_codeGenerator->generateFunctionRegistration(m_functions, m_generatedStubs);
             m_generatedStubs.clear();
 
@@ -1786,6 +1995,8 @@ namespace ps2recomp
             {
                 throw std::runtime_error("Failed to generate stub header");
             }
+
+            finalizeOutputManifest();
         }
         catch (const std::exception &e)
         {
@@ -1900,6 +2111,21 @@ namespace ps2recomp
         if (!m_codeGenerator)
         {
             return;
+        }
+
+        if (m_config.resumeIntoOwner)
+        {
+            const AbsorbStats absorbed =
+                absorbNestedEntryFragmentsImpl(m_functions, m_decodedFunctions, m_resumeEntryTargetsByOwner);
+            if (absorbed.fragments > 0u)
+            {
+                m_reporter.recordAbsorbedEntryFragments(absorbed.fragments, absorbed.owners);
+                std::ostringstream msg;
+                msg << "resume_into_owner: " << absorbed.fragments
+                    << " nested entry_ label(s) resume in their " << absorbed.owners
+                    << " owner function(s) instead of as fragments";
+                m_reporter.progress(msg.str());
+            }
         }
 
         std::unordered_set<uint32_t> guestFallbackEntryAddresses = m_entryPointHintStarts;
@@ -2293,6 +2519,32 @@ namespace ps2recomp
 
     bool PS2Recompiler::writeToFile(const std::string &path, const std::string &content)
     {
+        const fs::path filePath(path);
+        {
+            std::error_code ec;
+            const fs::path outputDir = fs::weakly_canonical(fs::path(m_config.outputPath), ec);
+            const fs::path parent = ec ? fs::path() : fs::weakly_canonical(filePath.parent_path(), ec);
+            if (!ec && parent == outputDir)
+            {
+                std::lock_guard<std::mutex> lock(m_outputFilesMutex);
+                m_outputFilesThisRun.insert(filePath.filename().string());
+            }
+        }
+
+        // Leave a file whose content is already right untouched (same text, same mtime), so
+        // a build only recompiles what really changed. Text mode on both sides, as written.
+        {
+            std::ifstream existing(path);
+            if (existing)
+            {
+                std::string current((std::istreambuf_iterator<char>(existing)), std::istreambuf_iterator<char>());
+                if (!existing.bad() && current == content)
+                {
+                    return true;
+                }
+            }
+        }
+
         std::ofstream file(path);
         if (!file)
         {
@@ -2302,8 +2554,131 @@ namespace ps2recomp
 
         file << content;
         file.close();
+        if (!file)
+        {
+            m_reporter.error("file", "Failed to write file: " + path);
+            return false;
+        }
 
         return true;
+    }
+
+    std::vector<std::string> PS2Recompiler::CollectDirectCallees(const std::string &code, const std::unordered_set<std::string> &names)
+    {
+        static constexpr std::string_view kCallArgs = "(rdram, ctx, runtime)";
+        std::set<std::string> found;
+        auto isIdentChar = [](char c)
+        { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+
+        size_t pos = code.find(kCallArgs);
+        while (pos != std::string::npos)
+        {
+            size_t begin = pos;
+            while (begin > 0 && isIdentChar(code[begin - 1]))
+            {
+                --begin;
+            }
+            const bool qualified = begin >= 1 && code[begin - 1] == ':';
+            if (begin < pos && !qualified)
+            {
+                std::string name = code.substr(begin, pos - begin);
+                if (names.count(name) != 0)
+                {
+                    found.insert(std::move(name));
+                }
+            }
+            pos = code.find(kCallArgs, pos + kCallArgs.size());
+        }
+        return std::vector<std::string>(found.begin(), found.end());
+    }
+
+    std::string PS2Recompiler::GroupOutputFileName(uint32_t windowStart)
+    {
+        char name[32];
+        std::snprintf(name, sizeof(name), "ps2x_group_%08x.cpp", windowStart);
+        return name;
+    }
+
+    std::filesystem::path PS2Recompiler::getGroupOutputPath(uint32_t windowStart) const
+    {
+        return fs::path(m_config.outputPath) / GroupOutputFileName(windowStart);
+    }
+
+    void PS2Recompiler::finalizeOutputManifest()
+    {
+        const fs::path outputDir(m_config.outputPath);
+        const fs::path manifestPath = outputDir / kOutputManifestName;
+
+        std::set<std::string> current;
+        {
+            std::lock_guard<std::mutex> lock(m_outputFilesMutex);
+            current = m_outputFilesThisRun;
+        }
+
+        // Stale = written by the last run (the manifest) or, in grouped mode, one of the
+        // one-file-per-function names of today's functions (a folder written in the old
+        // layout), and not written this run. Nothing else in the folder is touched.
+        std::set<std::string> candidates;
+        {
+            std::ifstream manifest(manifestPath);
+            std::string line;
+            while (std::getline(manifest, line))
+            {
+                if (!line.empty() && line.back() == '\r')
+                {
+                    line.pop_back();
+                }
+                if (!line.empty() && line.find_first_of("/\\:") == std::string::npos)
+                {
+                    candidates.insert(line);
+                }
+            }
+        }
+        if (!m_config.singleFileOutput && m_config.outputGroupBytes > 0)
+        {
+            for (const auto &function : m_functions)
+            {
+                if (shouldGenerateCodeForFunction(function))
+                {
+                    candidates.insert(getOutputPath(function).filename().string());
+                }
+            }
+        }
+
+        size_t removed = 0;
+        for (const std::string &name : candidates)
+        {
+            if (current.count(name) != 0 || name == kOutputManifestName)
+            {
+                continue;
+            }
+            std::error_code ec;
+            if (fs::remove(outputDir / name, ec))
+            {
+                ++removed;
+            }
+        }
+        if (removed > 0)
+        {
+            std::ostringstream msg;
+            msg << "removed " << removed << " stale generated file(s) from " << m_config.outputPath;
+            m_reporter.progress(msg.str());
+        }
+
+        std::string list;
+        for (const std::string &name : current)
+        {
+            list += name;
+            list += "\n";
+        }
+        std::ifstream existing(manifestPath);
+        const std::string old((std::istreambuf_iterator<char>(existing)), std::istreambuf_iterator<char>());
+        existing.close();
+        if (old != list)
+        {
+            std::ofstream manifest(manifestPath);
+            manifest << list;
+        }
     }
 
     std::filesystem::path PS2Recompiler::getOutputPath(const Function &function) const
@@ -2426,6 +2801,14 @@ namespace ps2recomp
     size_t PS2Recompiler::ResliceEntryFunctions(std::vector<Function> &functions, std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions)
     {
         return resliceEntryFunctionsImpl(functions, decodedFunctions);
+    }
+
+    size_t PS2Recompiler::AbsorbNestedEntryFragments(
+        std::vector<Function> &functions,
+        std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
+        std::unordered_map<uint32_t, std::vector<uint32_t>> &targetsByOwner)
+    {
+        return absorbNestedEntryFragmentsImpl(functions, decodedFunctions, targetsByOwner).fragments;
     }
 
     size_t PS2Recompiler::CollectInternalEntryTargets(

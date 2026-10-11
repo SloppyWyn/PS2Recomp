@@ -52,6 +52,10 @@ add_gs_cache_suite(ps2_gs_clut_cache_tests gs_clut_cache_tests.cpp clut
     reserved_cld nonindexed_cld tex2_reload shared_contexts
     csa_ct32 csa_ct16 csa_ct16s texa_without_reload palette_before_filtering high_planes)
 
+# Header-only pool (runtime/gs/gs_raster_pool.h); the backend library only supplies the include path.
+add_gs_cache_suite(ps2_gs_raster_pool_tests gs_raster_pool_tests.cpp raster_pool
+    coverage serial late_workers slow_workers_share)
+
 if(PS2_GS_CACHE_BUILD_MEMORY_TESTS)
     add_gs_cache_suite(ps2_gs_memory_cache_tests gs_memory_cache_tests.cpp memory
         ct32 ct24 ct16 ct16s t8 t4 t8h t4hl t4hh z32 z24 z16 z16s

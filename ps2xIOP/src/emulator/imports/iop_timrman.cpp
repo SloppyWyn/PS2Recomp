@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <limits>
 
 namespace ps2x::iop::detail
@@ -451,6 +452,14 @@ namespace ps2x::iop::detail
                 continue;
             if (result == 0u)
             {
+                // The handler asked to stop the timer (a 0 return value disables it).
+                static int s_lines = 0;
+                if (s_lines < 16)
+                {
+                    ++s_lines;
+                    std::fprintf(stderr, "[iop:timer] handler 0x%X returned 0: timer %X stopped\n",
+                                 callback.function, timer.address);
+                }
                 stop(timer, currentCycle);
                 continue;
             }
@@ -463,6 +472,25 @@ namespace ps2x::iop::detail
 
     }
 
+    std::string IopTimrman::describe(uint64_t currentCycle) const
+    {
+        std::string text;
+        char item[96];
+        for (size_t i = 0u; i < m_timers.size(); ++i)
+        {
+            const Timer &timer = m_timers[i];
+            if (timer.users == 0u)
+                continue;
+            const uint64_t next = std::min(timer.compareCycle, timer.overflowCycle);
+            const long long in = next == UINT64_MAX ? -1ll
+                                 : next > currentCycle ? static_cast<long long>(next - currentCycle) : 0ll;
+            std::snprintf(item, sizeof(item), "%st%zu:%s cmp=%X in=%lld fn=%X", text.empty() ? "" : " ", i,
+                          timer.running ? "run" : "stop", timer.compare, in, timer.compareCallback.function);
+            text += item;
+        }
+        return text;
+    }
+
     uint64_t IopTimrman::nextEventCycle(uint64_t fallback) const noexcept
     {
         uint64_t next = fallback;
@@ -472,5 +500,21 @@ namespace ps2x::iop::detail
             next = std::min(next, timer.overflowCycle);
         }
         return next;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopTimrman::saveState(ps2x::StateWriter &w) const
+    {
+        w.pod(m_timers);
+        w.u32(m_holdMode);
+    }
+
+    void IopTimrman::loadState(ps2x::StateReader &r)
+    {
+        r.pod(m_timers);
+        m_holdMode = r.u32();
+        m_servicing = false;
     }
 }

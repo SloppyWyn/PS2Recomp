@@ -65,6 +65,10 @@ namespace ps2_stubs
     void sceCdReadClock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdReadIOPm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    // The CD file registry for the IOP side: a cdrom0: path's LSN and size (registering the
+    // file as sceCdSearchFile would), and sector reads in that LSN space.
+    bool cdLookupFile(const std::string &ps2Path, uint32_t &lbn, uint32_t &sizeBytes);
+    bool cdReadSectorsByLbn(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount);
     void sceCdSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdStandby(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

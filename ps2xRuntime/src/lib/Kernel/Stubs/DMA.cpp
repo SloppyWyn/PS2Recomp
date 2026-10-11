@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "DMA.h"
+#include "runtime/ps2_pace_log.h"
 
 namespace ps2_stubs
 {
@@ -201,6 +202,15 @@ namespace ps2_stubs
 
     void sceDmaSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (ps2x::pace::enabled()) [[unlikely]]
+        {
+            const uint32_t channel = getRegU32(ctx, 4);
+            const uint32_t tag = getRegU32(ctx, 5);
+            const int64_t t0 = ps2x::pace::nowUs();
+            setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
+            ps2x::pace::line("DMA ch=0x%x tag=0x%x us=%lld", channel, tag, static_cast<long long>(ps2x::pace::nowUs() - t0));
+            return;
+        }
         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
     }
 
@@ -232,5 +242,25 @@ namespace ps2_stubs
     void sceDmaWatch(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         TODO_NAMED("sceDmaWatch", rdram, ctx, runtime);
+    }
+}
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    void saveDma(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+        std::lock_guard<std::mutex> lock(g_dmaEnvMutex);
+        w.pod(g_dmaCurrentEnv);
+    }
+
+    void loadDma(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
+        std::lock_guard<std::mutex> lock(g_dmaEnvMutex);
+        r.pod(g_dmaCurrentEnv);
     }
 }

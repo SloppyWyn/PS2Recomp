@@ -12,7 +12,12 @@ option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 
 option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" ON)
 option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" ON)
+# The per-function call tracker (PS_LOG_ENTRY in every generated function): one flushed line per
+# guest function entry and exit into ps2_log.txt, gigabytes per run and a large share of the EE
+# thread's time. Debugging aid only, independent of the logs above.
+option(PS2X_ENABLE_FUNCTION_LOG_TRACKER "Log every recompiled function entry/exit to ps2_log.txt (very slow)" OFF)
 option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
+option(PS2X_TYPED_STUBS_DEFAULT "Converted runtime handlers decode their arguments through the typed stub ABI layer by default (PS2X_TYPED_STUBS=0/1 overrides at run time)" OFF)
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
 option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
@@ -259,6 +264,16 @@ elseif(WIN32)
     set(FFMPEG_PREBUILT_TAG "n7.1-241205")
     set(FFMPEG_PREBUILT_URL
         "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip")
+    # Pinned hash: CMake verifies the download, and keeps an already-downloaded zip with this
+    # hash instead of fetching it again (without a hash it re-downloads on every fresh build).
+    set(FFMPEG_PREBUILT_SHA256 "b985887dbca8c0a9a4c47f9d2bac7ec3ab994335b1b7fe7000bdb1dcd772ac68")
+    # Optional shared download folder, so every build dir (worktrees too) reuses one copy.
+    set(PS2X_DOWNLOAD_CACHE "" CACHE PATH "Folder for downloaded prebuilt archives (empty = per build dir)")
+    if(PS2X_DOWNLOAD_CACHE)
+        set(FFMPEG_DOWNLOAD_ARGS DOWNLOAD_DIR "${PS2X_DOWNLOAD_CACHE}")
+    else()
+        set(FFMPEG_DOWNLOAD_ARGS "")
+    endif()
 
     set(FFMPEG_PREFIX_DIR "${CMAKE_BINARY_DIR}/ThirdParty/ffmpeg-prefix")
     set(FFMPEG_SOURCE_DIR "${FFMPEG_PREFIX_DIR}/src/ffmpeg_external")
@@ -268,6 +283,8 @@ elseif(WIN32)
 
     ExternalProject_Add(ffmpeg_external
         URL "${FFMPEG_PREBUILT_URL}"
+        URL_HASH SHA256=${FFMPEG_PREBUILT_SHA256}
+        ${FFMPEG_DOWNLOAD_ARGS}
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         PREFIX "${FFMPEG_PREFIX_DIR}"
         CONFIGURE_COMMAND ""
@@ -380,6 +397,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
+    src/lib/ps2_spu2_output.cpp
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
@@ -389,6 +407,14 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/ps2_snapshot.cpp
+    src/lib/ps2_frame_hash.cpp
+    src/lib/ps2_cheats.cpp
+    src/lib/ps2_headless.cpp
+    src/lib/ps2_watchdog.cpp
+    src/lib/ps2_host_stack.cpp
+    src/lib/ps2_host_profile.cpp
+    src/lib/ps2_crash.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
@@ -405,6 +431,11 @@ endif()
 if(PS2X_ENABLE_AGRESSIVE_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         AGRESSIVE_LOGS=1
+    )
+endif()
+
+if(PS2X_ENABLE_FUNCTION_LOG_TRACKER)
+    target_compile_definitions(ps2_runtime PUBLIC
         PS2_FUNCTION_LOG_TRACKER=1
     )
 endif()
@@ -419,6 +450,14 @@ else()
     )
 endif()
 
+# Typed stub ABI layer (include/ps2_stub_abi.h): which decoding the converted handlers use when
+# PS2X_TYPED_STUBS is not set in the environment.
+if(PS2X_TYPED_STUBS_DEFAULT)
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_TYPED_STUBS_DEFAULT=1)
+else()
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_TYPED_STUBS_DEFAULT=0)
+endif()
+
 if(PS2X_STRICT_RETURN_DIAGNOSTICS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2X_STRICT_RETURN_DIAGNOSTICS=1
@@ -429,6 +468,12 @@ target_compile_definitions(ps2_runtime PRIVATE
     PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
 )
 
+# raylib on the desktop GLFW backend: ps2_headless.cpp probes GLFW for a monitor before
+# InitWindow (raylib 5.5 crashes in InitWindow when there is none) and falls back to headless.
+if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID AND (NOT DEFINED PLATFORM OR PLATFORM STREQUAL "Desktop"))
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HOST_GLFW=1)
+endif()
+
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel/*.cpp"
 )
@@ -437,9 +482,43 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
+# PS2X_GAME_DIR: build the runner from recompiler output kept outside this tree (the
+# function files, register_functions.cpp and the generated headers), e.g. a project's
+# private output folder. Empty = src/runner as before.
+set(PS2X_GAME_DIR "" CACHE PATH "Directory holding the recompiler output for ps2EntryRunner (empty = src/runner)")
+if(PS2X_GAME_DIR)
+    set(PS2X_RUNNER_GENERATED_DIR "${PS2X_GAME_DIR}")
+else()
+    set(PS2X_RUNNER_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/runner")
+endif()
+
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+    "${PS2X_RUNNER_GENERATED_DIR}/*.cpp"
 )
+
+# Grouped recompiler output (ps2_recomp with output_group_bytes > 0): ps2x_group_<addr>.cpp
+# files with stable membership by guest address, each declaring only the generated functions
+# it calls. They are compiled as they are (no unity batching: a batch would change membership
+# when the file set changes) and the generated headers stay out of the PCH, so a binding
+# change rebuilds only the groups whose code changed plus register_functions.cpp.
+file(GLOB PS2X_RUNNER_GROUP_FILES CONFIGURE_DEPENDS "${PS2X_RUNNER_GENERATED_DIR}/ps2x_group_*.cpp")
+if(PS2X_RUNNER_GROUP_FILES)
+    set(PS2X_RUNNER_GROUPED_OUTPUT ON)
+    set_source_files_properties(${PS2X_RUNNER_GROUP_FILES} "${PS2X_RUNNER_GENERATED_DIR}/register_functions.cpp"
+        PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+else()
+    set(PS2X_RUNNER_GROUPED_OUTPUT OFF)
+endif()
+
+# PS2X_OVERLAY_DIR: recompiled code overlays, one self-contained .cpp per overlay that
+# registers itself (ps2_overlays.h). Kept out of unity batches: each file has its own
+# file-local helpers.
+set(PS2X_OVERLAY_DIR "" CACHE PATH "Directory holding one linked .cpp per code overlay (empty = none)")
+if(PS2X_OVERLAY_DIR)
+    file(GLOB PS2X_OVERLAY_SRC_FILES CONFIGURE_DEPENDS "${PS2X_OVERLAY_DIR}/*.cpp")
+    set_source_files_properties(${PS2X_OVERLAY_SRC_FILES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    list(APPEND RUNNER_SRC_FILES ${PS2X_OVERLAY_SRC_FILES})
+endif()
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
@@ -475,13 +554,19 @@ if(PS2X_ENABLE_RUNNER_PCH)
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
     )
 
-    foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
-        if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
-            list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
-        endif()
-    endforeach()
+    # The generated headers change with every binding; with grouped output only
+    # register_functions.cpp includes them, so they stay out of the PCH.
+    if(NOT PS2X_RUNNER_GROUPED_OUTPUT)
+        foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
+            "${PS2X_GAME_DIR}/ps2_recompiled_functions.h"
+            "${PS2X_GAME_DIR}/ps2_recompiled_stubs.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+            if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
+                list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
+            endif()
+        endforeach()
+    endif()
 
     list(APPEND PS2X_RUNNER_PCH_HEADERS
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_syscalls.h"
@@ -498,7 +583,16 @@ if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
 endif()
 
 if(MSVC)
-    target_compile_options(ps2EntryRunner PRIVATE /FS)
+    # /MP: compile the runner's many generated files in parallel within the one project;
+    # /bigobj: unity batches of large generated functions exceed the default section limit.
+    target_compile_options(ps2EntryRunner PRIVATE /FS /MP /bigobj)
+    # /MAP: ps2EntryRunner.map names the exe's functions for the PS2X_WATCHDOG stack dumps
+    # and the crash reports.
+    target_link_options(ps2EntryRunner PRIVATE /MAP)
+endif()
+
+if(PS2X_GAME_DIR)
+    target_include_directories(ps2EntryRunner PRIVATE "${PS2X_GAME_DIR}")
 endif()
 
 target_include_directories(ps2_runtime PUBLIC
@@ -507,6 +601,11 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(WIN32)
+    # dbghelp: symbol lookup for the PS2X_WATCHDOG stack dumps and crash reports
+    # (ps2_host_stack.cpp), minidumps (ps2_crash.cpp).
+    target_link_libraries(ps2_runtime PUBLIC dbghelp)
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
@@ -557,6 +656,8 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_runtime)
     EnableFastReleaseMode(ps2EntryRunner)
+    # The GS rasteriser's arithmetic must stay exactly as written (/fp:fast reassociates).
+    set_source_files_properties(src/lib/gs/gs_cpu_backend.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:MSVC>:/fp:precise>")
 
     if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
         if(MSVC)

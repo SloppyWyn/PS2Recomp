@@ -200,7 +200,7 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 4, kIopBlockSize);
             ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
             const uint32_t iopAddress = ::getRegU32(&env.ctx, 2);
-            t.IsTrue(iopAddress >= 0x00120000u && iopAddress < 0x00200000u,
+            t.IsTrue(iopAddress >= 0x00010000u && iopAddress < 0x00200000u,
                      "sceSifAllocIopHeap should return an address in physical IOP RAM");
             std::memset(env.rdram.data() + iopAddress, 0x5Au, payload.size());
 
@@ -407,6 +407,39 @@ void register_ps2_sif_dma_tests()
                 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A};
             t.IsTrue(std::memcmp(env.rdram.data() + kDstA, expectedUnchanged.data(), expectedUnchanged.size()) == 0,
                      "failed multi-descriptor sceSifSetDma should not partially write earlier descriptors");
+        });
+
+        tc.Run("IOP sysmem pool fits a large sound bank next to resident blocks", [](TestCase &t)
+        {
+            TestEnv env;
+            // The resident blocks SRWZ holds when it loads a battle sound bank (0x5e400 bytes in 14
+            // blocks), then the 0x90000 bank itself: the IOP's free memory is far larger than this.
+            const uint32_t resident[] = {0x840, 0x840, 0x840, 0x20, 0x1040, 0x1040, 0x840, 0x840,
+                                         0x840, 0x840, 0x10000, 0x10000, 0x8000, 0x2a000};
+            bool allResident = true;
+            for (uint32_t size : resident)
+            {
+                setRegU32(env.ctx, 4, 0u);
+                setRegU32(env.ctx, 5, size);
+                setRegU32(env.ctx, 6, 0u);
+                ps2_stubs::sceSifAllocSysMemory(env.rdram.data(), &env.ctx, &env.runtime);
+                allResident = allResident && ::getRegU32(&env.ctx, 2) != 0u;
+            }
+            t.IsTrue(allResident, "resident IOP blocks should allocate");
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 0x90000u);
+            setRegU32(env.ctx, 6, 0u);
+            ps2_stubs::sceSifAllocSysMemory(env.rdram.data(), &env.ctx, &env.runtime);
+            const uint32_t bank = ::getRegU32(&env.ctx, 2);
+            t.IsTrue(bank != 0u && bank + 0x90000u <= 0x00200000u, "a 0x90000 bank should fit in IOP RAM");
+            setRegU32(env.ctx, 4, bank);
+            ps2_stubs::sceSifFreeSysMemory(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 0, "the bank should free");
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 0x90000u);
+            setRegU32(env.ctx, 6, 0u);
+            ps2_stubs::sceSifAllocSysMemory(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(::getRegU32(&env.ctx, 2), bank, "a freed bank should be reused, not leaked");
         });
 
         tc.Run("sceSifSetDma enforces descriptor count limit", [](TestCase &t)

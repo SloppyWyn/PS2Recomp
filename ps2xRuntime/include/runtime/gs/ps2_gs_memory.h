@@ -540,6 +540,18 @@ namespace GSMem
 
 	void InitLookupTables();
 
+	// The page lookup tables InitLookupTables fills, for code that resolves pixel addresses
+	// inline (the rasteriser): PixelStorageTraits<psm>::Address(PageTableXX, bp, bw, x, y) is
+	// the pixel index; the byte address follows as in PixelStorageTraits<psm>::Read.
+	extern PixelStorageTraits<C32>::PageLookupTableT PageTableC32;   // CT32, CT24, T8H, T4HL, T4HH
+	extern PixelStorageTraits<Z32>::PageLookupTableT PageTableZ32;   // Z32, Z24
+	extern PixelStorageTraits<C16>::PageLookupTableT PageTableC16;
+	extern PixelStorageTraits<C16S>::PageLookupTableT PageTableC16S;
+	extern PixelStorageTraits<Z16>::PageLookupTableT PageTableZ16;
+	extern PixelStorageTraits<Z16S>::PageLookupTableT PageTableZ16S;
+	extern PixelStorageTraits<P8>::PageLookupTableT PageTableP8;
+	extern PixelStorageTraits<P4>::PageLookupTableT PageTableP4;
+
     // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
 

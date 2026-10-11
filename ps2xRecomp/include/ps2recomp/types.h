@@ -179,6 +179,46 @@ namespace ps2recomp
         std::string outputPath;
         std::string ghidraMapPath;
         bool singleFileOutput = false;
+        // Without single_file_output: when non-zero, functions are written grouped by guest
+        // address, one .cpp per aligned window of this many bytes (e.g. 0x2000), so a change
+        // to one function rewrites one file and the generated headers stay out of every TU.
+        // 0 (default) = one .cpp per function (the original layout).
+        uint32_t outputGroupBytes = 0;
+        // resume_into_owner: an entry_* code label nested inside a real function (Ghidra
+        // exports every referenced label as one) is not emitted as its own fragment
+        // function; its address is registered to the owner function instead, whose
+        // `switch (ctx->pc)` jumps to the label. The scheduler then resumes a thread in the
+        // middle of the owner and the code runs on natively instead of returning to the
+        // scheduler at every label. Labels outside any real function stay fragments.
+        // false (default) = fragments as before.
+        bool resumeIntoOwner = false;
+        // lean_codegen: leaner generated code with the same guest semantics (see
+        // ps2xRuntime/include/ps2_runtime_lean_macros.h and docs/LEAN-CODEGEN.md):
+        // `ctx->pc` is stored only where the runtime can observe it (before calls, dispatches,
+        // syscalls, traps, checkpoints, returns and branch targets, and in the slow path of a
+        // memory access that reaches the runtime), the delay-slot flags only around delay
+        // slots that can reach the runtime, memory accesses go through inline functions
+        // instead of lambdas (no ps2TraceGuestWrite no-op), the GPR accessors are scalar
+        // 32/64-bit loads and stores of the low half (upper 64 bits untouched, as before) and
+        // $zero operands are folded to literals. false (default) = output byte-identical to
+        // before. lean_codegen = true turns every trim on; each has its own key too
+        // (lean_pc_stores, lean_memory_helpers, lean_delay_slot_flags, lean_gpr_scalar,
+        // lean_zero_fold), read after lean_codegen so it can switch one trim off (or on alone).
+        bool leanCodegen = false;
+        struct LeanOptions
+        {
+            bool pcStores = false;       // drop ctx->pc stores nothing can observe
+            bool memoryHelpers = false;  // PS2X_READn/WRITEn inline helpers instead of the lambdas
+            bool delaySlotFlags = false; // in_delay_slot/branch_pc only around runtime-reaching delay slots
+            bool gprScalar = false;      // scalar low-half GPR accessors
+            bool zeroFold = false;       // GPR_*(ctx, 0) -> literal
+            bool any() const { return pcStores || memoryHelpers || delaySlotFlags || gprScalar || zeroFold; }
+            static LeanOptions all() { return LeanOptions{true, true, true, true, true}; }
+        };
+        LeanOptions lean;
+        // The trims to apply: `lean` as merged by ConfigManager (lean_codegen plus per-trim
+        // keys), or every trim when leanCodegen was set in code without touching `lean`.
+        LeanOptions effectiveLeanOptions() const { return (leanCodegen && !lean.any()) ? LeanOptions::all() : lean; }
         bool lowMemoryMode = false;
         uint32_t outputWorkerThreads = 0;
         bool patchSyscalls = false;

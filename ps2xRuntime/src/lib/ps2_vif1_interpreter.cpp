@@ -1,6 +1,10 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <algorithm>
+#include <cstdlib>
+#include <vector>
 #include <cstring>
+#include <iostream>
 
 enum VIFCmd : uint8_t
 {
@@ -283,6 +287,91 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
+namespace
+{
+    // PS2X_VIF1_UNPACK_WATCH=<vu1 qword addr>[:<count>]: for the first <count> (default 64)
+    // UNPACKs that write VU1 data memory starting at <addr>, print the guest address the
+    // payload was read from (DMA source, through the chain's tags) and the first 8 qwords.
+    struct Vif1UnpackWatch
+    {
+        bool enabled = false;
+        uint32_t vuAddr = 0u;
+        uint64_t remaining = 0u;
+    };
+
+    Vif1UnpackWatch &vif1UnpackWatch()
+    {
+        static Vif1UnpackWatch watch = []
+        {
+            Vif1UnpackWatch w;
+            const char *value = std::getenv("PS2X_VIF1_UNPACK_WATCH");
+            if (!value || !*value)
+                return w;
+            char *end = nullptr;
+            w.vuAddr = static_cast<uint32_t>(std::strtoul(value, &end, 0)) & 0x3FFu;
+            w.remaining = (end && *end == ':') ? std::strtoull(end + 1, nullptr, 0) : 64u;
+            w.enabled = true;
+            return w;
+        }();
+        return watch;
+    }
+}
+
+// One DIRECT/DIRECTHL payload (or part of one) for the GIF's PATH2. The GIF keeps its tag state
+// across DIRECT commands: when the previous GIF tag was IMAGE with more data than its DIRECT
+// carried, the next DIRECT payload qwords are that image data (sent here behind a synthesized
+// IMAGE tag, the GIF backend being packet based); whatever follows starts with a new GIF tag.
+void PS2Memory::submitVif1DirectPayload(const uint8_t *data, uint32_t qwc, bool directHl)
+{
+    while (qwc != 0u && m_vif1PendingPath2ImageQwc != 0u)
+    {
+        const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, qwc);
+        std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+        const uint64_t imageTag =
+            static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+            ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+            (static_cast<uint64_t>(kGifFmtImage) << 58);
+        std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+        std::memcpy(imagePacket.data() + 16u, data, static_cast<size_t>(chunkQw) * 16u);
+        submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true,
+                        m_vif1PendingPath2DirectHl);
+        data += chunkQw * 16u;
+        qwc -= chunkQw;
+        m_vif1PendingPath2ImageQwc -= chunkQw;
+        if (m_vif1PendingPath2ImageQwc == 0u)
+            m_vif1PendingPath2DirectHl = false;
+    }
+    if (qwc == 0u)
+        return;
+
+    submitGifPacket(GifPathId::Path2, data, qwc * 16u, true, directHl);
+    const uint32_t pendingImageQw = pendingGifImageQwc(data, qwc * 16u);
+    if (pendingImageQw != 0u)
+    {
+        m_vif1PendingPath2ImageQwc = pendingImageQw;
+        m_vif1PendingPath2DirectHl = directHl;
+    }
+}
+
+bool vif1UnpackWatchEnabled()
+{
+    return vif1UnpackWatch().enabled;
+}
+
+uint32_t PS2Memory::vif1GuestAddressOf(const uint8_t *p) const
+{
+    if (!m_vif1SrcSegs || !m_vif1SrcBase || p < m_vif1SrcBase)
+        return 0xFFFFFFFFu;
+    const uint32_t off = static_cast<uint32_t>(p - m_vif1SrcBase);
+    const auto &segs = *m_vif1SrcSegs;
+    for (size_t i = segs.size(); i-- > 0;)
+    {
+        if (segs[i].first <= off)
+            return segs[i].second + (off - segs[i].first);
+    }
+    return 0xFFFFFFFFu;
+}
+
 void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
@@ -292,7 +381,19 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     if (requestedEnd > static_cast<uint64_t>(PS2_RAM_SIZE))
         sizeBytes = PS2_RAM_SIZE - srcPhys;
 
+    std::vector<std::pair<uint32_t, uint32_t>> segs;
+    if (vif1UnpackWatchEnabled())
+    {
+        segs.emplace_back(0u, srcPhys);
+        m_vif1SrcSegs = &segs;
+        m_vif1SrcBase = m_rdram + srcPhys;
+    }
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
+    if (vif1UnpackWatchEnabled())
+    {
+        m_vif1SrcSegs = nullptr;
+        m_vif1SrcBase = nullptr;
+    }
 }
 
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
@@ -300,34 +401,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (sizeBytes == 0u)
         return;
 
+    m_pathStats.vif1Bytes.fetch_add(sizeBytes, std::memory_order_relaxed);
     uint32_t pos = 0;
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        if (m_vif1DirectRemainQwc != 0u)
         {
+            // The rest of a DIRECT/DIRECTHL payload that did not fit in the previous transfer.
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
-            {
                 break;
-            }
-
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-
+            const uint32_t chunkQw = std::min<uint32_t>(m_vif1DirectRemainQwc, availableQw);
+            m_vif1DirectRemainQwc -= chunkQw;
+            submitVif1DirectPayload(data + pos, chunkQw, m_vif1DirectRemainHl);
             pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
             continue;
         }
 
@@ -336,6 +424,53 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         pos += 4;
 
         uint8_t opcode = (cmd >> 24) & 0x7F;
+        {
+            std::atomic<uint64_t> *counter = &m_pathStats.vif1Other;
+            if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
+                counter = &m_pathStats.vif1Mscal;
+            else if (opcode == VIF_MSCNT)
+                counter = &m_pathStats.vif1Mscnt;
+            else if (opcode == VIF_MPG)
+                counter = &m_pathStats.vif1Mpg;
+            else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
+                counter = &m_pathStats.vif1Direct;
+            else if ((opcode & 0x60u) == 0x60u)
+                counter = &m_pathStats.vif1Unpack;
+            const uint64_t ordinal = counter->fetch_add(1, std::memory_order_relaxed);
+            (void)ordinal;
+            // PS2X_VIF1_TRACE=[<skip>:]<n>: VIFcodes skip..skip+n-1 (all VIF1 codes, in order) with
+            // the registers that shape UNPACK (CYCLE, MASK, MODE, TOPS, BASE, OFST) on stderr.
+            static uint64_t traceSkip = 0u;
+            static const uint64_t traceCount = []
+            {
+                const char *value = std::getenv("PS2X_VIF1_TRACE");
+                if (!value)
+                    return uint64_t{0};
+                char *end = nullptr;
+                const uint64_t first = std::strtoull(value, &end, 0);
+                if (end && *end == ':')
+                {
+                    traceSkip = first;
+                    return static_cast<uint64_t>(std::strtoull(end + 1, nullptr, 0));
+                }
+                return first;
+            }();
+            static uint64_t traceIndex = 0u;
+            if (traceCount != 0u)
+            {
+                const uint64_t index = traceIndex++;
+                if (index >= traceSkip && index - traceSkip < traceCount)
+                {
+                    std::cerr << "[vif1:code] n=" << index << std::hex << " cmd=0x" << cmd
+                              << " op=0x" << static_cast<uint32_t>(opcode)
+                              << " num=0x" << ((cmd >> 16) & 0xFFu) << " imm=0x" << (cmd & 0xFFFFu)
+                              << " cycle=0x" << vif1_regs.cycle << " mask=0x" << vif1_regs.mask
+                              << " mode=" << vif1_regs.mode << " base=0x" << vif1_regs.base
+                              << " ofst=0x" << vif1_regs.ofst << " tops=0x" << vif1_regs.tops
+                              << std::dec << std::endl;
+                }
+            }
+        }
         uint16_t imm = cmd & 0xFFFF;
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
@@ -487,30 +622,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
         {
+            // DIRECT/DIRECTHL: IMMEDIATE qwords (0 = 65536) go to the GIF over PATH2. The data
+            // is qword aligned in the stream; a payload cut off by the end of this transfer
+            // continues at the start of the next one.
             uint32_t qwCount = imm;
             if (qwCount == 0)
                 qwCount = 65536;
+            const bool directHl = (opcode == VIF_DIRECTHL);
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            const bool truncated = qwCount > availableQw;
-            if (qwCount > availableQw)
-                qwCount = availableQw;
-
-            if (qwCount > 0)
+            const uint32_t nowQw = std::min<uint32_t>(qwCount, availableQw);
+            submitVif1DirectPayload(data + pos, nowQw, directHl);
+            pos += nowQw * 16u;
+            if (nowQw < qwCount)
             {
-                const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
-
-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
-                if (pendingImageQw != 0u)
-                {
-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
-                    m_vif1PendingPath2DirectHl = directHl;
-                }
-            }
-
-            pos += qwCount * 16;
-            if (truncated)
-            {
+                m_vif1DirectRemainQwc = qwCount - nowQw;
+                m_vif1DirectRemainHl = directHl;
                 pos = sizeBytes;
                 break;
             }
@@ -571,6 +697,32 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
+
+            if (vif1UnpackWatchEnabled())
+            {
+                Vif1UnpackWatch &watch = vif1UnpackWatch();
+                if (watch.remaining != 0u && vuAddr == watch.vuAddr)
+                {
+                    --watch.remaining;
+                    const uint32_t guest = vif1GuestAddressOf(data + pos);
+                    std::cerr << std::hex << "[vif1:unpack-watch] cmd=0x" << cmd << " vu=0x" << vuAddr
+                              << " num=0x" << static_cast<uint32_t>(num) << " src=0x" << guest
+                              << " cycle=0x" << vif1_regs.cycle << std::dec << std::endl;
+                    const uint32_t qws = std::min<uint32_t>(std::min<uint32_t>(writeVectorCount, 8u), (sizeBytes - pos) / 16u);
+                    if (bytesPerVector == 16u)
+                    {
+                        for (uint32_t q = 0; q < qws; ++q)
+                        {
+                            uint32_t w[4];
+                            float f[4];
+                            std::memcpy(w, data + pos + q * 16u, 16u);
+                            std::memcpy(f, w, 16u);
+                            std::cerr << "[vif1:unpack-watch]   q" << q << std::hex << " " << w[0] << " " << w[1] << " " << w[2] << " " << w[3]
+                                      << std::dec << "  (" << f[0] << ", " << f[1] << ", " << f[2] << ", " << f[3] << ")" << std::endl;
+                        }
+                    }
+                }
+            }
 
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {

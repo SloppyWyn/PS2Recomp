@@ -414,3 +414,26 @@ namespace ps2_syscalls
         }
     }
 }
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_syscalls::snapshot
+{
+    void saveVagAccumulators(ps2x::StateWriter &w)
+    {
+        std::lock_guard<std::mutex> lock(g_vagAccumMutex);
+        w.sortedMap(g_vagAccum, [&w](const VagAccumEntry &entry)
+                    {
+                        w.podVector(entry.data);
+                        w.u32(entry.firstBufAddr); });
+    }
+
+    void loadVagAccumulators(ps2x::StateReader &r)
+    {
+        std::lock_guard<std::mutex> lock(g_vagAccumMutex);
+        r.sortedMap(g_vagAccum, [&r](VagAccumEntry &entry)
+                    {
+                        r.podVector(entry.data);
+                        entry.firstBufAddr = r.u32(); });
+    }
+}

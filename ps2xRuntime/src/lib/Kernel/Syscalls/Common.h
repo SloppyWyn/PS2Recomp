@@ -5,6 +5,10 @@
 #include "ps2_runtime_macros.h"
 #include "ps2_stubs.h"
 #include "ps2x/iop/ps2_path.h"
+// Typed stub ABI layer (ps2_stub_abi.h): handlers declared here register as syscalls.
+#define PS2_STUB_KIND ::ps2_abi::Kind::Syscall
+#include "ps2_stub_abi.h"
+#include "runtime/ps2_deterministic.h"
 #include <iostream>
 #include <algorithm>
 #include <cctype>

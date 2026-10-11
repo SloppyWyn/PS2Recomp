@@ -85,6 +85,7 @@ namespace ps2_stubs
             {
                 completeIpuInit(rdram, &parent, runtime);
             };
+            invocation.completeTag = {GuestInvocationCompleteKind::IpuInitComplete, 0u};
             scheduler.invokeCurrent(std::move(invocation));
         }
 
@@ -104,5 +105,32 @@ namespace ps2_stubs
     void sceIpuSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
+    }
+}
+
+#include "ps2_snapshot_hooks.h"
+
+namespace ps2_stubs::snapshot
+{
+    std::function<void(const R5900Context &, R5900Context &)> makeIpuInitComplete(PS2Runtime &runtime)
+    {
+        PS2Runtime *rt = &runtime;
+        uint8_t *rdram = runtime.memory().getRDRAM();
+        return [rdram, rt](const R5900Context &, R5900Context &parent)
+        {
+            completeIpuInit(rdram, &parent, rt);
+        };
+    }
+
+    // No state of its own: only this file's copy of the Helpers/Support.h globals.
+    void saveIpu(ps2x::StateWriter &w)
+    {
+        snapshotSaveSupport(w);
+    }
+
+    void loadIpu(ps2x::StateReader &r, PS2Runtime &runtime)
+    {
+        (void)runtime;
+        snapshotLoadSupport(r);
     }
 }

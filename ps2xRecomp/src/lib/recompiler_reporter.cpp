@@ -107,6 +107,13 @@ namespace ps2recomp
         m_counters.additionalEntryPoints += count;
     }
 
+    void RecompilerReporter::recordAbsorbedEntryFragments(size_t fragments, size_t owners)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_counters.absorbedEntryFragments += fragments;
+        m_counters.absorbedEntryOwners += owners;
+    }
+
     void RecompilerReporter::recordGeneratedFunctions(size_t count)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -191,6 +198,12 @@ namespace ps2recomp
            << ", skipped: " << m_counters.functionsSkipped
            << ", decode failures: " << m_counters.decodeFailures << std::endl;
         os << "Additional entrypoints: " << m_counters.additionalEntryPoints << std::endl;
+        if (m_counters.absorbedEntryFragments > 0u)
+        {
+            os << "Nested entry_ labels resumed in their owner (resume_into_owner): "
+               << m_counters.absorbedEntryFragments << " across " << m_counters.absorbedEntryOwners
+               << " function(s)" << std::endl;
+        }
         os << "Generated functions: " << m_counters.generatedFunctions << std::endl;
         os << "Indirect fallback promotions: " << m_counters.indirectFallbackPromotions
            << " (" << m_counters.indirectFallbackEntries << " fallback entries)" << std::endl;

@@ -1,4 +1,7 @@
+#include "runtime/ps2_pace_log.h"
 #include "ps2_runtime.h"
+#include "runtime/ps2_snapshot.h"
+#include "ps2_overlays.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -6,13 +9,21 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_fastforward.h"
 #include "ThreadNaming.h"
+#include "ps2_watchdog.h"
+#include "ps2_host_profile.h"
+#include "ps2_headless.h"
+#include "ps2_call_trace.h"
+#include "ps2_crash.h"
+#include "ps2_guest_names.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#include "runtime/ps2_spu2_output.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -20,11 +31,13 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <chrono>
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <iomanip>
 #include <sstream>
 
 namespace ps2_stubs
@@ -87,10 +100,47 @@ struct ProgramHeader
 
 namespace
 {
+    // PS2X_UNWIND_LOG=<n>: log the first n checkpoint unwinds that pass a call with ctx->pc at
+    // the callee's entry (dispatchGuestBranch); before that case was handled they were taken
+    // for returns. Off by default: one branch on a rare path.
+    void noteUnwindAtCalleeEntry(const R5900Context *ctx, uint32_t sourcePc)
+    {
+        static const unsigned long limit = []
+        {
+            const char *value = std::getenv("PS2X_UNWIND_LOG");
+            return value ? std::strtoul(value, nullptr, 0) : 0ul;
+        }();
+        static unsigned long count = 0;
+        if (count >= limit)
+        {
+            return;
+        }
+        ++count;
+        std::cerr << "[ee:unwind] checkpoint unwinds through the call at " << ps2x_names::describe(sourcePc)
+                  << " with pc at the callee's entry " << ps2x_names::describe(ctx->pc)
+                  << " (resumed there, not taken as a return) ra=0x" << std::hex << getRegU32(ctx, 31)
+                  << " sp=0x" << getRegU32(ctx, 29) << std::dec << " n=" << count << std::endl;
+    }
+
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+
+    // Guest stacks for invocations the runtime starts itself (interrupt handlers,
+    // alarms, RPC end-callbacks; EeScheduler::invocationStackTop). On hardware these
+    // run on the kernel's stack in kernel RAM. Everything from the ELF to the top of
+    // RAM belongs to the game, including the main thread's stack, which crt0 often
+    // puts at the very top (SRW Z: SetupThread(stack=0x1f00000, size=0x100000)):
+    // stacks carved from there let callbacks overwrite the main thread's saved
+    // registers. So use the space between the kernel (below 0x80000; the runtime
+    // mirrors its syscall table there) and the lowest loaded segment, starting at
+    // 0x90000 to stay clear of the SDK's kernel patches (libkernl's InitAlarm copies
+    // data to 0x82000 on hardware); fall back to the top of RAM only when the ELF
+    // loads that low.
+    constexpr uint32_t kAsyncCallbackStackLowFloor = 0x00090000u;
+    constexpr uint32_t kAsyncCallbackStackLowTop = 0x00100000u;
+    constexpr uint32_t kAsyncCallbackStackMinWindow = 0x00010000u;
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
@@ -108,6 +158,8 @@ namespace
     };
 
     thread_local DispatchHistory g_dispatchHistory;
+    // The game (EE scheduler) thread's history, for crash reports from any thread.
+    std::atomic<const DispatchHistory *> g_guestDispatchHistory{nullptr};
 
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
@@ -162,28 +214,30 @@ namespace
         }
     }
 
-    std::string formatDispatchHistory()
+    // "0x100230 (FUN_00100230) -> ..." oldest first.
+    std::string formatDispatchHistory(const DispatchHistory &h = g_dispatchHistory, const char *separator = " -> ")
     {
-        const DispatchHistory &h = g_dispatchHistory;
         const uint32_t count = h.wrapped ? static_cast<uint32_t>(h.pcs.size()) : h.next;
         if (count == 0u)
         {
             return "(empty)";
         }
 
-        std::ostringstream oss;
-        bool first = true;
+        std::string out;
+        char name[200];
         for (uint32_t i = 0u; i < count; ++i)
         {
             const uint32_t idx = (h.next + h.pcs.size() - count + i) % static_cast<uint32_t>(h.pcs.size());
-            if (!first)
+            if (i != 0u)
             {
-                oss << " -> ";
+                out += separator;
             }
-            first = false;
-            oss << "0x" << std::hex << h.pcs[idx];
+            char text[240];
+            ps2x_names::format(name, sizeof(name), h.pcs[idx]);
+            std::snprintf(text, sizeof(text), "0x%x (%s)", h.pcs[idx], name);
+            out += text;
         }
-        return oss.str();
+        return out;
     }
 
     uint32_t selectExceptionVector(const R5900Context *ctx, bool tlbRefill)
@@ -373,10 +427,41 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+// Rate of the host (window) loop, which presents frames, takes GS dumps and prints the
+// [run:tick] lines: 60 Hz, or 60 x PS2X_FASTFORWARD so the presenter keeps up with a sped-up
+// guest clock. 0 = unthrottled (unlimited fast-forward with a window). Headless, unlimited
+// fast-forward paces at 60 x the busy scale instead of spinning.
+static int hostLoopTargetFps(bool headless)
+{
+    const ps2x::ff::Settings &ff = ps2x::ff::settings();
+    if (!ff.active)
+        return 60;
+    if (ff.unlimited && !headless)
+        return 0;
+    return static_cast<int>(60.0 * ff.factor);
+}
+
+// Latch the GS's presented picture once per guest VBlank (the first loop pass always
+// latches). Latching runs the presentation (and PS2X_GS_DUMP); returns true when it did.
+static bool LatchPresentationFrame(PS2Runtime *rt)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
+    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+    if (s_hasLatchedInitialFrame && currentTick == s_lastPresentationTick)
+        return false;
+    const int64_t paceStart = ps2x::pace::enabled() ? ps2x::pace::nowUs() : 0;
+    rt->gs().latchHostPresentationFrame();
+    if (ps2x::pace::enabled()) [[unlikely]]
+        ps2x::pace::line("LATCH v=%llu us=%lld", static_cast<unsigned long long>(currentTick),
+                         static_cast<long long>(ps2x::pace::nowUs() - paceStart));
+    s_lastPresentationTick = currentTick;
+    s_hasLatchedInitialFrame = true;
+    return true;
+}
+
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+{
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
     static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
     static bool s_lastPreferred = false;
@@ -387,14 +472,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
-    if (needsLatch)
-    {
-        rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
-    }
-    else if (s_hasUploadedFrame)
+    const bool needsLatch = LatchPresentationFrame(rt);
+    if (!needsLatch && s_hasUploadedFrame)
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
@@ -503,8 +582,25 @@ PS2Runtime::PS2Runtime()
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackFloor = kAsyncCallbackStackLowFloor;
+    m_asyncCallbackStackTop = kAsyncCallbackStackLowTop;
+}
+
+void PS2Runtime::closeSpu2Output()
+{
+    // After the emulation thread has stopped: hand over the last mixed frames, detach the
+    // sink, then finish the WAV and stop the host stream.
+    if (!m_spu2Output)
+    {
+        return;
+    }
+    if (m_iopSubsystem)
+    {
+        m_iopSubsystem->flushAudioOutput();
+        m_iopSubsystem->setAudioOutput(nullptr);
+    }
+    m_spu2Output->close();
+    m_spu2Output.reset();
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -529,6 +625,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        closeSpu2Output();
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -566,18 +663,21 @@ PS2Runtime::~PS2Runtime()
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
 {
+    syncIopTime();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
 }
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
 {
+    syncIopTime();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
 }
 
 bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
 {
+    syncIopTime();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->stopModule(moduleId, result);
 }
@@ -594,6 +694,7 @@ bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
+    syncIopTime();
     auto scope = m_iopHost->enterCall(ctx, rdram);
     request.callToken = scope.token();
     return m_iopSubsystem->handleRpc(request);
@@ -601,6 +702,7 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
 
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
+    syncIopTime();
     auto scope = m_iopHost->enterCall(nullptr, rdram);
     m_iopSubsystem->onSifTransfer(transfer);
 }
@@ -608,6 +710,27 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
     m_iopSubsystem->runEeCycles(eeCycles);
+}
+
+uint64_t PS2Runtime::iopEeCyclesUntilNextEvent() const noexcept
+{
+    return m_iopSubsystem ? m_iopSubsystem->eeCyclesUntilNextEvent() : std::numeric_limits<uint64_t>::max();
+}
+
+void PS2Runtime::setIopBatchedTiming(bool enabled) noexcept
+{
+    if (m_iopSubsystem)
+    {
+        m_iopSubsystem->setBatchedTiming(enabled);
+    }
+}
+
+void PS2Runtime::syncIopTime() const noexcept
+{
+    if (m_eeScheduler && m_eeScheduler->batchTimingEnabled() && m_eeScheduler->isExecutorThread())
+    {
+        m_eeScheduler->flushDeferredTimeForIopAccess();
+    }
 }
 
 void PS2Runtime::resetIop()
@@ -632,16 +755,19 @@ bool PS2Runtime::freeIopMemory(uint32_t address)
 
 bool PS2Runtime::readIopMemory(uint32_t address, void *destination, size_t size) const
 {
+    syncIopTime();
     return m_iopSubsystem && m_iopSubsystem->readMemory(address, destination, size);
 }
 
 bool PS2Runtime::writeIopMemory(uint32_t address, const void *source, size_t size)
 {
+    syncIopTime();
     return m_iopSubsystem && m_iopSubsystem->writeMemory(address, source, size);
 }
 
 bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
 {
+    syncIopTime();
     return m_iopSubsystem && m_iopSubsystem->zeroMemory(address, size);
 }
 
@@ -665,6 +791,9 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    if (m_gs.asyncEnabled())
+        m_memory.setGsSyncCallback([this]
+                                   { m_gs.sync(); });
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
@@ -715,6 +844,9 @@ bool PS2Runtime::syncCoreSubsystems()
 
 bool PS2Runtime::initialize(const char *title)
 {
+    // First, so a crash during start-up (window, audio, device setup) is reported too.
+    ps2x_crash::install([this]()
+                        { return crashGuestReport(); });
     try
     {
         if (!m_memory.initialize())
@@ -728,16 +860,77 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
+        bool audioDeviceOpen = false;
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-        InitAudioDevice();
-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        // FLAG_WINDOW_ALWAYS_RUN: without it raylib's EndDrawing parks the window loop in
+        // glfwWaitEvents while the window is minimized; nothing is presented then (no frames,
+        // no GS dumps, no tick lines) and a close request is never seen, because raylib's
+        // minimized loop only checks the minimized state. The guest runs on regardless.
+        // PS2X_HEADLESS=1, or no monitor (ps2_headless.h): no window, GL context or audio
+        // device. Decided before InitWindow, which crashes when GLFW finds no monitor.
+        bool headless = ps2x::headless::requestedByEnv();
+        if (headless)
+        {
+            std::cout << "[run] headless (PS2X_HEADLESS)" << std::endl;
+        }
+        else if (!ps2x::headless::hostHasMonitor())
+        {
+            std::cout << "[run] no monitor: headless" << std::endl;
+            headless = true;
+        }
+        ps2x::headless::setActive(headless);
+        if (!headless)
+        {
+            // FLAG_WINDOW_UNFOCUSED: the window is created with GLFW_FOCUSED off, so GLFW shows it
+            // without activation (SW_SHOWNA, or the launcher's STARTUPINFO show command) and never
+            // calls glfwFocusWindow: a scripted run opens behind whatever the user is working in
+            // instead of taking the foreground. A click focuses it as usual (keyboard and pad
+            // input then work). PS2X_WINDOW_FOCUS=1 restores focus-on-start for interactive use.
+            unsigned int windowFlags = FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN;
+            const char *focusEnv = std::getenv("PS2X_WINDOW_FOCUS");
+            const bool focusOnStart = focusEnv && focusEnv[0] && std::strcmp(focusEnv, "0") != 0;
+            if (!focusOnStart)
+            {
+                windowFlags |= FLAG_WINDOW_UNFOCUSED;
+            }
+            SetConfigFlags(windowFlags);
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+            std::cout << "[run] window " << (focusOnStart ? "focused on start (PS2X_WINDOW_FOCUS)" : "opened without focus") << std::endl;
+        }
+        // PS2X_NO_AUDIO=1 / PS2X_MUTE=1 / headless: no InitAudioDevice at all (no WASAPI
+        // stream opened and closed per run). The backend's sounds then go nowhere; nothing in
+        // the guest waits on host playback, so the game runs the same (ps2_headless.h).
+        const ps2x::headless::AudioDevice audioDecision = ps2x::headless::audioDeviceDecision(headless);
+        if (audioDecision == ps2x::headless::AudioDevice::Open)
+        {
+            InitAudioDevice();
+            audioDeviceOpen = IsAudioDeviceReady();
+        }
+        else
+        {
+            std::cout << ps2x::headless::describeAudioDevice(audioDecision) << std::endl;
+        }
+        m_audioBackend.setAudioReady(audioDeviceOpen);
 #endif
-        SetTargetFPS(60);
-        if (m_debugUiInitCallback)
+        // SPU2 mixed output (ps2_spu2_output.h): PS2X_SPU2_WAV and/or PS2X_AUDIO_SPU2; with
+        // neither, no sink and the mixer stays off.
+        m_spu2Output = ps2x::audio::Spu2Output::create(ps2x::audio::spu2OutputSettingsFromEnvironment(), audioDeviceOpen);
+        if (m_spu2Output && m_iopSubsystem)
+        {
+            ps2x::audio::Spu2Output *output = m_spu2Output.get();
+            m_iopSubsystem->setAudioOutput([output](const int16_t *frames, size_t count)
+                                           { output->onFrames(frames, count); });
+        }
+        if (ps2x::ff::settings().active && audioDeviceOpen)
+        {
+            std::cout << "[audio] fast-forward with sound on: sounds play at 1x pitch and cut each other off" << std::endl;
+        }
+        ps2x::headless::installStopSources();
+        // PS2X_FASTFORWARD: the window loop must not throttle a sped-up guest clock.
+        SetTargetFPS(hostLoopTargetFps(false));
+        if (m_debugUiInitCallback && !ps2x::headless::active())
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
             m_debugUiInitialized = true;
@@ -821,6 +1014,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     m_debugPc.store(m_cpuContext.pc, std::memory_order_relaxed);
 
     uint32_t maxLoadedRdramEnd = kGuestHeapDefaultBase;
+    uint32_t minLoadedRdramBase = PS2_RAM_SIZE;
     uint32_t moduleBase = std::numeric_limits<uint32_t>::max();
     uint32_t moduleEnd = 0u;
     bool loadedAnySegment = false;
@@ -922,6 +1116,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         if (!scratch)
         {
             maxLoadedRdramEnd = std::max(maxLoadedRdramEnd, static_cast<uint32_t>(segmentMemEnd));
+            minLoadedRdramBase = std::min(minLoadedRdramBase, physAddr);
         }
 
         if (ph.flags & 0x1u) // PF_X
@@ -971,9 +1166,23 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        const uint32_t lowTop = std::min(kAsyncCallbackStackLowTop, minLoadedRdramBase & ~0xFu);
+        if (lowTop > kAsyncCallbackStackLowFloor &&
+            lowTop - kAsyncCallbackStackLowFloor >= kAsyncCallbackStackMinWindow)
+        {
+            m_asyncCallbackStackFloor = kAsyncCallbackStackLowFloor;
+            m_asyncCallbackStackTop = lowTop;
+        }
+        else
+        {
+            const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+            m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
+            m_asyncCallbackStackTop = PS2_RAM_SIZE;
+            std::cerr << "[runtime] ELF loads at 0x" << std::hex << minLoadedRdramBase
+                      << ": callback stacks go at the top of RAM (0x" << m_asyncCallbackStackFloor
+                      << "-0x" << m_asyncCallbackStackTop << "), which may overlap a guest stack"
+                      << std::dec << std::endl;
+        }
     }
 
     LoadedModule module;
@@ -1064,6 +1273,13 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.cdRoot = paths.elfDirectory;
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
+    // PS2X_MC_ROOT=<dir>: the memory card folder (default: mc0 beside the ELF), e.g. a
+    // checkpoint's own copy, so test runs neither see nor change the player's saves.
+    if (const char *mcRoot = std::getenv("PS2X_MC_ROOT"); mcRoot && *mcRoot)
+    {
+        paths.mcRoot = std::filesystem::path(mcRoot);
+        std::cout << "[io] memory card folder: " << paths.mcRoot.string() << " (PS2X_MC_ROOT)" << std::endl;
+    }
 
     setIoPaths(paths);
 }
@@ -1109,10 +1325,28 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
     return replaceFunction(address, func);
 }
 
+namespace
+{
+    // The function for `address` (generated table, then the code overlay loaded there), or
+    // null. No logging and no dispatch history: hasFunction and the dispatcher's hot path.
+    PS2Runtime::RecompiledFunction findGuestFunction(const uint8_t *rdram, uint32_t address)
+    {
+        uint32_t slot = 0u;
+        if (generatedFunctionTableSlot(address, slot))
+        {
+            if (PS2Runtime::RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot])
+            {
+                return fn;
+            }
+        }
+        // Code overlays loaded over the same addresses (ps2_overlays.h).
+        return ps2xOverlayLookup(rdram, address);
+    }
+}
+
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
-    uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    return findGuestFunction(const_cast<PS2Memory &>(m_memory).getRDRAM(), address) != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1146,6 +1380,10 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         {
             return fn;
         }
+    }
+    if (RecompiledFunction fn = ps2xOverlayLookup(m_memory.getRDRAM(), address))
+    {
+        return fn;
     }
 
     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
@@ -1314,6 +1552,11 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " vtbl[c]=0x" << vtableSlotC
             << " codeRegion=" << (m_memory.isCodeAddress(targetPc) ? "yes" : "no")
             << " policy=" << static_cast<uint32_t>(policy)
+            << std::dec
+            << " thread=" << (m_eeScheduler ? m_eeScheduler->currentThreadId() : 0)
+            << " sourceName=" << ps2x_names::describe(sourcePc, rdram)
+            << " raName=" << ps2x_names::describe(ra, rdram)
+            << std::hex
             << " trace=" << formatDispatchHistory()
             << std::dec;
 
@@ -1342,6 +1585,14 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+bool PS2Runtime::traceGuestCall(const R5900Context *ctx, uint32_t targetPc, uint32_t sourcePc, bool isCall)
+{
+    const int thread = m_eeScheduler ? m_eeScheduler->currentThreadId() : 0;
+    return ps2x_calltrace::enter(ctx, targetPc, sourcePc,
+                                 isCall ? ps2x_calltrace::Kind::Call : ps2x_calltrace::Kind::Jump, thread,
+                                 m_memory.gs().vsyncTick.load(std::memory_order_relaxed));
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1361,18 +1612,26 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
+    // One lookup for both the existence check and the call (it used to be hasFunction() then
+    // lookupFunction(), i.e. two table lookups and, for overlay code, two overlay lookups).
+    const RecompiledFunction targetFn = findGuestFunction(m_memory.getRDRAM(), targetPc);
+
     if (!isCall)
     {
-        if (!hasFunction(targetPc))
+        if (!targetFn)
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+        }
+        else if (ps2x_calltrace::active() && kind != GuestBranchKind::Return) [[unlikely]]
+        {
+            traceGuestCall(ctx, targetPc, sourcePc, false);
         }
 
         ctx->pc = targetPc;
         return false;
     }
 
-    if (!hasFunction(targetPc))
+    if (!targetFn)
     {
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
@@ -1394,12 +1653,42 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    RecompiledFunction targetFn = lookupFunction(targetPc);
+    pushDispatchPc(targetPc); // as lookupFunction() does: the history in missing-function reports
     const uint32_t entryPc = ctx->pc;
-    targetFn(rdram, ctx, this);
+    if (ps2x_calltrace::active()) [[unlikely]]
+    {
+        const bool traced = traceGuestCall(ctx, targetPc, sourcePc, true);
+        targetFn(rdram, ctx, this);
+        if (traced && ps2x_calltrace::logReturns() && !isStopRequested() &&
+            !(m_eeScheduler && m_eeScheduler->unwindingToDispatcher()) &&
+            (ctx->pc == entryPc || ctx->pc == fallthroughPc))
+        {
+            ps2x_calltrace::leave(ctx, targetPc);
+        }
+    }
+    else
+    {
+        targetFn(rdram, ctx, this);
+    }
 
     if (isStopRequested() || ctx->pc == 0u)
     {
+        return false;
+    }
+
+    // A checkpoint inside the callee (an event, a time-slice preemption) is unwinding the host
+    // stack to the scheduler: ctx->pc is where this thread resumes, not where the callee
+    // returned to. It can equal entryPc: the callee made a nested call to its own address (the
+    // dispatch checkpoint fires before it and leaves ctx->pc = target) or looped back to its
+    // first instruction. Taking that for "the callee returned without touching pc" (the rule
+    // below) would continue the caller at fallthroughPc with the callee's registers: callee-saved
+    // registers still holding the callee's values, v0 = whatever it held. Keep unwinding.
+    if (m_eeScheduler && m_eeScheduler->unwindingToDispatcher())
+    {
+        if (ctx->pc == entryPc) [[unlikely]]
+        {
+            noteUnwindAtCalleeEntry(ctx, sourcePc);
+        }
         return false;
     }
 
@@ -1990,27 +2279,32 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     }
 
     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-    uint32_t top = m_asyncCallbackStackTop;
-    if (top > PS2_RAM_SIZE)
+    for (;;)
     {
-        top = PS2_RAM_SIZE;
-    }
-    top &= ~(kGuestHeapDefaultAlignment - 1u);
+        uint32_t top = m_asyncCallbackStackTop;
+        if (top > PS2_RAM_SIZE)
+        {
+            top = PS2_RAM_SIZE;
+        }
+        top &= ~(kGuestHeapDefaultAlignment - 1u);
 
-    if (top <= allocSize)
-    {
-        return 0u;
-    }
+        uint32_t base = (top > allocSize) ? ((top - allocSize) & ~(normalizedAlignment - 1u)) : 0u;
+        if (top > allocSize && base >= m_asyncCallbackStackFloor && base < top)
+        {
+            m_asyncCallbackStackTop = base;
+            return top - 0x10u;
+        }
 
-    uint32_t base = top - allocSize;
-    base &= ~(normalizedAlignment - 1u);
-    if (base < m_asyncCallbackStackFloor || base >= top)
-    {
-        return 0u;
+        if (m_asyncCallbackStackFloor != kAsyncCallbackStackLowFloor)
+        {
+            return 0u;
+        }
+        // The low window is used up: continue at the top of RAM (the old default).
+        m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        std::cerr << "[runtime] callback stacks below the ELF used up; continuing at the top of RAM,"
+                  << " which may overlap a guest stack" << std::endl;
     }
-
-    m_asyncCallbackStackTop = base;
-    return top - 0x10u;
 }
 
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
@@ -2223,7 +2517,8 @@ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
                              [resumePc](R5900Context &context)
                              {
                                  context.pc = resumePc;
-                             });
+                             },
+                             EeResumeTag{EeResumeKind::SetPc, {resumePc}});
 }
 
 void PS2Runtime::addEeExitHandler(int threadId, uint32_t function, uint32_t argument)
@@ -2339,6 +2634,54 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+// For ps2x_crash: lock-free (the crashing thread may hold any runtime lock).
+std::string PS2Runtime::crashGuestReport()
+{
+    std::string out;
+    char line[512];
+    char a[200];
+    char b[200];
+    const R5900Context *ctx = m_activeGuestContext.load(std::memory_order_relaxed);
+    const int thread = m_eeScheduler ? m_eeScheduler->currentThreadId() : 0;
+    std::snprintf(line, sizeof(line), "[crash] guest: vsync=%llu EE thread %d, executing guest code: %s\n",
+                  static_cast<unsigned long long>(m_memory.gs().vsyncTick.load(std::memory_order_relaxed)), thread,
+                  m_eeScheduler && m_eeScheduler->isExecutingGuest() ? "yes" : "no");
+    out += line;
+    if (ctx)
+    {
+        ps2x_names::format(a, sizeof(a), ctx->pc);
+        ps2x_names::format(b, sizeof(b), getRegU32(ctx, 31));
+        std::snprintf(line, sizeof(line), "[crash] guest live pc=0x%x (%s) ra=0x%x (%s) sp=0x%x%s\n", ctx->pc, a,
+                      getRegU32(ctx, 31), b, getRegU32(ctx, 29), ctx->in_delay_slot ? " (in delay slot)" : "");
+        out += line;
+        std::snprintf(line, sizeof(line),
+                      "[crash] guest regs v0=%x v1=%x a0=%x a1=%x a2=%x a3=%x t0=%x t1=%x t2=%x t3=%x\n",
+                      getRegU32(ctx, 2), getRegU32(ctx, 3), getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6),
+                      getRegU32(ctx, 7), getRegU32(ctx, 8), getRegU32(ctx, 9), getRegU32(ctx, 10), getRegU32(ctx, 11));
+        out += line;
+        std::snprintf(line, sizeof(line),
+                      "[crash] guest regs s0=%x s1=%x s2=%x s3=%x s4=%x s5=%x s6=%x s7=%x gp=%x fp=%x\n",
+                      getRegU32(ctx, 16), getRegU32(ctx, 17), getRegU32(ctx, 18), getRegU32(ctx, 19),
+                      getRegU32(ctx, 20), getRegU32(ctx, 21), getRegU32(ctx, 22), getRegU32(ctx, 23),
+                      getRegU32(ctx, 28), getRegU32(ctx, 30));
+        out += line;
+    }
+    const uint32_t debugPc = m_debugPc.load(std::memory_order_relaxed);
+    const uint32_t debugRa = m_debugRa.load(std::memory_order_relaxed);
+    ps2x_names::format(a, sizeof(a), debugPc);
+    ps2x_names::format(b, sizeof(b), debugRa);
+    std::snprintf(line, sizeof(line), "[crash] guest at last scheduler switch: pc=0x%x (%s) ra=0x%x (%s) sp=0x%x\n",
+                  debugPc, a, debugRa, b, m_debugSp.load(std::memory_order_relaxed));
+    out += line;
+    if (const DispatchHistory *h = g_guestDispatchHistory.load(std::memory_order_acquire))
+    {
+        out += "[crash] last guest dispatches (game thread, oldest first):\n[crash]   ";
+        out += formatDispatchHistory(*h, "\n[crash]   ");
+        out += "\n";
+    }
+    return out;
+}
+
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
@@ -2357,19 +2700,44 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
+    // Headless (ps2_headless.h): no texture, no drawing; the loop only latches the presented
+    // frame (GS dumps), prints the tick lines and is paced by the host clock.
+    const bool headless = ps2x::headless::active();
+    Texture2D frameTex{};
+    if (!headless)
+    {
+        // A blank image to use as a framebuffer
+        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+        frameTex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+    }
 
     std::atomic<bool> gameThreadFinished{false};
 
-    std::thread gameThread([&]()
+    // Debug aids (ps2_guest_names.h, ps2_call_trace.h, ps2_crash.h).
+    ps2x_names::setGuestMemory(m_memory.getRDRAM());
+    ps2x_calltrace::init();
+    ps2x_crash::install([this]()
+                        { return crashGuestReport(); }); // no-op when initialize() installed it
+    // PS2X_SNAPSHOT_LOAD restores the whole state here, before the game thread exists;
+    // PS2X_SNAPSHOT_AT arms timed saves (ps2_snapshot.h).
+    const bool resumedFromSnapshot = PS2SnapshotService::startup(*this);
+
+    std::thread gameThread([&, resumedFromSnapshot]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        ps2x_crash::prepareThread();
+        g_guestDispatchHistory.store(&g_dispatchHistory, std::memory_order_release);
         try
         {
-            m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
+            if (resumedFromSnapshot)
+            {
+                m_eeScheduler->adoptExecutorThread();
+            }
+            else
+            {
+                m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
+            }
             m_eeScheduler->run();
             uint32_t pc = m_debugPc.load(std::memory_order_relaxed);
             RUNTIME_LOG("Game thread returned. PC=0x" << std::hex << pc
@@ -2383,11 +2751,69 @@ void PS2Runtime::run()
         {
             std::cerr << "Error during program execution: unknown exception" << std::endl;
         }
+        g_guestDispatchHistory.store(nullptr, std::memory_order_release); // thread_local dies with the thread
+        m_activeGuestContext.store(nullptr, std::memory_order_relaxed);
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    ps2x_host_profile::startFromEnvironment(); // PS2X_HOST_PROFILE
+    ps2x_watchdog::start(
+        [this]()
+        { return m_memory.gs().vsyncTick.load(std::memory_order_acquire); },
+        [this]()
+        {
+            std::ostringstream out;
+            const uint32_t debugPc = m_debugPc.load(std::memory_order_relaxed);
+            const uint32_t debugRa = m_debugRa.load(std::memory_order_relaxed);
+            out << std::hex << "[watchdog] guest debug pc=0x" << debugPc << " (" << ps2x_names::describe(debugPc)
+                << ") ra=0x" << debugRa << " (" << ps2x_names::describe(debugRa)
+                << ") sp=0x" << m_debugSp.load(std::memory_order_relaxed)
+                << " guestExecuting=" << (m_eeScheduler->isExecutingGuest() ? 1 : 0) << "\n";
+            const auto snap = m_eeScheduler->snapshot();
+            out << std::dec << "[watchdog] EE snapshot seq=" << snap.sequence << " eeMs="
+                << (snap.eeCycle / (EeScheduler::kEeClockHz / 1000u)) << " running thread=" << snap.runningThreadId << "\n";
+            for (const auto &t : snap.threads)
+            {
+                out << "[watchdog]   thread " << t.id << std::hex << " pc=0x" << t.pc << " ("
+                    << ps2x_names::describe(t.pc) << ") ra=0x" << t.ra << " (" << ps2x_names::describe(t.ra) << ")"
+                    << " sp=0x" << t.sp << " entry=0x" << t.entry << std::dec
+                    << " prio=" << t.currentPriority << " status=" << static_cast<int>(t.status)
+                    << " wait=" << static_cast<int>(t.waitReason) << "/" << t.waitId
+                    << " suspend=" << t.suspendCount << " invocations=" << t.invocationDepth << "\n";
+            }
+            for (const auto &sema : snap.semaphores)
+            {
+                out << "[watchdog]   sema " << sema.id << " count=" << sema.count << "/" << sema.maxCount
+                    << " waiters=" << sema.waiters << "\n";
+            }
+            for (const auto &flag : snap.eventFlags)
+            {
+                out << "[watchdog]   evf " << flag.id << std::hex << " bits=0x" << flag.bits << std::dec
+                    << " waiters=" << flag.waiters << "\n";
+            }
+            return out.str();
+        });
+
     uint64_t tick = 0;
+    const auto runStart = std::chrono::steady_clock::now();
+    // Headless pacing: the same loop rate the window loop gets from SetTargetFPS.
+    const int headlessFps = headless ? hostLoopTargetFps(true) : 0;
+    const auto headlessPeriod = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / static_cast<double>(std::max(1, headlessFps))));
+    auto headlessNextFrame = runStart;
+    if (headless)
+    {
+        ps2x::headless::beginHighResTimer();
+        std::cout << "[run] headless loop at " << headlessFps << " Hz" << std::endl;
+    }
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        ps2x_watchdog::uiHeartbeat();
+        if (const char *why = ps2x::headless::pollStopRequest())
+        {
+            std::cout << "[run] stop requested (" << why << ")" << std::endl;
+            requestStop();
+            break;
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
@@ -2412,14 +2838,101 @@ void PS2Runtime::run()
                                                << " display1=0x" << gs.display1
                                                << std::dec
                                                << " activeThreads=" << eeSnapshot.threads.size()
+                                               << " hostMs=" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - runStart).count()
+                                               << " eeMs=" << (eeSnapshot.eeCycle / (EeScheduler::kEeClockHz / 1000u))
+                                               << " vsync=" << gs.vsyncTick
                                                << " dma=" << curDma
                                                << " gif=" << curGif
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
+                                               << " eeCpuMs=" << ps2x::headless::threadCpuTimeMs(reinterpret_cast<void *>(gameThread.native_handle()))
+                                               << " flips=" << m_eeScheduler->displayFlips()
                                                << std::endl);
+                static const bool vif1Stats = []
+                {
+                    const char *value = std::getenv("PS2X_VIF1_STATS");
+                    return value && *value && *value != '0';
+                }();
+                if (vif1Stats)
+                {
+                    // PS2X_VIF1_STATS=1: cumulative VIF1 work and GIF traffic per path, to tell
+                    // "nothing sent to VU1" from "VU1 ran but kicked nothing" from "kicked, not drawn".
+                    const PS2Memory::PathStats &ps = m_memory.pathStats();
+                    auto ld = [](const std::atomic<uint64_t> &v) { return v.load(std::memory_order_relaxed); };
+                    RUNTIME_LOG("[vif1:stats] tick=" << tick
+                                                     << " vif1Bytes=" << ld(ps.vif1Bytes)
+                                                     << " mscal=" << ld(ps.vif1Mscal)
+                                                     << " mscnt=" << ld(ps.vif1Mscnt)
+                                                     << " mpg=" << ld(ps.vif1Mpg)
+                                                     << " direct=" << ld(ps.vif1Direct)
+                                                     << " unpack=" << ld(ps.vif1Unpack)
+                                                     << " other=" << ld(ps.vif1Other)
+                                                     << " path1=" << ld(ps.gifPackets[1]) << "/" << ld(ps.gifBytes[1])
+                                                     << " path2=" << ld(ps.gifPackets[2]) << "/" << ld(ps.gifBytes[2])
+                                                     << " path3=" << ld(ps.gifPackets[3]) << "/" << ld(ps.gifBytes[3])
+                                                     << std::endl);
+                }
+                if (m_vu1.statsEnabled())
+                {
+                    // PS2X_VU1_STATS=1: cumulative VU1 work per micro program entry (key = hash of
+                    // micro memory when it ran : entry pc).
+                    std::ostringstream line;
+                    line << "[vu1:stats] tick=" << tick;
+                    for (const VU1Interpreter::ProgramStats &p : m_vu1.programStats())
+                    {
+                        const uint64_t key = p.key.load(std::memory_order_relaxed);
+                        if (key == 0u)
+                            break;
+                        line << " " << std::hex << std::setfill('0') << std::setw(8)
+                             << static_cast<uint32_t>(key >> 32) << ":" << std::setw(8)
+                             << static_cast<uint32_t>(key) << std::dec << std::setfill(' ')
+                             << " runs=" << p.runs.load(std::memory_order_relaxed)
+                             << " pairs=" << p.pairs.load(std::memory_order_relaxed)
+                             << " cycles=" << p.cycles.load(std::memory_order_relaxed)
+                             << " stalls=" << p.stallCycles.load(std::memory_order_relaxed);
+                    }
+                    if (const uint64_t overflow = m_vu1.statsOverflowRuns())
+                        line << " overflowRuns=" << overflow;
+                    RUNTIME_LOG(line.str() << std::endl);
+                }
+                if (m_eeScheduler->dispatchStatsEnabled())
+                {
+                    const EeScheduler::DispatchStats sched = m_eeScheduler->dispatchStats();
+                    RUNTIME_LOG("[sched:stats] tick=" << tick
+                                                      << " dispatches=" << sched.total
+                                                      << " start=" << sched.intoStart
+                                                      << " owner=" << sched.intoOwner
+                                                      << " fragment=" << sched.intoFragment
+                                                      << " overlay=" << sched.intoOverlay
+                                                      << " watched=" << sched.watched
+                                                      << std::endl);
+                }
+                // RUNTIME_LOG's endl lands in its string stream, not on stdout, and stdout
+                // redirected to a file is fully buffered: flush the liveness line, or sparse
+                // output (a slow title under fast-forward, a loaded host) sits in the buffer for
+                // 30+ s and the run scripts take the run for stalled.
+                std::cout.flush();
 
             }
         });
+        if (headless)
+        {
+            LatchPresentationFrame(this);
+            // Fixed-rate schedule (raylib's limiter gives about the same rate); a late frame
+            // restarts it rather than bursting to catch up.
+            headlessNextFrame += headlessPeriod;
+            const auto now = std::chrono::steady_clock::now();
+            if (headlessNextFrame <= now)
+            {
+                headlessNextFrame = now;
+            }
+            else
+            {
+                std::this_thread::sleep_until(headlessNextFrame);
+            }
+            continue;
+        }
+
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -2446,6 +2959,11 @@ void PS2Runtime::run()
         }
         EndDrawing();
 
+        if (IsKeyPressed(KEY_F5))
+        {
+            PS2SnapshotService::requestFromHost(*this);
+        }
+
         if (WindowShouldClose())
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
@@ -2459,14 +2977,25 @@ void PS2Runtime::run()
     {
         gameThread.join();
     }
+    closeSpu2Output();
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
     {
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    UnloadTexture(frameTex);
-    CloseWindow();
+    ps2x_watchdog::stop();
+    ps2x_host_profile::stop(); // PS2X_HOST_PROFILE: final report
+    ps2x_calltrace::shutdown();
+    if (headless)
+    {
+        ps2x::headless::endHighResTimer();
+    }
+    else
+    {
+        UnloadTexture(frameTex);
+        CloseWindow();
+    }
 
     RUNTIME_LOG("[run] exiting loop");
 }

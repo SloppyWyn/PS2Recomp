@@ -15,7 +15,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -408,12 +410,171 @@ namespace
             gs.ReadVram(GS_PSM_Z32, kDepthBlock, 1u, 0u, 0u),
         };
     }
+
+    // Sets an environment variable for one scope and puts the previous value back (the whole
+    // suite may run with PS2X_GS_ASYNC set from outside).
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value) : m_name(name)
+        {
+            if (const char *old = std::getenv(name))
+            {
+                m_had = true;
+                m_old = old;
+            }
+            set(value);
+        }
+        ~ScopedEnv() { set(m_had ? m_old.c_str() : nullptr); }
+
+    private:
+        void set(const char *value)
+        {
+#if defined(_WIN32)
+            _putenv_s(m_name, value ? value : "");
+#else
+            if (value)
+                setenv(m_name, value, 1);
+            else
+                unsetenv(m_name);
+#endif
+        }
+        const char *m_name;
+        bool m_had = false;
+        std::string m_old;
+    };
 }
 
 void register_ps2_gs_tests()
 {
     MiniTest::Case("PS2GS", [](TestCase &tc)
     {
+        tc.Run("Asynchronous GS (PS2X_GS_ASYNC) applies queued commands in order; sync() publishes them", [](TestCase &t)
+        {
+            // The same command stream on a synchronous GS and on an asynchronous one: register
+            // writes, a 64x64 flat sprite (big enough for the raster workers), an IMAGE upload
+            // over part of it, a VRAM write and a second sprite on top. After sync() local
+            // memory must be byte-identical.
+            auto run = [](GS &gs)
+            {
+                gs.WriteVram(GS_PSM_CT32, 0u, 1u, 3u, 3u, 0xDEADBEEFu);
+                gs.writeRegister(GS_REG_FRAME_1, (1ull << 16));             // FBP 0, FBW 1 (64), CT32
+                gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (63ull << 48));
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80402010ull | (0x3F800000ull << 32));
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, (64ull << 4) | ((64ull << 4) << 16));
+                gs.writeRegister(GS_REG_BITBLTBUF, (0ull << 32) | (1ull << 48));
+                gs.writeRegister(GS_REG_TRXPOS, (8ull << 32) | (8ull << 48));
+                gs.writeRegister(GS_REG_TRXREG, 4ull | (4ull << 32));
+                gs.writeRegister(GS_REG_TRXDIR, 0ull);
+                std::vector<uint8_t> packet;
+                appendU64(packet, makeGifTag(4u, GIF_FMT_IMAGE, 0u, true));
+                appendU64(packet, 0ull);
+                for (uint32_t i = 0; i < 64u; ++i)
+                    packet.push_back(static_cast<uint8_t>(i * 3u + 1u));
+                gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+                gs.WriteVram(GS_PSM_CT32, 0u, 1u, 9u, 9u, 0x01020304u);
+                gs.writeRegister(GS_REG_RGBAQ, 0x11223344ull | (0x3F800000ull << 32));
+                gs.writeRegister(GS_REG_XYZ2, (32ull << 4) | ((32ull << 4) << 16));
+                gs.writeRegister(GS_REG_XYZ2, (48ull << 4) | ((48ull << 4) << 16));
+            };
+
+            std::vector<uint8_t> syncVram(PS2_GS_VRAM_SIZE, 0u);
+            {
+                ScopedEnv env("PS2X_GS_ASYNC", "0");
+                GS gs;
+                gs.init(syncVram.data(), static_cast<uint32_t>(syncVram.size()), nullptr);
+                t.IsFalse(gs.asyncEnabled(), "PS2X_GS_ASYNC=0 should keep the GS synchronous");
+                run(gs);
+            }
+
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                ScopedEnv env("PS2X_GS_ASYNC", nullptr);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                t.IsTrue(gs.asyncEnabled(), "without PS2X_GS_ASYNC the GS should be asynchronous (the default)");
+            }
+
+            std::vector<uint8_t> asyncVram(PS2_GS_VRAM_SIZE, 0u);
+            {
+                GS gs;
+                {
+                    ScopedEnv env("PS2X_GS_ASYNC", "1");
+                    gs.init(asyncVram.data(), static_cast<uint32_t>(asyncVram.size()), nullptr);
+                }
+                t.IsTrue(gs.asyncEnabled(), "PS2X_GS_ASYNC=1 should start the GS thread");
+                for (int frame = 0; frame < 3; ++frame)
+                {
+                    run(gs);
+                    gs.throttleAtVBlank(); // at most one VBlank of lag: must not deadlock
+                }
+                // sync() from another thread (the presenter's case) while nothing more is queued.
+                std::thread other([&]
+                                  { gs.sync(); });
+                other.join();
+                gs.sync();
+                t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 9u, 9u), 0x01020304u,
+                         "a VRAM write queued after the IMAGE upload should land after it");
+                t.IsTrue(std::memcmp(syncVram.data(), asyncVram.data(), syncVram.size()) == 0,
+                         "asynchronous GS local memory should equal the synchronous result after sync()");
+            }
+        });
+
+        tc.Run("Asynchronous GS: CSR SIGNAL/FINISH clears and SIGLBLID reads come after queued commands", [](TestCase &t)
+        {
+            // On the console the GS has taken in every packet whose transfer the EE saw end, so a
+            // FINISH from an earlier packet cannot set CSR after the guest cleared it. With the GS
+            // on its own thread the runtime drains the queue (PS2Memory's GS sync callback, as
+            // PS2Runtime installs it) before such a CSR write and before SIGLBLID accesses.
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            GS gs;
+            {
+                ScopedEnv env("PS2X_GS_ASYNC", "1");
+                gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            }
+            t.IsTrue(gs.asyncEnabled(), "PS2X_GS_ASYNC=1 should start the GS thread");
+            mem.setGsSyncCallback([&gs]
+                                  { gs.sync(); });
+
+            constexpr uint32_t kGsCsr = 0x12001000u;
+            constexpr uint32_t kGsSiglblid = 0x12001080u;
+            for (int round = 0; round < 8; ++round)
+            {
+                // Slow work first (a 640x448 sprite), then FINISH, then the guest's clear.
+                gs.writeRegister(GS_REG_FRAME_1, (10ull << 16));
+                gs.writeRegister(GS_REG_SCISSOR_1, (639ull << 16) | (447ull << 48));
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80402010ull | (0x3F800000ull << 32));
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, (640ull << 4) | ((448ull << 4) << 16));
+                gs.writeRegister(GS_REG_FINISH, 0ull);
+                mem.write64(kGsCsr, 0x2ull);
+                t.Equals(mem.read64(kGsCsr) & 0x2ull, 0ull, "CSR FINISH should be clear right after the guest clears it");
+                gs.sync();
+                t.Equals(mem.read64(kGsCsr) & 0x2ull, 0ull, "an earlier queued FINISH must not set CSR after the guest's clear");
+
+                gs.writeRegister(GS_REG_FINISH, 0ull);
+                gs.sync();
+                t.Equals(mem.read64(kGsCsr) & 0x2ull, 0x2ull, "a FINISH queued after the clear should set CSR FINISH");
+                mem.write64(kGsCsr, 0x2ull);
+
+                const uint64_t id = 0x1000ull + static_cast<uint64_t>(round);
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, (640ull << 4) | ((448ull << 4) << 16));
+                gs.writeRegister(GS_REG_SIGNAL, id | (0xFFFFFFFFull << 32));
+                t.Equals(mem.read64(kGsSiglblid) & 0xFFFFFFFFull, id, "a SIGLBLID read should see the SIGNAL queued before it");
+                t.Equals(mem.read64(kGsCsr) & 0x1ull, 0x1ull, "CSR SIGNAL should be set once SIGLBLID shows the id");
+                mem.write64(kGsCsr, 0x1ull);
+                gs.sync();
+                t.Equals(mem.read64(kGsCsr) & 0x1ull, 0ull, "CSR SIGNAL should stay clear after the guest's clear");
+            }
+        });
+
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;
@@ -535,6 +696,14 @@ void register_ps2_gs_tests()
             constexpr uint32_t kXYOffset1Offset = kDraw01Offset + 0x20u;
             constexpr uint32_t kXYOffset1AddrOffset = kDraw01Offset + 0x28u;
 
+            // Interlaced FIELD mode (ffmode 0): a 448-line buffer, DH = h - 1 as in libgraph.
+            R5900Context resetCtx{};
+            setRegU32(resetCtx, 4, 0u);
+            setRegU32(resetCtx, 5, 1u);
+            setRegU32(resetCtx, 6, 2u);
+            setRegU32(resetCtx, 7, 0u);
+            ps2_stubs::sceGsResetGraph(rdram.data(), &resetCtx, &runtime);
+
             R5900Context ctx{};
             setRegU32(ctx, 4, kEnvAddr);
             setRegU32(ctx, 5, 0u);
@@ -611,8 +780,8 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 7, 448u);
             setRegU32(ctx, 29, kStackAddr);
             std::memset(rdram.data() + kEnvAddr, 0xCD, kDBuffSize);
-            std::memcpy(rdram.data() + kStackAddr + 16u, &kZTest, sizeof(kZTest));
-            std::memcpy(rdram.data() + kStackAddr + 24u, &kEnableClear, sizeof(kEnableClear));
+            setRegU32(ctx, 8, kZTest);
+            setRegU32(ctx, 10, kEnableClear);
             std::memset(runtime.memory().getGSVRAM(), 0xAB, 16u);
             ps2_stubs::sceGsSetDefDBuffDc(rdram.data(), &ctx, &runtime);
 
@@ -644,6 +813,7 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 5, 0u);
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
+            runtime.gs().sync(); // asynchronous GS: the clear is applied on the GS thread
             uint32_t clearedPixel = 0u;
             std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
             t.Equals(clearedPixel, kClearColor,
@@ -699,6 +869,7 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 5, 0u);
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
+            runtime.gs().sync(); // asynchronous GS: the clear is applied on the GS thread
             uint32_t clearedPixel = 0u;
             std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
             t.Equals(clearedPixel, kClearColor,
@@ -720,11 +891,13 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_SCISSOR_2, (0ull << 0) | (0ull << 16) | (1ull << 32) | (1ull << 48));
             gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT) | (1ull << 9));
 
+            gs.sync();
             writeReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 1u, kCtx1Sentinel);
 
             t.IsTrue(gs.clearFramebufferContext(0u, kCtx0Color),
                      "context-targeted clear should succeed for a configured CT32 framebuffer");
 
+            gs.sync();
             const uint32_t ctx0Pixel = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 0u, 1u);
             t.Equals(ctx0Pixel, kCtx0Color,
                      "context-targeted clear should write the requested context even when PRIM.ctxt points elsewhere");
@@ -769,6 +942,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ3, xyz(0u, 6u));
             gs.writeRegister(GS_REG_XYZ2, xyz(6u, 6u));
 
+            gs.sync();
             t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u), 0u,
                      "XYZ3 should suppress the completed ABC triangle");
             t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 4u, 4u), kColor,
@@ -803,6 +977,7 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_FOG, static_cast<uint64_t>(fog) << 56);
                 gs.writeRegister(GS_REG_XYZ2, 0ull);
 
+                gs.sync();
                 return readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
             };
 
@@ -845,6 +1020,7 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
                 gs.writeRegister(GS_REG_XYZ2, 0ull);
 
+                gs.sync();
                 return readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
             };
 
@@ -868,6 +1044,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT) | (1ull << 6));
 
             const uint32_t dstWhite = 0xFFFFFFFFu;
+            gs.sync();
             std::memcpy(vram.data(), &dstWhite, sizeof(dstWhite));
 
             gs.writeRegister(GS_REG_PABE, 0ull);
@@ -875,6 +1052,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
             uint32_t blendedPixel = 0u;
+            gs.sync();
             std::memcpy(&blendedPixel, vram.data(), sizeof(blendedPixel));
             t.Equals(blendedPixel, 0x013F3F3Fu,
                      "without PABE, low-alpha fullscreen copies should still apply ALPHA blending");
@@ -887,6 +1065,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
             uint32_t pabeBypassedPixel = 0u;
+            gs.sync();
             std::memcpy(&pabeBypassedPixel, vram.data(), sizeof(pabeBypassedPixel));
             t.Equals(pabeBypassedPixel, 0x01000000u,
                      "with PABE enabled, low-alpha source pixels should bypass ALPHA blending and overwrite the destination");
@@ -899,6 +1078,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
             uint32_t highAlphaPixel = 0u;
+            gs.sync();
             std::memcpy(&highAlphaPixel, vram.data(), sizeof(highAlphaPixel));
             t.Equals(highAlphaPixel, 0x803F3F3Fu,
                      "with PABE enabled, high-alpha source pixels should still use the configured ALPHA blend");
@@ -921,6 +1101,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
             uint32_t pixelWithoutFba = 0u;
+            gs.sync();
             std::memcpy(&pixelWithoutFba, vram.data(), sizeof(pixelWithoutFba));
             t.Equals(pixelWithoutFba, 0x01112233u,
                      "without FBA, CT32 writes should preserve the source alpha byte");
@@ -933,6 +1114,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
             uint32_t pixelWithFba = 0u;
+            gs.sync();
             std::memcpy(&pixelWithFba, vram.data(), sizeof(pixelWithFba));
             t.Equals(pixelWithFba, 0x81112233u,
                      "with FBA enabled, CT32 writes should force the framebuffer alpha high bit");
@@ -1002,8 +1184,9 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, kUvRow1);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, kUvRow1);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // sprite (0,0)-(1,1): one pixel
 
+            gs.sync();
             const uint32_t dstPixel = readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u);
             t.Equals(dstPixel, static_cast<uint32_t>(kSourceColor),
                      "CT32 primitives should land in the same local-memory layout that later CT32 texture sampling expects");
@@ -1052,6 +1235,7 @@ void register_ps2_gs_tests()
                 0x80FFFFFFu,
             };
 
+            gs.sync();
             for (uint32_t y = 0u; y < 4u; ++y)
             {
                 for (uint32_t x = 0u; x < 4u; ++x)
@@ -1075,6 +1259,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, kUv1);
             gs.writeRegister(GS_REG_XYZ2, kXyz1);
 
+            gs.sync();
             for (uint32_t y = 0u; y < 4u; ++y)
             {
                 for (uint32_t x = 0u; x < 4u; ++x)
@@ -1740,6 +1925,126 @@ void register_ps2_gs_tests()
                      "field presentation should still preserve different source content across field rows");
         });
 
+        // Interlaced FRAME mode (SMODE2 INT 1, FFMD 1) as SRWZ's title: a 640x224 buffer with
+        // libgraph's DH = 2h - 1 = 447. Each field reads every buffer line, so the CRTC shows
+        // 224 buffer lines over 448 frame lines (each line twice).
+        tc.Run("latched host presentation spans frame-mode buffers over the full frame height", [](TestCase &t)
+        {
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GSRegisters regs{};
+                regs.pmode = 0x0001ull;
+                regs.smode2 = 0x0003ull;
+                regs.dispfb1 = 70ull | (10ull << 9) | (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+                // DX 636 DY 50 MAGH 3 DW 2559 DH 447, as libgraph builds it for 640x224.
+                regs.display1 = 636ull | (50ull << 12) | (3ull << 23) | (2559ull << 32) | (447ull << 44);
+
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+                for (uint32_t y = 0; y < 224u; ++y)
+                    writeReferenceFramePSMCT32Pixel(vram, 70u, 10u, 5u, y, 0x80000000u | (y + 1u));
+                writeReferenceFramePSMCT32Pixel(vram, 70u, 10u, 5u, 224u, 0x800000FFu); // below the picture
+
+                gs.latchHostPresentationFrame();
+                std::vector<uint8_t> frame;
+                uint32_t width = 0u, height = 0u;
+                t.IsTrue(gs.copyLatchedHostPresentationFrame(frame, width, height),
+                         "frame-mode presentation should produce a host frame");
+                t.Equals(width, 640u, "frame-mode presentation width is DW / (MAGH + 1)");
+                t.Equals(height, 448u, "frame-mode presentation spans DH + 1 frame lines");
+                bool ok = true;
+                for (uint32_t y = 0; y < 448u && ok; ++y)
+                    ok = frame[(static_cast<size_t>(y) * 640u + 5u) * 4u] == static_cast<uint8_t>(y / 2u + 1u);
+                t.IsTrue(ok, "frame line y should show buffer line y / 2 (each buffer line twice)");
+            }
+        });
+
+        // MAGV repeats lines on top of the frame-mode doubling: (DH + 1) / (MAGV + 1) / 2 buffer lines.
+        tc.Run("latched host presentation applies MAGV in frame mode", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0x0001ull;
+            regs.smode2 = 0x0003ull;
+            regs.dispfb1 = 70ull | (10ull << 9) | (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 = (3ull << 23) | (1ull << 27) | (2559ull << 32) | (447ull << 44);
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            for (uint32_t y = 0; y < 224u; ++y)
+                writeReferenceFramePSMCT32Pixel(vram, 70u, 10u, 0u, y, 0x80000000u | (y + 1u));
+
+            gs.latchHostPresentationFrame();
+            std::vector<uint8_t> frame;
+            uint32_t width = 0u, height = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(frame, width, height),
+                     "MAGV presentation should produce a host frame");
+            t.Equals(height, 448u, "MAGV presentation spans DH + 1 frame lines");
+            t.Equals(static_cast<uint32_t>(frame[(447u * 640u) * 4u]), 112u,
+                     "with MAGV 1 in frame mode the last frame line shows buffer line 111");
+            t.Equals(static_cast<uint32_t>(frame[(4u * 640u) * 4u]), 2u,
+                     "with MAGV 1 in frame mode each buffer line covers four frame lines");
+        });
+
+        // DH beyond the host frame (512 lines) crops at the same line ratio instead of squashing:
+        // 640x448 in frame mode (DH 895) shows buffer lines 0..255, each twice.
+        tc.Run("latched host presentation crops frame-mode output taller than the host frame", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0x0001ull;
+            regs.smode2 = 0x0003ull;
+            regs.dispfb1 = 70ull | (10ull << 9) | (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 = (3ull << 23) | (2559ull << 32) | (895ull << 44);
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            for (uint32_t y = 0; y < 448u; ++y)
+                writeReferenceFramePSMCT32Pixel(vram, 70u, 10u, 0u, y, 0x80000000u | (y & 0xFFu) | ((y >> 8) << 8));
+
+            gs.latchHostPresentationFrame();
+            std::vector<uint8_t> frame;
+            uint32_t width = 0u, height = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(frame, width, height),
+                     "tall frame-mode presentation should produce a host frame");
+            t.Equals(height, 512u, "tall frame-mode presentation is clamped to the host frame height");
+            bool ok = true;
+            for (uint32_t y = 0; y < 512u && ok; ++y)
+            {
+                const uint32_t want = y / 2u;
+                const size_t off = (static_cast<size_t>(y) * 640u) * 4u;
+                ok = frame[off] == static_cast<uint8_t>(want & 0xFFu) && frame[off + 1u] == static_cast<uint8_t>(want >> 8);
+            }
+            t.IsTrue(ok, "output line y should show buffer line y / 2 (cropped, not squashed)");
+        });
+
+        // Non-interlaced (SMODE2 0 or libgraph's 2) reads DH + 1 buffer lines, no doubling.
+        tc.Run("latched host presentation reads DH + 1 buffer lines when non-interlaced", [](TestCase &t)
+        {
+            for (uint64_t smode2 : {0x0ull, 0x2ull})
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GSRegisters regs{};
+                regs.pmode = 0x0001ull;
+                regs.smode2 = smode2;
+                regs.dispfb1 = 70ull | (10ull << 9) | (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+                regs.display1 = (3ull << 23) | (2559ull << 32) | (223ull << 44);
+
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+                writeReferenceFramePSMCT32Pixel(vram, 70u, 10u, 0u, 223u, 0x80000033u);
+
+                gs.latchHostPresentationFrame();
+                std::vector<uint8_t> frame;
+                uint32_t width = 0u, height = 0u;
+                t.IsTrue(gs.copyLatchedHostPresentationFrame(frame, width, height),
+                         "non-interlaced presentation should produce a host frame");
+                t.Equals(height, 224u, "non-interlaced presentation shows DH + 1 lines");
+                t.Equals(static_cast<uint32_t>(frame[(223u * 640u) * 4u]), 0x33u,
+                         "non-interlaced presentation keeps buffer line 223 on line 223");
+            }
+        });
+
         tc.Run("GIF PACKED A+D writes DISPFB1 and DISPLAY1 privileged registers", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
@@ -1760,6 +2065,7 @@ void register_ps2_gs_tests()
 
             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
 
+            gs.sync();
             t.Equals(regs.dispfb1, dispfb1, "A+D should write GS DISPFB1");
             t.Equals(regs.display1, display1, "A+D should write GS DISPLAY1");
         });
@@ -1784,6 +2090,7 @@ void register_ps2_gs_tests()
 
             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
 
+            gs.sync();
             t.Equals(regs.dispfb2, dispfb2, "A+D should write GS DISPFB2");
             t.Equals(regs.display2, display2, "A+D should write GS DISPLAY2");
         });
@@ -1924,6 +2231,7 @@ void register_ps2_gs_tests()
                 GS gs;
                 gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
 
+                gs.sync();
                 writeReferencePSMT4Texel(vram, kTexTbp, 8u, sample.x, sample.y, sample.index);
                 const uint32_t clutOff = referenceAddrPSMCT32(kClutCbp, 1u, sample.index, 0u);
                 std::memcpy(vram.data() + clutOff, &sample.color, sizeof(sample.color));
@@ -1948,6 +2256,7 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_ST, packSt(s, tVal));
                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
 
+                gs.sync();
                 const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
                 t.Equals(pixel, sample.color,
                          "T4 triangle sampling should fetch the manual-layout atlas texel from the correct 128x128 page");
@@ -2022,6 +2331,7 @@ void register_ps2_gs_tests()
             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
 
             bool imageOk = true;
+            gs.sync();
             for (uint32_t x = 0; x < 4u && imageOk; ++x)
             {
                 const uint32_t off = referenceAddrPSMCT32(0u, 1u, x, 0u);
@@ -2076,6 +2386,7 @@ void register_ps2_gs_tests()
             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
 
             bool imageOk = true;
+            gs.sync();
             for (uint32_t x = 0; x < 4u && imageOk; ++x)
             {
                 const uint32_t off = referenceAddrPSMCT32(0u, 1u, x, 0u);
@@ -2103,15 +2414,18 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_SIGNAL, signalValue);
             gs.writeRegister(GS_REG_FINISH, 0u);
 
+            gs.sync();
             t.IsTrue((mem.gs().csr & 0x1ull) != 0ull, "SIGNAL should raise CSR.SIGNAL");
             t.IsTrue((mem.gs().csr & 0x2ull) != 0ull, "FINISH should raise CSR.FINISH");
             t.Equals(static_cast<uint32_t>(mem.gs().siglblid & 0xFFFFFFFFull), 0x11223344u, "SIGNAL should update SIGLBLID low dword");
 
             mem.write64(0x12001000u, 0x1ull);
+            gs.sync();
             t.IsTrue((mem.gs().csr & 0x1ull) == 0ull, "writing CSR bit0 should acknowledge SIGNAL");
             t.IsTrue((mem.gs().csr & 0x2ull) != 0ull, "acknowledging SIGNAL should not clear FINISH");
 
             mem.write32(0x12001000u, 0x2u);
+            gs.sync();
             t.IsTrue((mem.gs().csr & 0x2ull) == 0ull, "writing CSR bit1 should acknowledge FINISH");
         });
 
@@ -2149,6 +2463,7 @@ void register_ps2_gs_tests()
             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
 
             bool same = true;
+            gs.sync();
             for (uint32_t y = 0; y < 2u && same; ++y)
             {
                 for (uint32_t x = 0; x < 2u; ++x)
@@ -2207,6 +2522,7 @@ void register_ps2_gs_tests()
 
             gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
 
+            gs.sync();
             t.Equals(gs.nativeImageUploadCount(), 1ull, "load-image packet should use the native image upload fast path");
 
             bool same = true;
@@ -2489,6 +2805,7 @@ void register_ps2_gs_tests()
             uint32_t badY = 0u;
             uint32_t got = 0u;
             uint32_t expected = 0u;
+            gs.sync();
             for (uint32_t y = 0; y < kTexHeight && aliasOk; ++y)
             {
                 for (uint32_t x = 0; x < kTexWidth; ++x)
@@ -2626,6 +2943,7 @@ void register_ps2_gs_tests()
 
             const uint32_t texNibbleAddr = GSPSMT4::addrPSMT4(kTexTbp, 1u, 0u, 0u);
             const uint32_t texByteOff = texNibbleAddr >> 1;
+            gs.sync();
             vram[texByteOff] = static_cast<uint8_t>((vram[texByteOff] & 0xF0u) | 0x08u);
 
             // CSM1 stores logical entry 8 at row 1, column 0 after the CLUT swizzle.
@@ -2645,6 +2963,7 @@ void register_ps2_gs_tests()
             // TEX0 loads the palette into the GS CLUT temporary buffer. The
             // source VRAM can subsequently be reused without changing the
             // palette seen by this draw.
+            gs.sync();
             std::memcpy(vram.data() + expectedClutOff, &kWrongColor, sizeof(kWrongColor));
             gs.writeRegister(GS_REG_TEX0_1, kTex0LoadIfCbp0Changed);
 
@@ -2653,15 +2972,21 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // sprite (0,0)-(1,1): one pixel
 
             uint32_t pixel = 0u;
+            gs.sync();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
                      "T4 CSM1 lookup should keep the cached palette after its source VRAM is reused");
         });
 
-        tc.Run("GS texture page buffer hides local-memory writes until TEXFLUSH", [](TestCase &t)
+        // Texture reads see local memory as it is. The GS has a texture buffer (TEXFLUSH exists to
+        // empty it) and sampling a page written without a TEXFLUSH is undefined on the hardware, so
+        // no game may rely on stale data; PCSX2 reads local memory directly too. The runtime used
+        // to keep one 8 KB page copy that hid writes until TEXFLUSH; it now decodes textures per
+        // page-write (gs_cpu_backend.cpp, LookupDecodedTexture), so a write is visible at once.
+        tc.Run("GS texture reads see local-memory writes with or without TEXFLUSH", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
@@ -2717,10 +3042,10 @@ void register_ps2_gs_tests()
 
             t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u), kInitialColor,
                      "the first sample should read the original texture page");
-            t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u), kInitialColor,
-                     "writes to local memory must remain hidden by the cached texture page");
+            t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u), kUpdatedColor,
+                     "a write to local memory is visible to the next texture read");
             t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 2u, 0u), kUpdatedColor,
-                     "TEXFLUSH must make the updated local-memory page visible to texture reads");
+                     "TEXFLUSH keeps the updated local-memory page visible to texture reads");
         });
 
         tc.Run("GS T8 CT32-uploaded CSM1 CLUT follows swizzled palette layout", [](TestCase &t)
@@ -2764,6 +3089,7 @@ void register_ps2_gs_tests()
             constexpr uint32_t kExpectedColor = 0x80FFFFFFu;
 
             const uint32_t texOff = GSPSMT8::addrPSMT8(kTexTbp, 1u, 0u, 0u);
+            gs.sync();
             vram[texOff] = 8u;
 
             std::vector<uint32_t> clut(32u, 0u);
@@ -2798,9 +3124,10 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // sprite (0,0)-(1,1): one pixel
 
             uint32_t pixel = 0u;
+            gs.sync();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
                      "T8 CSM1 CLUT sampling should read CT32-uploaded palette entries through GS swizzled addressing");
@@ -2840,6 +3167,7 @@ void register_ps2_gs_tests()
             constexpr uint32_t kWrongBit4Color = 0xFFFF0000u;
 
             const uint32_t texOff = GSPSMT8::addrPSMT8(kTexTbp, 1u, 0u, 0u);
+            gs.sync();
             vram[texOff] = 0u;
 
             // CSA=17 is CSA=1 for a CT32 CLUT. Logical entry 16 is at
@@ -2860,9 +3188,10 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // sprite (0,0)-(1,1): one pixel
 
             uint32_t pixel = 0u;
+            gs.sync();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
                      "T8 CSM1 should offset by CSA while CT32 ignores the fifth CSA bit");
@@ -2902,6 +3231,7 @@ void register_ps2_gs_tests()
             constexpr uint16_t kWrongGreen = 0x83E0u;
             constexpr uint32_t kExpectedColor = 0x800000F8u;
 
+            gs.sync();
             writePSMT4Texel(vram, kTexTbp, 1u, 0u, 0u, 1u);
 
             // CSA selects the destination in the temporary buffer, not a
@@ -2926,9 +3256,10 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // sprite (0,0)-(1,1): one pixel
 
             uint32_t pixel = 0u;
+            gs.sync();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
                      "CT16 CSM1 should retain CSA[4] instead of aliasing the upper palette onto the lower one");
@@ -3046,6 +3377,7 @@ void register_ps2_gs_tests()
             constexpr uint32_t kExpectedColor = 0xFF0000FFu;
 
             const uint32_t texOff = GSPSMT8::addrPSMT8(kTexTbp, 1u, 0u, 0u);
+            gs.sync();
             vram[texOff] = 8u;
 
             const uint32_t wrongClutOff = GSPSMCT32::addrPSMCT32(kWrongClutCbp, 1u, 8u, 0u);
@@ -3069,6 +3401,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
 
             uint32_t pixel = 0u;
+            gs.sync();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
                      "TEX2 should override the active CLUT base and format state without requiring a new TEX0 write");
@@ -3111,6 +3444,7 @@ void register_ps2_gs_tests()
             constexpr uint32_t kExpectedColor = 0xFF3366CCu;
 
             const uint32_t texOff = GSPSMT8::addrPSMT8(kTexTbp, 1u, 0u, 0u);
+            gs.sync();
             vram[texOff] = 0u;
 
             const uint32_t wrongClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 0u, 0u);
@@ -3134,6 +3468,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
 
             uint32_t pixel = 0u;
+            gs.sync();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
                      "TEXCLUT should offset the CLUT lookup coordinates instead of always starting from the CLUT base");
@@ -3176,6 +3511,7 @@ void register_ps2_gs_tests()
             constexpr uint32_t kExpectedBlack = 0x00000000u;
 
             const uint32_t redOff = GSPSMCT32::addrPSMCT32(kTexTbp, 1u, 0u, 0u);
+            gs.sync();
             vram[redOff + 0u] = 0xFFu;
             vram[redOff + 1u] = 0x00u;
             vram[redOff + 2u] = 0x00u;
@@ -3208,6 +3544,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, (16ull << 0));
             gs.writeRegister(GS_REG_XYZ2, (32ull << 0) | (16ull << 16));
 
+            gs.sync();
             const uint32_t redPixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
             const uint32_t blackPixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 0u);
             t.Equals(redPixel, kExpectedRed,
@@ -3257,6 +3594,7 @@ void register_ps2_gs_tests()
                 (0x44u << 24);
 
             const uint32_t texOff = GSPSMCT32::addrPSMCT32(kTexTbp, 1u, 0u, 0u);
+            gs.sync();
             std::memcpy(vram.data() + texOff, &kTexturePixel, sizeof(kTexturePixel));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -3273,6 +3611,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
 
+            gs.sync();
             const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
             t.Equals(pixel, kExpectedPixel,
                      "TCC=0 MODULATE should still use texture RGB while sourcing alpha from the shaded vertex");
@@ -3319,6 +3658,7 @@ void register_ps2_gs_tests()
                 (0x30u << 24);
 
             const uint32_t texOff = GSPSMCT32::addrPSMCT32(kTexTbp, 1u, 0u, 0u);
+            gs.sync();
             std::memcpy(vram.data() + texOff, &kTexturePixel, sizeof(kTexturePixel));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -3335,6 +3675,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
 
+            gs.sync();
             const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
             t.Equals(pixel, kExpectedPixel,
                      "HIGHLIGHT should add the shaded vertex alpha into RGB and accumulate texture plus vertex alpha");
@@ -3381,6 +3722,7 @@ void register_ps2_gs_tests()
                 (0x10u << 24);
 
             const uint32_t texOff = GSPSMCT32::addrPSMCT32(kTexTbp, 1u, 0u, 0u);
+            gs.sync();
             std::memcpy(vram.data() + texOff, &kTexturePixel, sizeof(kTexturePixel));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -3397,6 +3739,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
 
+            gs.sync();
             const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
             t.Equals(pixel, kExpectedPixel,
                      "HIGHLIGHT2 should add the shaded vertex alpha into RGB while preserving the texture alpha");
@@ -3441,6 +3784,7 @@ void register_ps2_gs_tests()
                 constexpr uint32_t kBlack = 0x80000000u;
                 constexpr uint32_t kWhite = 0x80FFFFFFu;
 
+                gs.sync();
                 writePSMT4Texel(vram, kTexTbp, 1u, 0u, 0u, 0u);
                 writePSMT4Texel(vram, kTexTbp, 1u, 1u, 0u, 1u);
                 std::memcpy(vram.data() + kClutCbp * 256u + 0u * 4u, &kBlack, sizeof(kBlack));
@@ -3472,11 +3816,14 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, 0ull);
                 gs.writeRegister(GS_REG_ST, packSt(1.0f, 0.0f));
-                gs.writeRegister(GS_REG_XYZ2, (64ull << 0) | (0ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, (128ull << 0) | (0ull << 16));
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
 
-                return readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+                // Pixel (3,1) is sampled at (3.0, 1.0): S = 3/8, u = 0.75 texel, i.e. a quarter
+                // of the way from texel 0 (black) to texel 1 (white) after the -0.5 bilinear offset.
+                gs.sync();
+                return readReferencePSMCT32Pixel(vram, 0u, 1u, 3u, 1u);
             };
 
             constexpr uint64_t kTex1Linear =
@@ -3531,6 +3878,7 @@ void register_ps2_gs_tests()
                     (1ull << 8);
                 constexpr uint64_t kRgbaq = 0x3F80000080808080ull;
 
+                gs.sync();
                 writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 0u, 0u, kTexel0);
                 writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 1u, 0u, kTexel1);
                 writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 2u, 0u, kTexel2);
@@ -3557,6 +3905,7 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_UV, uv);
                 gs.writeRegister(GS_REG_XYZ2, (32ull << 16));
 
+                gs.sync();
                 return readReferencePSMCT32Pixel(vram, 0u, 1u, 0u, 0u);
             };
 
@@ -3623,6 +3972,7 @@ void register_ps2_gs_tests()
                        (static_cast<uint64_t>(packFloat(q)) << 32);
             };
 
+            gs.sync();
             writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 1u, 0u, kAffineTexel);
             writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 2u, 0u, kHomogeneousTexel);
 
@@ -3640,13 +3990,16 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_ST, packSt(2.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(2.0f));
-            gs.writeRegister(GS_REG_XYZ2, 64ull);
+            gs.writeRegister(GS_REG_XYZ2, 128ull);
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
             gs.writeRegister(GS_REG_XYZ2, (64ull << 16));
 
+            // Pixel (3,1) is sampled at (3.0, 1.0): weights v1 = 3/8, v2 = 1/4. Perspective-correct
+            // S/Q = 0.75 / 1.375 -> u = 2.18 (texel 2); affine interpolation would give u = 1.5.
+            gs.sync();
             const uint32_t pixel =
-                readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+                readReferencePSMCT32Pixel(vram, 0u, 1u, 3u, 1u);
             t.Equals(pixel, kHomogeneousTexel,
                      "the DDA should interpolate S=0.75 and Q=1.375, selecting texel 2 after S/Q");
         });
@@ -3848,15 +4201,14 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZF2, makeXyzf(102u, 420u));
 
             bool sawFilledRow = false;
+            gs.sync();
             for (uint32_t y = 6u; y <= 26u; ++y)
             {
                 int first = -1;
                 int last = -1;
                 for (uint32_t x = 6u; x <= 26u; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, x, y);
                     if ((pixel & 0x00FFFFFFu) != 0u)
                     {
                         if (first < 0)
@@ -3875,9 +4227,7 @@ void register_ps2_gs_tests()
                 sawFilledRow = true;
                 for (int x = first; x <= last; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, static_cast<uint32_t>(x), y);
                     if ((pixel & 0x00FFFFFFu) == 0u)
                     {
                         t.Fail("triangle fan quad should not leave interior holes within a covered row");
@@ -3888,6 +4238,224 @@ void register_ps2_gs_tests()
 
             t.IsTrue(sawFilledRow,
                      "triangle fan quad should light at least one framebuffer row");
+        });
+
+        // ---- GS rasterisation rules (GS User's Manual, "Drawing"; PCSX2's software rasteriser) ----
+        // Pixel (x, y) is sampled at (x.0, y.0); points on a left or top edge are inside, on a right
+        // or bottom edge outside; attributes are interpolated to the sampling point, and an
+        // attribute equal at every vertex is that exact value at every pixel.
+        tc.Run("GS triangle coverage samples pixels at integer coordinates with the top-left rule", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (31ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80FFFFFFull);
+            // Triangle (0.25,0) (4,0) (0.25,4). Sampling at integer points leaves column 0 out
+            // (0 < 0.25); pixel-centre sampling (0.5) would draw it. The top edge y = 0 is drawn;
+            // the long edge 16x + 15y = 64 (a right edge) and the vertex (4,0) are not.
+            gs.writeRegister(GS_REG_XYZ2, 4ull);
+            gs.writeRegister(GS_REG_XYZ2, 64ull);
+            gs.writeRegister(GS_REG_XYZ2, 4ull | (64ull << 16));
+
+            gs.sync();
+            for (uint32_t y = 0; y < 6u; ++y)
+                for (uint32_t x = 0; x < 6u; ++x)
+                {
+                    const bool expected = x >= 1u && (16u * x + 15u * y) < 64u;
+                    const bool drawn = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, x, y) != 0u;
+                    if (drawn != expected)
+                    {
+                        t.Fail("pixel (" + std::to_string(x) + "," + std::to_string(y) + ") " +
+                               (expected ? "should be drawn" : "should not be drawn"));
+                        return;
+                    }
+                }
+        });
+
+        tc.Run("GS triangles sharing an edge draw every pixel exactly once", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (31ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            // Additive blend Cs * As + Cd: a pixel drawn twice ends up 0x20 instead of 0x10.
+            gs.writeRegister(GS_REG_ALPHA_1, 0x48ull | (0x80ull << 32));
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRISTRIP) | (1ull << 6));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80101010ull);
+            // A strip of four triangles covering x in [2, 30), y in [1, 25); the shared diagonals
+            // pass exactly through sampling points such as (9,10), (16,7) and (23,4).
+            const uint32_t xs[] = {2u, 30u, 2u, 30u, 2u, 30u};
+            const uint32_t ys16[] = {16u, 16u, 13u * 16u, 13u * 16u, 25u * 16u, 25u * 16u};
+            for (int i = 0; i < 6; ++i)
+                gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(xs[i] * 16u) | (static_cast<uint64_t>(ys16[i]) << 16));
+
+            gs.sync();
+            for (uint32_t y = 0; y < 27u; ++y)
+                for (uint32_t x = 0; x < 32u; ++x)
+                {
+                    const uint32_t expected = (x >= 2u && x < 30u && y >= 1u && y < 25u) ? 0x10u : 0u;
+                    const uint32_t red = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, x, y) & 0xFFu;
+                    if (red != expected)
+                    {
+                        t.Fail("pixel (" + std::to_string(x) + "," + std::to_string(y) + ") red " + std::to_string(red) +
+                               ", expected " + std::to_string(expected) + " (drawn twice or missed)");
+                        return;
+                    }
+                }
+        });
+
+        tc.Run("GS draw sampling its own frame buffer reads rows in order, whatever the thread count", [](TestCase &t)
+        {
+            // A 64x64 sprite textured from the frame buffer it draws into, pixel (x, y) sampling
+            // texel (x, y - 1): on the GS the rows are drawn top to bottom, so a red row 0 cascades
+            // down the whole sprite. The rasteriser shades large primitives on worker threads;
+            // one that samples its own pages must stay serial, or rows in another chunk would
+            // read black. 64x64 = 4096 pixels, the pool's threshold.
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            constexpr uint32_t kRed = 0x800000FFu;
+            for (uint32_t x = 0; x < 64u; ++x)
+                gs.WriteVram(GS_PSM_CT32, 0u, 1u, x, 0u, kRed);
+            gs.writeRegister(GS_REG_FRAME_1, (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (63ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+            // TEX0: tbp0 0, tbw 1, PSMCT32, 64x64, TCC 1, DECAL.
+            gs.writeRegister(GS_REG_TEX0_1, (1ull << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                                (6ull << 26) | (6ull << 30) | (1ull << 34) | (1ull << 35));
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(1u * 16u) << 16);                   // (0, 1)
+            gs.writeRegister(GS_REG_UV, static_cast<uint64_t>(64u * 16u) | (static_cast<uint64_t>(63u * 16u) << 16));
+            gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(64u * 16u) | (static_cast<uint64_t>(64u * 16u) << 16)); // (64, 64)
+
+            for (uint32_t y = 1; y < 64u; ++y)
+                for (uint32_t x = 0; x < 64u; ++x)
+                {
+                    const uint32_t pixel = gs.ReadVram(GS_PSM_CT32, 0u, 1u, x, y);
+                    if (pixel != kRed)
+                    {
+                        t.Fail("pixel (" + std::to_string(x) + "," + std::to_string(y) + ") = " + std::to_string(pixel) +
+                               ", expected the cascaded red (self-sampling rows must be drawn in order)");
+                        return;
+                    }
+                }
+        });
+
+        tc.Run("GS triangle with constant Z passes a GEQUAL depth test at every pixel", [](TestCase &t)
+        {
+            // SRWZ's title logo: Z24 buffer cleared to 0xFFFF37, then textured strips at the same Z
+            // with ZTST GEQUAL. Float barycentric weights put Z one or two below at scattered
+            // pixels, which then failed the test: dots in the logo.
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            constexpr uint32_t kZ = 0xFFFF37u;
+            constexpr uint32_t kZbp = 64u; // pages
+            gs.writeRegister(GS_REG_FRAME_1, (2ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, static_cast<uint64_t>(kZbp) | (static_cast<uint64_t>(GS_PSM_Z24 & 0xFu) << 24));
+            gs.writeRegister(GS_REG_SCISSOR_1, (127ull << 16) | (63ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, (1728ull << 4) | ((1936ull << 4) << 32));
+            // Clear: sprite, ZTST ALWAYS, depth written.
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, (1728ull << 4) | ((1936ull << 4) << 16) | (static_cast<uint64_t>(kZ) << 32));
+            gs.writeRegister(GS_REG_XYZ2, ((1728ull + 128ull) << 4) | (((1936ull + 64ull) << 4) << 16) | (static_cast<uint64_t>(kZ) << 32));
+            // Strip at the same Z, GEQUAL, depth writes off, vertices at odd sub-pixel positions.
+            gs.writeRegister(GS_REG_ZBUF_1, static_cast<uint64_t>(kZbp) | (static_cast<uint64_t>(GS_PSM_Z24 & 0xFu) << 24) | (1ull << 32));
+            gs.writeRegister(GS_REG_TEST_1, 0x50000ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRISTRIP));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80FFFFFFull);
+            const int32_t vx[] = {-112 * 16, 752 * 16, -112 * 16, 752 * 16};
+            const int32_t vy[] = {-33 * 16 + 8, -33 * 16 + 8, 255 * 16 + 8, 255 * 16 + 8};
+            for (int i = 0; i < 4; ++i)
+            {
+                const uint64_t x = static_cast<uint64_t>((1728 * 16 + vx[i]) & 0xFFFF);
+                const uint64_t y = static_cast<uint64_t>((1936 * 16 + vy[i]) & 0xFFFF);
+                gs.writeRegister(GS_REG_XYZ2, x | (y << 16) | (static_cast<uint64_t>(kZ) << 32));
+            }
+
+            uint32_t missed = 0u;
+            for (uint32_t y = 0; y < 64u; ++y)
+                for (uint32_t x = 0; x < 128u; ++x)
+                    if ((gs.ReadVram(GS_PSM_CT32, 0u, 2u, x, y) & 0xFFFFFFu) != 0xFFFFFFu)
+                        ++missed;
+            t.Equals(missed, 0u, "every pixel of the strip should pass GEQUAL against the same Z");
+            t.Equals(gs.ReadVram(GS_PSM_Z24, kZbp * 32u, 2u, 77u, 33u) & 0xFFFFFFu, kZ, "the clear should have written Z");
+        });
+
+        tc.Run("GS sprite covers [ceil(x0), ceil(x1)) and samples U/V at integer pixel coordinates", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (31ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+
+            // Untextured sprite (-0.5, -0.5) - (3.5, 2.5): pixels x 0..3, y 0..2.
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80FFFFFFull);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 8ull | (8ull << 32)); // (0.5, 0.5)
+            gs.writeRegister(GS_REG_XYZ2, 0ull);                      // window (-0.5, -0.5)
+            gs.writeRegister(GS_REG_XYZ2, (64ull) | (48ull << 16));   // window (3.5, 2.5)
+            gs.sync();
+            for (uint32_t y = 0; y < 5u; ++y)
+                for (uint32_t x = 0; x < 6u; ++x)
+                {
+                    const bool expected = x < 4u && y < 3u;
+                    const bool drawn = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, x, y) != 0u;
+                    if (drawn != expected)
+                    {
+                        t.Fail("sprite pixel (" + std::to_string(x) + "," + std::to_string(y) + ") " +
+                               (expected ? "should be drawn" : "should not be drawn"));
+                        return;
+                    }
+                }
+
+            // A zero-size sprite draws nothing.
+            std::fill(vram.begin(), vram.end(), 0u);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 32ull | (32ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 32ull | (32ull << 16));
+            gs.sync();
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 2u, 2u), 0u, "a zero-size sprite should not draw");
+
+            // FST texture sprite minifying 2:1, x 0..2 for U 0..4 texels: pixel 1 samples U = 2.0
+            // (texel 2); sampling at the pixel centre would give U = 3.0 (texel 3).
+            constexpr uint32_t kTexTbp = 64u;
+            for (uint32_t u = 0; u < 4u; ++u)
+                writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, u, 0u, 0x80000000u | (0x10u * (u + 1u)));
+            gs.writeRegister(GS_REG_TEX0_1, static_cast<uint64_t>(kTexTbp) | (1ull << 14) |
+                                                (static_cast<uint64_t>(GS_PSM_CT32) << 20) | (2ull << 26) | (0ull << 30) |
+                                                (1ull << 34) | (1ull << 35));
+            gs.writeRegister(GS_REG_CLAMP_1, 0ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, 64ull);
+            gs.writeRegister(GS_REG_XYZ2, 32ull | (16ull << 16));
+            gs.sync();
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 0u, 0u) & 0xFFu, 0x10u, "pixel 0 should sample texel 0");
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 0u, 1u, 1u, 0u) & 0xFFu, 0x30u, "pixel 1 should sample texel 2");
         });
 
         tc.Run("sceGsExecLoadImage and sceGsExecStoreImage roundtrip and free guest packets", [](TestCase &t)
@@ -3978,6 +4546,67 @@ void register_ps2_gs_tests()
                        ", got " + std::to_string(rdram[kDstAddr + mismatchIndex]) +
                        ", expected " + std::to_string(pixels[mismatchIndex]) + ")");
             }
+        });
+
+        tc.Run("sceGsExecLoadImage/StoreImage use the libgraph block address as DBP/SBP unscaled", [](TestCase &t)
+        {
+            // The game's sceGsSetDefLoadImage (0x10d570) builds BITBLTBUF as dbp << 32 | dbw << 48 |
+            // dpsm << 56, and sceGsSetDefStoreImage (0x10d758) as sbp | sbw << 16 | spsm << 24:
+            // the address argument is the GS block address itself (block = 256 bytes). SRW Z
+            // saves/restores blocks 0x1a40/0x2080/0x26c0 (BW 10, PSMCT32) around the movie.
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            uint8_t *const rdram = runtime.memory().getRDRAM();
+            uint8_t *const gsMem = runtime.memory().getGSVRAM();
+            constexpr uint32_t kImageAddr = 0x4000u;
+            constexpr uint32_t kSrcAddr = 0x5000u;
+            constexpr uint32_t kDstAddr = 0x6000u;
+            constexpr uint16_t kBlock = 0x1a40u;
+            constexpr uint32_t kBlockBytes = 256u;
+
+            const GsImageMem image{0u, 0u, 2u, 2u, kBlock, 10u, 0u};
+            const uint32_t pixels[4] = {0x11223344u, 0x55667788u, 0x99AABBCCu, 0xDDEEFF01u};
+            writeGsImageTest(rdram, kImageAddr, image);
+            std::memcpy(rdram + kSrcAddr, pixels, sizeof(pixels));
+
+            R5900Context loadCtx{};
+            setRegU32(loadCtx, 4, kImageAddr);
+            setRegU32(loadCtx, 5, kSrcAddr);
+            ps2_stubs::sceGsExecLoadImage(rdram, &loadCtx, &runtime);
+            t.Equals(static_cast<int32_t>(getRegU32Test(loadCtx, 2)), 0, "sceGsExecLoadImage should succeed");
+
+            uint64_t loadBitblt = 0u;
+            std::memcpy(&loadBitblt, rdram + runtime.guestHeapBase() + 16u, sizeof(loadBitblt));
+            t.Equals(static_cast<uint32_t>((loadBitblt >> 32) & 0x3FFFu), static_cast<uint32_t>(kBlock),
+                     "BITBLTBUF.DBP should be the block address as given (0x10d570: dbp << 32)");
+            t.Equals(static_cast<uint32_t>((loadBitblt >> 48) & 0x3Fu), 10u, "BITBLTBUF.DBW should be 10");
+
+            // PSMCT32 block layout (GS manual, column 0): pixels (0,0) (1,0) (0,1) (1,1) are
+            // words 0, 1, 2, 3 of the block, which starts at byte block * 256.
+            runtime.gs().sync(); // asynchronous GS: the upload is applied on the GS thread
+            uint32_t gsWords[4] = {};
+            std::memcpy(gsWords, gsMem + static_cast<uint32_t>(kBlock) * kBlockBytes, sizeof(gsWords));
+            for (int i = 0; i < 4; ++i)
+            {
+                t.Equals(gsWords[i], pixels[i], "pixel " + std::to_string(i) + " should land in block 0x1a40");
+            }
+            uint32_t wrongBlockWord = 0u;
+            std::memcpy(&wrongBlockWord, gsMem + ((static_cast<uint32_t>(kBlock) * 8u) & 0x3FFFu) * kBlockBytes,
+                        sizeof(wrongBlockWord));
+            t.Equals(wrongBlockWord, 0u, "nothing should land at the old 8x-scaled block (0x1200)");
+
+            std::memset(rdram + kDstAddr, 0, sizeof(pixels));
+            R5900Context storeCtx{};
+            setRegU32(storeCtx, 4, kImageAddr);
+            setRegU32(storeCtx, 5, kDstAddr);
+            ps2_stubs::sceGsExecStoreImage(rdram, &storeCtx, &runtime);
+            t.Equals(static_cast<int32_t>(getRegU32Test(storeCtx, 2)), 0, "sceGsExecStoreImage should succeed");
+            uint64_t storeBitblt = 0u;
+            std::memcpy(&storeBitblt, rdram + runtime.guestHeapBase() + 16u, sizeof(storeBitblt));
+            t.Equals(static_cast<uint32_t>(storeBitblt & 0x3FFFu), static_cast<uint32_t>(kBlock),
+                     "BITBLTBUF.SBP should be the block address as given (0x10d758: sbp in bits 0-13)");
+            t.IsTrue(std::memcmp(rdram + kDstAddr, pixels, sizeof(pixels)) == 0,
+                     "sceGsExecStoreImage should read the pixels back from block 0x1a40");
         });
 
         tc.Run("sceGifPkRefLoadImage seeds A+D GIFtag nloop once (no double-count)", [](TestCase &t)
@@ -4139,8 +4768,11 @@ void register_ps2_gs_tests()
                      "VSync callback should receive a positive tick value");
             t.Equals(g_gsSyncCallbackGp.load(std::memory_order_acquire), kGsCallbackGp,
                      "callback invocation should preserve the registered GP");
-            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) >= 0x01F00000u,
-                     "callback invocation should use the reserved async stack pool");
+            // Wall 5: with no ELF loaded, runtime callback stacks come from the window between
+            // the kernel area and the lowest loaded segment, 0x90000-0x100000 (ps2_runtime.cpp).
+            const uint32_t callbackSp = g_gsSyncCallbackSp.load(std::memory_order_acquire);
+            t.IsTrue(callbackSp >= 0x00090000u && callbackSp < 0x00100000u,
+                     "callback invocation should use the reserved async stack pool (0x90000-0x100000)");
             t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) != kGsCallbackCallerSp,
                      "callback invocation must not reuse the caller stack");
         });
@@ -4218,6 +4850,7 @@ void register_ps2_gs_tests()
 
             bool planesMatch = true;
             bool memReadersMatch = true;
+            gs.sync();
             for (uint32_t y = 0; y < kRrh; ++y)
             {
                 for (uint32_t x = 0; x < kRrw; ++x)
@@ -4283,6 +4916,7 @@ void register_ps2_gs_tests()
 
             bool t8hByteMatches = true;
             bool t8hMemReaderMatches = true;
+            gs.sync();
             for (uint32_t y = 0; y < kRrh; ++y)
             {
                 for (uint32_t x = 0; x < kRrw; ++x)
@@ -4376,6 +5010,7 @@ void register_ps2_gs_tests()
             gs.processGIFPacket(packetMixNibble.data(), static_cast<uint32_t>(packetMixNibble.size()));
 
             bool mixClobberMatches = true;
+            gs.sync();
             for (uint32_t y = 0; y < kRrh; ++y)
             {
                 for (uint32_t x = 0; x < kRrw; ++x)
@@ -4413,6 +5048,7 @@ void register_ps2_gs_tests()
             const uint32_t sharedWordOff = GSPSMCT32::addrPSMCT32(kTexTbp, 1u, 0u, 0u);
             const uint32_t sharedWord =
                 (static_cast<uint32_t>(kIndexB) << 28) | (static_cast<uint32_t>(kIndexA) << 24);
+            gs.sync();
             std::memcpy(vram.data() + sharedWordOff, &sharedWord, sizeof(sharedWord));
 
             constexpr uint32_t kExpectedColorA = 0x800000FFu; // RGBA = (255,0,0,128)
@@ -4467,9 +5103,10 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // sprite (0,0)-(1,1): one pixel
 
             uint32_t pixelHL = 0u;
+            gs.sync();
             std::memcpy(&pixelHL, vram.data(), sizeof(pixelHL));
             t.Equals(pixelHL, kExpectedColorA,
                      "T4HL sampling should resolve through its own CLUT plane, unaffected by the co-resident T4HH nibble");
@@ -4490,9 +5127,10 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16)); // sprite (0,0)-(1,1): one pixel
 
             uint32_t pixelHH = 0u;
+            gs.sync();
             std::memcpy(&pixelHH, vram.data(), sizeof(pixelHH));
             t.Equals(pixelHH, kExpectedColorB,
                      "T4HH sampling should resolve through its own CLUT plane, unaffected by the co-resident T4HL nibble");

@@ -258,8 +258,13 @@ struct JumpTable
     std::vector<uint32_t> targets; // Jump targets
 };
 
+// PS2X_VIF1_UNPACK_WATCH=<vu1 qword addr>[:<count>] is set (ps2_vif1_interpreter.cpp).
+bool vif1UnpackWatchEnabled();
+
 class PS2Memory
 {
+    friend struct PS2SnapshotAccess;
+
 public:
     PS2Memory();
     ~PS2Memory();
@@ -280,6 +285,14 @@ public:
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
+    // VIF1 / GIF path statistics for the [vif1:stats] line (PS2X_VIF1_STATS=1): VIF1 bytes and
+    // VIFcodes processed, VU1 program starts, and GIF packets/bytes per path (index 1..3).
+    struct PathStats
+    {
+        std::atomic<uint64_t> vif1Bytes{0}, vif1Mscal{0}, vif1Mscnt{0}, vif1Mpg{0}, vif1Direct{0}, vif1Unpack{0}, vif1Other{0};
+        std::atomic<uint64_t> gifPackets[4]{}, gifBytes[4]{};
+    };
+    const PathStats &pathStats() const { return m_pathStats; }
     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
 
@@ -310,12 +323,37 @@ public:
     // EE timers advance from the scheduler's emulated EE-cycle clock. The
     // returned mask uses bits 0..3 for newly raised TIM0..TIM3 interrupts.
     uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
+    // Cycles until the next compare/overflow interrupt any timer can raise (max() = none).
+    // Counts from the synced state: call syncEeTimers() first when cycles are deferred.
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
     void resetEeTimers() noexcept;
+
+    // Batched timing (EeScheduler, PS2X_BATCH_TIMING): the scheduler defers cycles here
+    // instead of advancing the timers on every charge, and the timers catch up lazily:
+    // on any guest read or write of a timer register (readIORegister/writeIORegister),
+    // on GIF_STAT reads (advanceEeTimers also clears its FQC field) and when the scheduler
+    // calls syncEeTimers() at a flush. The interrupt bits a sync raises are collected in
+    // takeEeTimerInterrupts(). eeTimerGeneration() changes whenever a timer register write
+    // may have moved the next interrupt, or a sync raised one: the scheduler recomputes its
+    // flush deadline when it sees a new value.
+    void deferEeTimerCycles(uint64_t eeCycles) noexcept { m_eeTimerDeferredCycles += eeCycles; }
+    void syncEeTimers() noexcept;
+    [[nodiscard]] uint32_t takeEeTimerInterrupts() noexcept;
+    [[nodiscard]] uint32_t eeTimerGeneration() const noexcept { return m_eeTimerGeneration; }
+    [[nodiscard]] uint64_t eeTimerDeferredCycles() const noexcept { return m_eeTimerDeferredCycles; }
+    [[nodiscard]] uint64_t eeTimerLazySyncCount() const noexcept { return m_eeTimerLazySyncs; }
 
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
+
+    // Asynchronous GS (PS2X_GS_ASYNC): drains the GS command queue. Called before the guest
+    // touches GS state the GS itself writes, in an order that matters: a CSR write clearing
+    // SIGNAL/FINISH (or resetting), and SIGLBLID reads and writes. On the console the GS has
+    // taken in every packet whose transfer the EE saw complete, so an earlier packet's FINISH
+    // must not land after the guest cleared the bit. Unset (synchronous GS): nothing to do.
+    using GsSyncCallback = std::function<void()>;
+    void setGsSyncCallback(GsSyncCallback cb) { m_gsSyncCallback = std::move(cb); }
 
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
@@ -374,10 +412,21 @@ public:
     std::atomic<uint64_t> m_gifCopyCount{0};
     std::atomic<uint64_t> m_gsWriteCount{0};
     std::atomic<uint64_t> m_vifWriteCount{0};
+    PathStats m_pathStats;
     std::atomic<uint64_t> m_vu0CodeGeneration{0};
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
     std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+    // GIF_STAT's slot in m_ioRegisters once it exists (element pointers survive rehashing;
+    // reset when the map is cleared): advanceEeTimers clears FQC on every cycle charge.
+    uint32_t *m_gifStatSlot = nullptr;
+    // Batched timing: EE cycles not yet applied to m_eeTimers, the interrupt bits a sync
+    // raised but nobody took yet, the generation the scheduler watches (see the API) and
+    // a count of lazy syncs forced by guest register accesses (statistics).
+    uint64_t m_eeTimerDeferredCycles = 0;
+    uint32_t m_eeTimerPendingInterrupts = 0;
+    uint32_t m_eeTimerGeneration = 0;
+    uint64_t m_eeTimerLazySyncs = 0;
 
     // Registers
     GSRegisters gs_regs;
@@ -400,6 +449,8 @@ public:
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
+    GsSyncCallback m_gsSyncCallback;
+    void syncGsForPrivAccess(uint32_t regOff, bool isWrite, uint64_t value);
     Vu1MscntCallback m_vu1MscntCallback;
 
     uint8_t *m_vu0Code = nullptr;
@@ -407,8 +458,15 @@ public:
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
+    // PATH2 IMAGE data still owed by the last GIF tag sent through DIRECT/DIRECTHL: the GIF
+    // takes it from the payload of the next DIRECT command(s), never from the VIFcode stream.
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
+    // DIRECT/DIRECTHL payload qwords not yet received (the command's data continues in the next
+    // VIF1 transfer).
+    uint32_t m_vif1DirectRemainQwc = 0u;
+    bool m_vif1DirectRemainHl = false;
+    void submitVif1DirectPayload(const uint8_t *data, uint32_t qwc, bool directHl);
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer
@@ -417,7 +475,14 @@ public:
         uint32_t srcAddr = 0;
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
+        // PS2X_VIF1_UNPACK_WATCH only: (offset in chainData, guest address) per appended piece.
+        std::vector<std::pair<uint32_t, uint32_t>> chainSrc;
     };
+    // Source map of the VIF1 data being interpreted (PS2X_VIF1_UNPACK_WATCH): guest address of
+    // byte (p - m_vif1SrcBase) found through m_vif1SrcSegs; null when unknown.
+    const std::vector<std::pair<uint32_t, uint32_t>> *m_vif1SrcSegs = nullptr;
+    const uint8_t *m_vif1SrcBase = nullptr;
+    uint32_t vif1GuestAddressOf(const uint8_t *p) const;
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;

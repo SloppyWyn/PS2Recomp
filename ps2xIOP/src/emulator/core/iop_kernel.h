@@ -4,7 +4,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
+#include <string>
+#include "ps2x/state_stream.h"
 
 namespace ps2x::iop::detail
 {
@@ -50,6 +53,10 @@ namespace ps2x::iop::detail
 
         void reset();
 
+        // Snapshots (docs/SNAPSHOT-DESIGN.md).
+        void saveState(ps2x::StateWriter &w) const;
+        void loadState(ps2x::StateReader &r);
+
         [[nodiscard]] bool dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         [[nodiscard]] bool dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] bool dispatchEventImport(uint16_t ordinal, IopCpuState &cpu);
@@ -61,12 +68,38 @@ namespace ps2x::iop::detail
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+        // Like beginNextReady, but only a thread that would run before a thread of priority
+        // `priority` made ready now: priority numerically <= `priority` (an equal-priority
+        // thread already ready or preempted mid-work goes first). nullptr = none; then nothing
+        // is changed (Delay threads whose time has come still become Ready).
+        [[nodiscard]] IopThread *beginNextReadyBefore(uint64_t currentCycle, uint32_t priority);
+        // Priority of the thread running now; 0 outside any thread.
+        [[nodiscard]] uint32_t currentThreadPriority() const noexcept { return m_currentThread ? m_currentThread->priority : 0u; }
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
+        // A thread that can run now (Ready or Running) without waiting for any event.
+        [[nodiscard]] bool hasRunnableThread() const noexcept;
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
         void cleanupDeadThreads();
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+
+        // Debug text (PS2X_IOP_WATCH_THREADS, the RPC log): one item per thread,
+        // "id:state:prio:pc" plus ":w<wait id>" for a blocked thread and ":k<n>" for pending
+        // wakeups; states D dormant, R ready, X running, S sleep, L delay, M semaphore,
+        // E event flag, U suspended, Z dead. readyOnly = Ready/Running threads only.
+        [[nodiscard]] std::string describeThreads(bool readyOnly) const;
+        // "id:count/max" per semaphore with ":<n>w" waiters, "id:bits" per event flag.
+        [[nodiscard]] std::string describeSyncObjects() const;
+
+        // A blocking wait (WaitSema, WaitEventFlag) reached outside any IOP thread: an RPC
+        // server function or callback the runtime calls directly. On the hardware the RPC
+        // server is a thread that sleeps while the interrupt it waits for (a DMA completion)
+        // arrives. The hook lets IOP time pass, servicing interrupts, timers and callbacks,
+        // until `ready` holds or nothing scheduled can make it hold; it returns whether it
+        // holds. No hook (or false) = the old behaviour: the wait fails at once.
+        using CallContextWait = std::function<bool(const std::function<bool()> &ready)>;
+        void setCallContextWait(CallContextWait wait) { m_callContextWait = std::move(wait); }
 
     private:
         struct Semaphore
@@ -99,5 +132,6 @@ namespace ps2x::iop::detail
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
         IopThread *m_currentThread = nullptr;
+        CallContextWait m_callContextWait;
     };
 }
